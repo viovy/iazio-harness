@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/viovy/iazio-harness/internal/auth"
+	"github.com/viovy/iazio-harness/internal/controlplane"
 )
 
 var (
@@ -41,10 +42,37 @@ func run(args []string) error {
 		fmt.Println(st.String())
 		return nil
 	case "run":
-		return nil
+		return runJob(args[1:])
 	default:
 		return fmt.Errorf("unknown command")
 	}
+}
+
+func runJob(args []string) error {
+	var api, job, chunk string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--api-url":
+			i++
+			if i < len(args) {
+				api = args[i]
+			}
+		case "--job-id":
+			i++
+			if i < len(args) {
+				job = args[i]
+			}
+		case "--chunk":
+			i++
+			if i < len(args) {
+				chunk = args[i]
+			}
+		}
+	}
+	if api == "" || job == "" || chunk == "" {
+		return nil
+	}
+	return controlplane.PostChunk(context.Background(), api, "", job, "stdout", chunk)
 }
 
 func formatVersion() string {
