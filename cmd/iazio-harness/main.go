@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -30,15 +31,14 @@ func run(args []string) error {
 		fmt.Println(formatVersion())
 		return nil
 	case "auth":
-		present, err := auth.HasRefresh(auth.Path())
+		if len(args) > 1 && args[1] == "login" {
+			return auth.Login(context.Background())
+		}
+		st, err := auth.Status()
 		if err != nil {
 			return err
 		}
-		if len(args) > 1 && args[1] == "login" {
-			noninteractive := os.Getenv("IAZIO_HARNESS_NONINTERACTIVE") == "1" || os.Getenv("INVOCATION_ID") != ""
-			return auth.RequireInteractiveToken(noninteractive, present)
-		}
-		fmt.Println(auth.FormatStatus(auth.Path(), present))
+		fmt.Println(st.String())
 		return nil
 	case "run":
 		return nil

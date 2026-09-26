@@ -1,6 +1,9 @@
 package prompt
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestFillMissing(t *testing.T) {
 	_, err := Fill("run {{.StoryID}}", Values{})
@@ -15,18 +18,17 @@ func TestFillMissing(t *testing.T) {
 
 func TestTranscriptNotInBody(t *testing.T) {
 	dir := t.TempDir()
-	path, err := WriteTranscript(dir, "job-1", "secret transcript")
+	res, err := Prepare(Input{
+		JobID: "job-1", Kind: KindStoryRefinement, SpoolDir: dir,
+		Body: "read {{.SourceTranscriptPath}}", Transcript: "secret transcript",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := Fill("read {{.SourceTranscriptPath}}", Values{SourceTranscriptPath: path})
-	if err != nil {
-		t.Fatal(err)
+	if strings.Contains(res.Prompt, "secret transcript") {
+		t.Fatal(res.Prompt)
 	}
-	if body == "secret transcript" || len(body) == 0 {
-		t.Fatal(body)
-	}
-	if Marker("job-1") != "harness-job: job-1" {
-		t.Fatal("marker")
+	if !strings.Contains(res.Prompt, "harness-job: job-1") {
+		t.Fatal(res.Prompt)
 	}
 }

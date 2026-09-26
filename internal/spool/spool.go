@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -238,4 +239,53 @@ func toValid(s string) string {
 		return s
 	}
 	return strings.ToValidUTF8(s, "")
+}
+
+var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+
+// StripANSI removes cursor-control sequences from a chunk of text.
+func StripANSI(s string) string {
+	return ansiPattern.ReplaceAllString(s, "")
+}
+
+// Truncate keeps a rune-safe head and tail that together fit in limit bytes.
+func Truncate(s string, limit int) (head, tail string, dropped int) {
+	if limit < 2 {
+		limit = 2
+	}
+	half := limit / 2
+	head = cutStart(s, half)
+	tail = cutEnd(s, half)
+	if len(head)+len(tail) > len(s) {
+		return s, "", 0
+	}
+	dropped = len(s) - len(head) - len(tail)
+	if dropped < 0 {
+		dropped = 0
+	}
+	return head, tail, dropped
+}
+
+func cutStart(s string, n int) string {
+	if n > len(s) {
+		n = len(s)
+	}
+	for n > 0 && !utf8.ValidString(s[:n]) {
+		n--
+	}
+	return s[:n]
+}
+
+func cutEnd(s string, n int) string {
+	if n > len(s) {
+		return s
+	}
+	i := len(s) - n
+	if i < 0 {
+		i = 0
+	}
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return s[i:]
 }
