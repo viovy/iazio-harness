@@ -241,23 +241,35 @@ func toValid(s string) string {
 	return strings.ToValidUTF8(s, "")
 }
 
-var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+var (
+	ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+	oscPattern  = regexp.MustCompile(`\x1b\][^\x07]*(?:\x07|\x1b\\)`)
+)
 
-// StripANSI removes cursor-control sequences from a chunk of text.
+// StripANSI removes cursor-control sequences and carriage returns from a chunk of text.
 func StripANSI(s string) string {
-	return ansiPattern.ReplaceAllString(s, "")
+	s = oscPattern.ReplaceAllString(s, "")
+	s = ansiPattern.ReplaceAllString(s, "")
+	return strings.ReplaceAll(s, "\r", "")
 }
 
 // Truncate keeps a rune-safe head and tail that together fit in limit bytes.
+// Bytes that do not fit a rune boundary stay in the dropped middle.
 func Truncate(s string, limit int) (head, tail string, dropped int) {
-	if limit < 2 {
-		limit = 2
+	if limit <= 0 || s == "" {
+		return "", "", len(s)
 	}
-	half := limit / 2
-	head = cutStart(s, half)
-	tail = cutEnd(s, half)
+	if len(s) <= limit {
+		return s, "", 0
+	}
+	head = cutStart(s, limit/2)
+	tail = cutEnd(s, limit-len(head))
 	if len(head)+len(tail) > len(s) {
 		return s, "", 0
+	}
+	// Head and tail must not overlap.
+	if len(head) > 0 && len(s)-len(tail) < len(head) {
+		tail = cutEnd(s[len(head):], limit-len(head))
 	}
 	dropped = len(s) - len(head) - len(tail)
 	if dropped < 0 {
