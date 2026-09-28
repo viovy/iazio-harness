@@ -88,7 +88,7 @@ func runJob(args []string) error {
 		api = os.Getenv("IAZIO_HARNESS_API_URL")
 	}
 	if api == "" {
-		api = "https://tian.go.ro/iazio-harness-api"
+		api = "http://localhost:8090"
 	}
 	if jobID == "" {
 		return fmt.Errorf("job-id is required")
