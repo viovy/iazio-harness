@@ -114,6 +114,11 @@ func (s *Spool) AppendRaw(stream string, p []byte) error {
 	return nil
 }
 
+// Flush strips ANSI from buffered bytes and returns events for time.Now().
+func (s *Spool) Flush() []Event {
+	return s.FlushAt(time.Now())
+}
+
 // FlushAt strips ANSI from buffered bytes and returns events for this instant.
 // OUTPUT_CHUNK sequence numbers start at 1. At most MaxTextBytes of text are emitted per second.
 // OUTPUT_TICK is returned when there are no new bytes.

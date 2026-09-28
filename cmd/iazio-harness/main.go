@@ -5,9 +5,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/viovy/iazio-harness/internal/auth"
 	"github.com/viovy/iazio-harness/internal/controlplane"
+	"github.com/viovy/iazio-harness/internal/engines"
+	"github.com/viovy/iazio-harness/internal/prompt"
+	"github.com/viovy/iazio-harness/internal/spool"
 )
 
 var (
@@ -49,7 +54,7 @@ func run(args []string) error {
 }
 
 func runJob(args []string) error {
-	var api, job, chunk string
+	var api, jobID, worktree, docsHub, chunk string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--api-url":
@@ -60,7 +65,17 @@ func runJob(args []string) error {
 		case "--job-id":
 			i++
 			if i < len(args) {
-				job = args[i]
+				jobID = args[i]
+			}
+		case "--worktree-path":
+			i++
+			if i < len(args) {
+				worktree = args[i]
+			}
+		case "--docs-hub-path":
+			i++
+			if i < len(args) {
+				docsHub = args[i]
 			}
 		case "--chunk":
 			i++
@@ -69,10 +84,109 @@ func runJob(args []string) error {
 			}
 		}
 	}
-	if api == "" || job == "" || chunk == "" {
-		return nil
+	if api == "" || jobID == "" {
+		return fmt.Errorf("api-url and job-id are required")
 	}
-	return controlplane.PostChunk(context.Background(), api, "", job, "stdout", chunk)
+	if chunk != "" {
+		return controlplane.PostChunk(context.Background(), api, "", jobID, "stdout", chunk)
+	}
+	return executeJob(context.Background(), api, jobID, worktree, docsHub)
+}
+
+func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error {
+	token, _ := auth.Bearer(ctx)
+	job, err := controlplane.GetJob(ctx, api, token, jobID)
+	if err != nil {
+		return fmt.Errorf("get job: %w", err)
+	}
+	if worktree == "" {
+		worktree = job.WorktreePath
+	}
+	if docsHub == "" {
+		docsHub = job.DocsHubPath
+	}
+	targetDir, err := engines.CheckoutDir(job.Kind, worktree, docsHub)
+	if err != nil {
+		return err
+	}
+	lock, err := engines.Hold(targetDir, "")
+	if err != nil {
+		return fmt.Errorf("checkout lock: %w", err)
+	}
+	defer lock.Release()
+
+	prepRes, err := prompt.Prepare(prompt.Input{
+		Kind:       job.Kind,
+		JobID:      job.ID,
+		Body:       job.Prompt,
+		Transcript: job.Transcript,
+		SpoolDir:   spool.DefaultDir(),
+		Values: prompt.Values{
+			StoryID:        job.StoryID,
+			TargetLeafName: filepath.Base(worktree),
+			WorktreePath:   worktree,
+			DocsHubPath:    docsHub,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("prepare prompt: %w", err)
+	}
+
+	sp, err := spool.Open(spool.DefaultDir(), jobID)
+	if err != nil {
+		return fmt.Errorf("open spool: %w", err)
+	}
+	defer sp.Close()
+
+	flushCtx, stopFlush := context.WithCancel(ctx)
+	defer stopFlush()
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-flushCtx.Done():
+				return
+			case <-ticker.C:
+				events := sp.Flush()
+				for _, ev := range events {
+					if ev.Type == spool.EventOutputChunk {
+						_ = controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text)
+					}
+				}
+			}
+		}
+	}()
+
+	runner := engines.CLI{Engine: job.Engine}
+	execReq := engines.ExecutionRequest{
+		Engine:       job.Engine,
+		Kind:         job.Kind,
+		Prompt:       prepRes.Prompt,
+		WorktreePath: worktree,
+		DocsHubPath:  docsHub,
+		ScheduleEnv:  job.EnvVars,
+		LogFile:      filepath.Join(spool.DefaultDir(), jobID+".engine.log"),
+	}
+	execRes, execErr := runner.Execute(ctx, execReq, sp)
+	stopFlush()
+
+	// Final spool flush
+	for _, ev := range sp.Flush() {
+		if ev.Type == spool.EventOutputChunk {
+			_ = controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text)
+		}
+	}
+
+	_ = controlplane.PostExit(context.Background(), api, token, jobID, execRes.ExitCode)
+
+	if execErr != nil {
+		return execErr
+	}
+	if execRes.ExitCode != 0 {
+		return fmt.Errorf("engine %s exited with code %d", job.Engine, execRes.ExitCode)
+	}
+	return nil
 }
 
 func formatVersion() string {
