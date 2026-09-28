@@ -84,8 +84,14 @@ func runJob(args []string) error {
 			}
 		}
 	}
-	if api == "" || jobID == "" {
-		return fmt.Errorf("api-url and job-id are required")
+	if api == "" {
+		api = os.Getenv("IAZIO_HARNESS_API_URL")
+	}
+	if api == "" {
+		api = "https://tian.go.ro/iazio-harness-api"
+	}
+	if jobID == "" {
+		return fmt.Errorf("job-id is required")
 	}
 	if chunk != "" {
 		return controlplane.PostChunk(context.Background(), api, "", jobID, "stdout", chunk)
