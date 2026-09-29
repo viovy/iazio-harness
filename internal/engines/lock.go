@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"syscall"
 )
 
 // ErrLockHeld is returned when the checkout lock is already held.
@@ -62,11 +61,8 @@ func Hold(checkout, lockDir string) (*Lock, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := fileLock(f); err != nil {
 		_ = f.Close()
-		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, ErrLockHeld
-		}
 		return nil, err
 	}
 	return &Lock{f: f, Path: path}, nil
@@ -77,7 +73,7 @@ func (l *Lock) Release() error {
 	if l == nil || l.f == nil {
 		return nil
 	}
-	err := syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
+	err := fileUnlock(l.f)
 	cerr := l.f.Close()
 	l.f = nil
 	if err != nil {
