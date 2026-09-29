@@ -65,6 +65,15 @@ func TestArgvOrder(t *testing.T) {
 			cwd:  "/repos/docs-hub",
 		},
 		{
+			name: "agy defaults",
+			req: ExecutionRequest{
+				Engine: "agy", Prompt: "hello", Kind: "execute",
+				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
+			},
+			want: []string{"agy", "--print", "hello", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high"},
+			cwd:  "/repos/leaf-01",
+		},
+		{
 			name: "opencode",
 			req: ExecutionRequest{
 				Engine: "opencode", Prompt: "p", Kind: "execute",

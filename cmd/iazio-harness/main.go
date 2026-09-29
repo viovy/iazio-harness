@@ -164,15 +164,27 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		}
 	}()
 
-	runner := engines.CLI{Engine: job.Engine}
+	engineName := job.Engine
+	if engineName == "" {
+		engineName = "agy"
+	}
+	runner := engines.CLI{Engine: engineName}
+	printTimeout := "10m"
+	if job.MaxExecutionDurationSeconds > 0 {
+		printTimeout = fmt.Sprintf("%ds", job.MaxExecutionDurationSeconds)
+	}
 	execReq := engines.ExecutionRequest{
-		Engine:       job.Engine,
-		Kind:         job.Kind,
-		Prompt:       prepRes.Prompt,
-		WorktreePath: worktree,
-		DocsHubPath:  docsHub,
-		ScheduleEnv:  job.EnvVars,
-		LogFile:      filepath.Join(spool.DefaultDir(), jobID+".engine.log"),
+		Engine:                     engineName,
+		Kind:                       job.Kind,
+		Prompt:                     prepRes.Prompt,
+		WorktreePath:               worktree,
+		DocsHubPath:                docsHub,
+		PrintTimeout:               printTimeout,
+		Model:                      "gemini-3.8-flash-high",
+		DisableSlashCommands:       true,
+		DangerouslySkipPermissions: true,
+		ScheduleEnv:                job.EnvVars,
+		LogFile:                    filepath.Join(spool.DefaultDir(), jobID+".engine.log"),
 	}
 	execRes, execErr := runner.Execute(ctx, execReq, sp)
 	stopFlush()
