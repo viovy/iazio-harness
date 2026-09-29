@@ -1,6 +1,9 @@
 package engines
 
-import "sort"
+import (
+	"os"
+	"sort"
+)
 
 // Forced environment keys. Schedule values cannot override them.
 const (
@@ -27,6 +30,21 @@ func ChildEnv(base []string, schedule map[string]string, docsHubPath string) []s
 			continue
 		}
 		m[k] = v
+	}
+	if m["HOME"] == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			m["HOME"] = home
+		}
+	}
+	if m["USER"] == "" {
+		if u := os.Getenv("USER"); u != "" {
+			m["USER"] = u
+		}
+	}
+	if m["PATH"] == "" {
+		if p := os.Getenv("PATH"); p != "" {
+			m["PATH"] = p
+		}
 	}
 	m[EnvGitTerminalPrompt] = "0"
 	m[EnvSSHBatchMode] = "yes"
