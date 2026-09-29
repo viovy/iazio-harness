@@ -66,7 +66,7 @@ type CLI struct {
 // Name returns the configured engine name.
 func (c CLI) Name() string {
 	if c.Engine == "" {
-		return "cli"
+		return "agy"
 	}
 	return c.Engine
 }
@@ -212,11 +212,16 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 	switch req.Engine {
 	case "agent":
 		return []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--", req.Prompt}, nil
-	case "agy":
-		if req.PrintTimeout == "" || req.Model == "" {
-			return nil, errors.New("agy requires print timeout and model")
+	case "agy", "":
+		timeout := req.PrintTimeout
+		if timeout == "" {
+			timeout = "10m"
 		}
-		argv := []string{"agy", "--print", req.Prompt, "--print-timeout", req.PrintTimeout, "--model", req.Model}
+		model := req.Model
+		if model == "" {
+			model = "gemini-3.8-flash-high"
+		}
+		argv := []string{"agy", "--print", req.Prompt, "--print-timeout", timeout, "--model", model}
 		if req.Agent != "" {
 			argv = append(argv, "--agent", req.Agent)
 		}
