@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/auth"
@@ -86,6 +87,13 @@ func runJob(args []string) error {
 	}
 	if api == "" {
 		api = os.Getenv("IAZIO_HARNESS_API_URL")
+	}
+	if api == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if b, err := os.ReadFile(filepath.Join(home, ".iazio", "api_url")); err == nil {
+				api = strings.TrimSpace(string(b))
+			}
+		}
 	}
 	if api == "" {
 		api = "http://localhost:8090"

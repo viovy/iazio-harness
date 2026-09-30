@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
+
+var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // PostChunk stores one stripped chunk. The raw spool stays on the runner.
 func PostChunk(ctx context.Context, baseURL, token, jobID, stream, text string) error {
@@ -26,7 +29,7 @@ func PostChunk(ctx context.Context, baseURL, token, jobID, stream, text string) 
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -63,7 +66,7 @@ func GetJob(ctx context.Context, baseURL, token, jobID string) (JobDetail, error
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return JobDetail{}, err
 	}
@@ -92,7 +95,7 @@ func PostExit(ctx context.Context, baseURL, token, jobID string, exitCode int) e
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -120,7 +123,7 @@ func PostStoryDraft(ctx context.Context, baseURL, token, jobID, storyID, body st
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}

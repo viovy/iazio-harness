@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -78,6 +79,22 @@ func (c CLI) HealthCheck() error {
 		look = exec.LookPath
 	}
 	_, err := look(c.Name())
+	if err == nil {
+		return nil
+	}
+	if c.LookPath == nil {
+		if home, errH := os.UserHomeDir(); errH == nil && home != "" {
+			candidates := []string{
+				filepath.Join(home, ".local", "bin", c.Name()),
+				filepath.Join(home, ".iazio", "bin", c.Name()),
+			}
+			for _, cand := range candidates {
+				if fi, errS := os.Stat(cand); errS == nil && !fi.IsDir() {
+					return nil
+				}
+			}
+		}
+	}
 	return err
 }
 
@@ -98,7 +115,22 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	if len(argv) == 0 || argv[0] == "" {
 		return ExecutionResult{}, errors.New("empty argv")
 	}
-	cmd := exec.Command(argv[0], argv[1:]...)
+	bin := argv[0]
+	if resolved, err := exec.LookPath(bin); err == nil {
+		bin = resolved
+	} else if home, err := os.UserHomeDir(); err == nil && home != "" {
+		candidates := []string{
+			filepath.Join(home, ".local", "bin", bin),
+			filepath.Join(home, ".iazio", "bin", bin),
+		}
+		for _, cand := range candidates {
+			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+				bin = cand
+				break
+			}
+		}
+	}
+	cmd := exec.Command(bin, argv[1:]...)
 	cmd.Dir = WorkingDirectory(req.Kind, req.WorktreePath, req.DocsHubPath)
 	base := req.BaseEnv
 	if req.BaseEnv == nil {
