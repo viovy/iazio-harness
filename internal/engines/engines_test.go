@@ -173,6 +173,27 @@ func TestEnvOverride(t *testing.T) {
 	}
 }
 
+func TestChildEnvPATHAugmentation(t *testing.T) {
+	env := ChildEnv([]string{"PATH=/usr/bin"}, nil, "/repos/docs-hub")
+	path, ok := EnvLookup(env, "PATH")
+	if !ok {
+		t.Fatal("missing PATH in ChildEnv")
+	}
+	if !strings.Contains(path, "/usr/bin") {
+		t.Fatalf("expected /usr/bin in PATH, got: %s", path)
+	}
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		localBin := filepath.Join(home, ".local", "bin")
+		if fi, err := os.Stat(localBin); err == nil && fi.IsDir() {
+			if !strings.Contains(path, localBin) {
+				t.Fatalf("expected %s in PATH, got: %s", localBin, path)
+			}
+		}
+	}
+}
+
+
 func TestLockRefusal(t *testing.T) {
 	tests := []struct {
 		name    string
