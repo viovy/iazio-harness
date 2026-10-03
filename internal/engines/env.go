@@ -2,7 +2,10 @@ package engines
 
 import (
 	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
+	"strings"
 )
 
 // Forced environment keys. Schedule values cannot override them.
@@ -41,10 +44,32 @@ func ChildEnv(base []string, schedule map[string]string, docsHubPath string) []s
 			m["USER"] = u
 		}
 	}
-	if m["PATH"] == "" {
-		if p := os.Getenv("PATH"); p != "" {
-			m["PATH"] = p
+	pathVal := m["PATH"]
+	if pathVal == "" {
+		pathVal = os.Getenv("PATH")
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		dirs := []string{
+			filepath.Join(home, ".local", "bin"),
+			filepath.Join(home, ".iazio", "bin"),
 		}
+		if runtime.GOOS == "darwin" {
+			dirs = append(dirs, "/opt/homebrew/bin")
+		}
+		for _, d := range dirs {
+			if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+				if !strings.Contains(pathVal, d) {
+					if pathVal == "" {
+						pathVal = d
+					} else {
+						pathVal = d + string(filepath.ListSeparator) + pathVal
+					}
+				}
+			}
+		}
+	}
+	if pathVal != "" {
+		m["PATH"] = pathVal
 	}
 	m[EnvGitTerminalPrompt] = "0"
 	m[EnvSSHBatchMode] = "yes"
