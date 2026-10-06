@@ -181,6 +181,10 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	if job.MaxExecutionDurationSeconds > 0 {
 		printTimeout = fmt.Sprintf("%ds", job.MaxExecutionDurationSeconds)
 	}
+	resumeConvID := job.ResumeConversationID
+	if resumeConvID == "" && job.EnvVars != nil {
+		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
+	}
 	execReq := engines.ExecutionRequest{
 		Engine:                     engineName,
 		Kind:                       job.Kind,
@@ -193,6 +197,14 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		DangerouslySkipPermissions: true,
 		ScheduleEnv:                job.EnvVars,
 		LogFile:                    filepath.Join(spool.DefaultDir(), jobID+".engine.log"),
+		ResumeConversationID:       resumeConvID,
+		OnConversationID: func(cid string) {
+			if cid != "" {
+				go func() {
+					_ = controlplane.PostConversation(context.Background(), api, token, jobID, cid)
+				}()
+			}
+		},
 	}
 	execRes, execErr := runner.Execute(ctx, execReq, sp)
 	stopFlush()

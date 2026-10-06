@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -46,6 +47,8 @@ type ExecutionRequest struct {
 	DisableSlashCommands       bool
 	DangerouslySkipPermissions bool
 	LogFile                    string
+	ResumeConversationID       string
+	OnConversationID           func(string)
 	// Argv, when non-empty, replaces BuildArgv. Tests use it to run a local program.
 	Argv []string
 	// BaseEnv, when non-nil, replaces the inherited environment before schedule and forced keys.
@@ -115,6 +118,31 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	if len(argv) == 0 || argv[0] == "" {
 		return ExecutionResult{}, errors.New("empty argv")
 	}
+
+	if req.ResumeConversationID != "" && req.OnConversationID != nil {
+		req.OnConversationID(req.ResumeConversationID)
+	} else if req.Engine == "agent" && req.OnConversationID != nil && len(req.Argv) == 0 {
+		look := c.LookPath
+		if look == nil {
+			look = exec.LookPath
+		}
+		agentBin := "agent"
+		if resolved, err := look(agentBin); err == nil {
+			agentBin = resolved
+		}
+		chatCmd := exec.CommandContext(ctx, agentBin, "create-chat")
+		if out, err := chatCmd.Output(); err == nil {
+			createdID := strings.TrimSpace(string(out))
+			if createdID != "" {
+				req.ResumeConversationID = createdID
+				req.OnConversationID(createdID)
+				if rebuilt, errB := BuildArgv(req); errB == nil {
+					argv = rebuilt
+				}
+			}
+		}
+	}
+
 	bin := argv[0]
 	if resolved, err := exec.LookPath(bin); err == nil {
 		bin = resolved
@@ -157,15 +185,57 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	}
 	done := make(chan struct{})
 	go watchCancel(ctx, cmd, done)
+
+	var scanned bool
+	var convMu sync.Mutex
+	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, mu: &convMu}
+	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, mu: &convMu}
+
+	if req.LogFile != "" && req.OnConversationID != nil {
+		go func() {
+			for i := 0; i < 20; i++ {
+				select {
+				case <-done:
+					return
+				case <-time.After(250 * time.Millisecond):
+					convMu.Lock()
+					isScanned := scanned
+					convMu.Unlock()
+					if isScanned {
+						return
+					}
+					if data, err := os.ReadFile(req.LogFile); err == nil && len(data) > 0 {
+						sData := string(data)
+						const marker = "Created conversation "
+						if idx := strings.Index(sData, marker); idx != -1 {
+							rest := sData[idx+len(marker):]
+							fields := strings.Fields(rest)
+							if len(fields) > 0 && len(fields[0]) >= 32 {
+								convID := strings.TrimSpace(fields[0])
+								convMu.Lock()
+								if !scanned {
+									scanned = true
+									go req.OnConversationID(convID)
+								}
+								convMu.Unlock()
+								return
+							}
+						}
+					}
+				}
+			}
+		}()
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(rawWriter{stream: "stdout", dst: stream}, stdout)
+		_, _ = io.Copy(stdoutWriter, stdout)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(rawWriter{stream: "stderr", dst: stream}, stderr)
+		_, _ = io.Copy(stderrWriter, stderr)
 	}()
 	waitErr := cmd.Wait()
 	wg.Wait()
@@ -215,19 +285,50 @@ func exitCode(err error) int {
 }
 
 type rawWriter struct {
-	stream string
-	dst    EventStream
+	stream  string
+	dst     EventStream
+	onConv  func(string)
+	scanned *bool
+	mu      *sync.Mutex
 }
 
 func (w rawWriter) Write(p []byte) (int, error) {
 	if w.dst == nil || len(p) == 0 {
 		return len(p), nil
 	}
+	if w.onConv != nil && w.scanned != nil && w.mu != nil {
+		w.mu.Lock()
+		if !*w.scanned {
+			if cid := extractConversationID(string(p)); cid != "" {
+				*w.scanned = true
+				go w.onConv(cid)
+			}
+		}
+		w.mu.Unlock()
+	}
 	buf := append([]byte(nil), p...)
 	if err := w.dst.AppendRaw(w.stream, buf); err != nil {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+func extractConversationID(s string) string {
+	keys := []string{`"conversation_id":"`, `"session_id":"`, `"conversationId":"`, `"sessionId":"`}
+	for _, k := range keys {
+		idx := strings.Index(s, k)
+		if idx != -1 {
+			start := idx + len(k)
+			end := strings.IndexByte(s[start:], '"')
+			if end != -1 {
+				val := strings.TrimSpace(s[start : start+end])
+				if val != "" {
+					return val
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // WorkingDirectory returns the docs hub for story_refinement and the worktree otherwise.
@@ -243,7 +344,12 @@ func WorkingDirectory(kind, worktree, docsHub string) string {
 func BuildArgv(req ExecutionRequest) ([]string, error) {
 	switch req.Engine {
 	case "agent":
-		return []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--", req.Prompt}, nil
+		argv := []string{"agent", "--print", "--output-format", "text", "--trust", "--force"}
+		if req.ResumeConversationID != "" {
+			argv = append(argv, "--resume", req.ResumeConversationID)
+		}
+		argv = append(argv, "--", req.Prompt)
+		return argv, nil
 	case "agy", "":
 		timeout := req.PrintTimeout
 		if timeout == "" {
@@ -254,6 +360,9 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 			model = "gemini-3.8-flash-high"
 		}
 		argv := []string{"agy", "--print", req.Prompt, "--print-timeout", timeout, "--model", model}
+		if req.ResumeConversationID != "" {
+			argv = append(argv, "--conversation", req.ResumeConversationID)
+		}
 		if req.Agent != "" {
 			argv = append(argv, "--agent", req.Agent)
 		}
