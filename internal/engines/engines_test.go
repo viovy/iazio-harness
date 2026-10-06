@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -80,6 +81,26 @@ func TestArgvOrder(t *testing.T) {
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
 			want: []string{"agy", "--print", "hello", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high"},
+			cwd:  "/repos/leaf-01",
+		},
+		{
+			name: "agent with resume",
+			req: ExecutionRequest{
+				Engine: "agent", Prompt: "continue work", Kind: "execute",
+				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
+				ResumeConversationID: "chat-uuid-123",
+			},
+			want: []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--resume", "chat-uuid-123", "--", "continue work"},
+			cwd:  "/repos/leaf-01",
+		},
+		{
+			name: "agy with resume",
+			req: ExecutionRequest{
+				Engine: "agy", Prompt: "continue work", Kind: "execute",
+				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
+				ResumeConversationID: "conv-uuid-456",
+			},
+			want: []string{"agy", "--print", "continue work", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--conversation", "conv-uuid-456"},
 			cwd:  "/repos/leaf-01",
 		},
 		{
@@ -341,3 +362,89 @@ func TestChildEnvForcedOnProcess(t *testing.T) {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
+
+func TestExtractConversationID(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{
+			input: `{"event":"init","conversation_id":"e5bb80ff-9747-4c25-8ab1-706ecdf3679b","init":{}}`,
+			want:  "e5bb80ff-9747-4c25-8ab1-706ecdf3679b",
+		},
+		{
+			input: `{"type":"system","subtype":"init","session_id":"sess-1234-uuid"}`,
+			want:  "sess-1234-uuid",
+		},
+		{
+			input: `normal output without any session identifier`,
+			want:  "",
+		},
+	}
+	for _, tt := range tests {
+		got := extractConversationID(tt.input)
+		if got != tt.want {
+			t.Errorf("extractConversationID(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+type testCaptureStream struct {
+	events []string
+}
+
+func (s *testCaptureStream) AppendRaw(stream string, p []byte) error {
+	s.events = append(s.events, string(p))
+	return nil
+}
+
+func TestEarlyConversationIDStreaming(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "emit.sh")
+	body := "#!/bin/sh\necho '{\"event\":\"init\",\"conversation_id\":\"streamed-conv-123\"}'\necho 'second line'\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var capturedID string
+	var mu sync.Mutex
+	doneCapture := make(chan struct{})
+
+	stream := &testCaptureStream{}
+	eng := CLI{}
+	res, err := eng.Execute(context.Background(), ExecutionRequest{
+		Kind:         "execute",
+		WorktreePath: dir,
+		DocsHubPath:  dir,
+		Argv:         []string{"/bin/sh", script},
+		OnConversationID: func(cid string) {
+			mu.Lock()
+			capturedID = cid
+			mu.Unlock()
+			select {
+			case <-doneCapture:
+			default:
+				close(doneCapture)
+			}
+		},
+	}, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("exit code %d", res.ExitCode)
+	}
+
+	select {
+	case <-doneCapture:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for OnConversationID callback")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if capturedID != "streamed-conv-123" {
+		t.Fatalf("expected 'streamed-conv-123', got %q", capturedID)
+	}
+}
+

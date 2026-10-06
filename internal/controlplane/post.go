@@ -40,6 +40,33 @@ func PostChunk(ctx context.Context, baseURL, token, jobID, stream, text string) 
 	return nil
 }
 
+// PostConversation registers an early or streamed conversation ID with the control plane.
+func PostConversation(ctx context.Context, baseURL, token, jobID, conversationID string) error {
+	raw, err := json.Marshal(map[string]string{
+		"conversation_id": conversationID,
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/conversations", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("conversation post: %s", resp.Status)
+	}
+	return nil
+}
+
 // JobDetail carries the execution specification from iazio-harness-api.
 type JobDetail struct {
 	ID                          string            `json:"id"`
@@ -55,6 +82,7 @@ type JobDetail struct {
 	DocsHubPath                 string            `json:"docs_hub_path"`
 	EnvVars                     map[string]string `json:"env_vars"`
 	MaxExecutionDurationSeconds int               `json:"max_execution_duration_seconds"`
+	ResumeConversationID        string            `json:"resume_conversation_id,omitempty"`
 }
 
 // GetJob fetches the job definition from the control plane.

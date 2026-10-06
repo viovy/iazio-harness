@@ -90,3 +90,27 @@ func TestPostStoryDraft(t *testing.T) {
 	}
 }
 
+func TestPostConversation(t *testing.T) {
+	var body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/jobs/job-123/conversations" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer test-tok" {
+			t.Fatalf("unexpected auth: %s", r.Header.Get("Authorization"))
+		}
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if err := PostConversation(context.Background(), srv.URL, "test-tok", "job-123", "conv-uuid-789"); err != nil {
+		t.Fatalf("PostConversation failed: %v", err)
+	}
+	if !strings.Contains(body, `"conversation_id":"conv-uuid-789"`) {
+		t.Fatalf("unexpected body: %s", body)
+	}
+}
+
+
