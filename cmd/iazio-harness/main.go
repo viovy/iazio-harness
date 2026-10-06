@@ -204,7 +204,21 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		}
 	}
 
-	_ = controlplane.PostExit(context.Background(), api, token, jobID, execRes.ExitCode)
+	// Explicitly release checkout file lock before posting exit to control plane,
+	// ensuring subsequent jobs can immediately acquire the lock without race or contention.
+	_ = lock.Release()
+
+	var postExitErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		postExitErr = controlplane.PostExit(context.Background(), api, token, jobID, execRes.ExitCode)
+		if postExitErr == nil {
+			break
+		}
+		time.Sleep(time.Duration(attempt*250) * time.Millisecond)
+	}
+	if postExitErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: post exit failed for job %s: %v\n", jobID, postExitErr)
+	}
 
 	if execErr != nil {
 		return execErr
