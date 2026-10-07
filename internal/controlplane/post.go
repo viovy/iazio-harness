@@ -40,6 +40,34 @@ func PostChunk(ctx context.Context, baseURL, token, jobID, stream, text string) 
 	return nil
 }
 
+// PostTick pulses an execution keepalive tick when the engine is silent.
+func PostTick(ctx context.Context, baseURL, token, jobID string, silentForMs int64) error {
+	raw, err := json.Marshal(map[string]any{
+		"type":          "OUTPUT_TICK",
+		"silent_for_ms": silentForMs,
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/chunks", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("tick post: %s", resp.Status)
+	}
+	return nil
+}
+
 // PostConversation registers an early or streamed conversation ID with the control plane.
 func PostConversation(ctx context.Context, baseURL, token, jobID, conversationID string) error {
 	raw, err := json.Marshal(map[string]string{

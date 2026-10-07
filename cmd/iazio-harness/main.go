@@ -157,15 +157,23 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
+		var lastTickSent time.Time
 		for {
 			select {
 			case <-flushCtx.Done():
 				return
 			case <-ticker.C:
 				events := sp.Flush()
+				now := time.Now()
 				for _, ev := range events {
 					if ev.Type == spool.EventOutputChunk {
 						_ = controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text)
+						lastTickSent = now
+					} else if ev.Type == spool.EventOutputTick {
+						if now.Sub(lastTickSent) >= 5*time.Second {
+							_ = controlplane.PostTick(context.Background(), api, token, jobID, ev.SilentForMs)
+							lastTickSent = now
+						}
 					}
 				}
 			}
