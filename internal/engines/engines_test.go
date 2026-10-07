@@ -461,6 +461,18 @@ func TestExtractConversationIDFromText(t *testing.T) {
 		t.Fatalf("expected %s, got %s", uuid2, got)
 	}
 
+	// Trailing punctuation should be trimmed
+	logLine3 := "Finished task in conversation=" + uuid1 + "."
+	if got := extractConversationIDFromText(logLine3); got != uuid1 {
+		t.Fatalf("expected %s, got %s", uuid1, got)
+	}
+
+	// Earlier false-positive marker occurrence should not block later valid UUID
+	logLine4 := "Flags: conversation=none\nServer: conversation=" + uuid2
+	if got := extractConversationIDFromText(logLine4); got != uuid2 {
+		t.Fatalf("expected %s, got %s", uuid2, got)
+	}
+
 	stdoutText := "Session initialized: Created conversation " + uuid1 + "\n"
 	if got := extractConversationID(stdoutText); got != uuid1 {
 		t.Fatalf("expected %s from extractConversationID, got %s", uuid1, got)
