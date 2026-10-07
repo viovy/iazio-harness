@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -157,15 +158,29 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
+		var lastTickSent time.Time
 		for {
 			select {
 			case <-flushCtx.Done():
 				return
 			case <-ticker.C:
 				events := sp.Flush()
+				now := time.Now()
 				for _, ev := range events {
 					if ev.Type == spool.EventOutputChunk {
-						_ = controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text)
+						if err := controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text); err != nil {
+							log.Printf("[harness] post chunk failed for %s: %v", jobID, err)
+						} else {
+							lastTickSent = now
+						}
+					} else if ev.Type == spool.EventOutputTick {
+						if now.Sub(lastTickSent) >= 5*time.Second {
+							if err := controlplane.PostTick(context.Background(), api, token, jobID, ev.SilentForMs); err != nil {
+								log.Printf("[harness] post tick failed for %s: %v", jobID, err)
+							} else {
+								lastTickSent = now
+							}
+						}
 					}
 				}
 			}

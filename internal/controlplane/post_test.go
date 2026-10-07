@@ -28,6 +28,25 @@ func TestPostChunk(t *testing.T) {
 	}
 }
 
+func TestPostTick(t *testing.T) {
+	var body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/jobs/job-1/chunks" {
+			t.Fatalf("path %s", r.URL.Path)
+		}
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+	if err := PostTick(context.Background(), srv.URL, "tok", "job-1", 5000); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body, `"type":"OUTPUT_TICK"`) || !strings.Contains(body, `"silent_for_ms":5000`) {
+		t.Fatalf("unexpected body: %s", body)
+	}
+}
+
 func TestGetJob(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/jobs/job-123" {
