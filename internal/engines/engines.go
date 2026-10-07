@@ -191,36 +191,36 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, mu: &convMu}
 	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, mu: &convMu}
 
+	scanLogFile := func() {
+		convMu.Lock()
+		defer convMu.Unlock()
+		if scanned {
+			return
+		}
+		if data, err := os.ReadFile(req.LogFile); err == nil && len(data) > 0 {
+			if cid := extractConversationIDFromText(string(data)); cid != "" {
+				scanned = true
+				go req.OnConversationID(cid)
+			}
+		}
+	}
+
 	if req.LogFile != "" && req.OnConversationID != nil {
 		go func() {
-			for i := 0; i < 20; i++ {
+			ticker := time.NewTicker(250 * time.Millisecond)
+			defer ticker.Stop()
+			for {
 				select {
 				case <-done:
+					scanLogFile()
 					return
-				case <-time.After(250 * time.Millisecond):
+				case <-ticker.C:
+					scanLogFile()
 					convMu.Lock()
 					isScanned := scanned
 					convMu.Unlock()
 					if isScanned {
 						return
-					}
-					if data, err := os.ReadFile(req.LogFile); err == nil && len(data) > 0 {
-						sData := string(data)
-						const marker = "Created conversation "
-						if idx := strings.Index(sData, marker); idx != -1 {
-							rest := sData[idx+len(marker):]
-							fields := strings.Fields(rest)
-							if len(fields) > 0 && len(fields[0]) >= 32 {
-								convID := strings.TrimSpace(fields[0])
-								convMu.Lock()
-								if !scanned {
-									scanned = true
-									go req.OnConversationID(convID)
-								}
-								convMu.Unlock()
-								return
-							}
-						}
 					}
 				}
 			}
@@ -240,6 +240,9 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	waitErr := cmd.Wait()
 	wg.Wait()
 	close(done)
+	if req.LogFile != "" && req.OnConversationID != nil {
+		scanLogFile()
+	}
 	code := exitCode(waitErr)
 	if ctx.Err() != nil {
 		return ExecutionResult{ExitCode: code}, ctx.Err()
@@ -313,6 +316,28 @@ func (w rawWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func extractConversationIDFromText(sData string) string {
+	markers := []string{
+		"Created conversation ",
+		"Print mode: conversation=",
+		"conversation=",
+		"Streaming conversation ",
+		"GetConversationDetail: found conversation ",
+	}
+	for _, marker := range markers {
+		if idx := strings.Index(sData, marker); idx != -1 {
+			rest := sData[idx+len(marker):]
+			fields := strings.FieldsFunc(rest, func(r rune) bool {
+				return r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == ',' || r == '"' || r == '\'' || r == '(' || r == ')'
+			})
+			if len(fields) > 0 && len(fields[0]) >= 32 {
+				return strings.TrimSpace(fields[0])
+			}
+		}
+	}
+	return ""
+}
+
 func extractConversationID(s string) string {
 	keys := []string{`"conversation_id":"`, `"session_id":"`, `"conversationId":"`, `"sessionId":"`}
 	for _, k := range keys {
@@ -327,6 +352,9 @@ func extractConversationID(s string) string {
 				}
 			}
 		}
+	}
+	if cid := extractConversationIDFromText(s); cid != "" {
+		return cid
 	}
 	return ""
 }

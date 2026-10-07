@@ -448,3 +448,77 @@ func TestEarlyConversationIDStreaming(t *testing.T) {
 	}
 }
 
+func TestExtractConversationIDFromText(t *testing.T) {
+	uuid1 := "d9d4953a-1427-4274-8010-7270aa743bb3"
+	logLine1 := "I1006 19:58:28.686365 1 server.go:1263] Created conversation " + uuid1
+	if got := extractConversationIDFromText(logLine1); got != uuid1 {
+		t.Fatalf("expected %s, got %s", uuid1, got)
+	}
+
+	uuid2 := "a45a2580-7964-4dcd-8a79-f45696a9add0"
+	logLine2 := "I1006 19:58:28.693980 1 session.go:192] Print mode: conversation=" + uuid2 + ", sending message"
+	if got := extractConversationIDFromText(logLine2); got != uuid2 {
+		t.Fatalf("expected %s, got %s", uuid2, got)
+	}
+
+	stdoutText := "Session initialized: Created conversation " + uuid1 + "\n"
+	if got := extractConversationID(stdoutText); got != uuid1 {
+		t.Fatalf("expected %s from extractConversationID, got %s", uuid1, got)
+	}
+}
+
+func TestLogFileConversationIDPostExit(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "engine.log")
+	uuid := "e1234567-89ab-cdef-0123-456789abcdef"
+
+	script := filepath.Join(dir, "run_log.sh")
+	// Writes to log file right before exiting
+	body := "#!/bin/sh\nsleep 0.05\necho 'Created conversation " + uuid + "' > \"" + logFile + "\"\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var capturedID string
+	var mu sync.Mutex
+	doneCapture := make(chan struct{})
+
+	stream := &testCaptureStream{}
+	eng := CLI{}
+	res, err := eng.Execute(context.Background(), ExecutionRequest{
+		Kind:         "execute",
+		WorktreePath: dir,
+		DocsHubPath:  dir,
+		LogFile:      logFile,
+		Argv:         []string{"/bin/sh", script},
+		OnConversationID: func(cid string) {
+			mu.Lock()
+			capturedID = cid
+			mu.Unlock()
+			select {
+			case <-doneCapture:
+			default:
+				close(doneCapture)
+			}
+		},
+	}, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("exit code %d", res.ExitCode)
+	}
+
+	select {
+	case <-doneCapture:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for log file OnConversationID callback")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if capturedID != uuid {
+		t.Fatalf("expected %q, got %q", uuid, capturedID)
+	}
+}
+
