@@ -477,6 +477,18 @@ func TestExtractConversationIDFromText(t *testing.T) {
 	if got := extractConversationID(stdoutText); got != uuid1 {
 		t.Fatalf("expected %s from extractConversationID, got %s", uuid1, got)
 	}
+
+	// New markers test
+	uuid3 := "b56c3691-8075-4ede-9b80-056707b0bee1"
+	if got := extractConversationIDFromText("Starting prompt: conversationID=" + uuid3); got != uuid3 {
+		t.Fatalf("expected %s, got %s", uuid3, got)
+	}
+	if got := extractConversationIDFromText("Agent active. Conversation ID: " + uuid3); got != uuid3 {
+		t.Fatalf("expected %s, got %s", uuid3, got)
+	}
+	if got := extractConversationIDFromText("Logged: conversation_id=" + uuid3); got != uuid3 {
+		t.Fatalf("expected %s, got %s", uuid3, got)
+	}
 }
 
 func TestLogFileConversationIDPostExit(t *testing.T) {
