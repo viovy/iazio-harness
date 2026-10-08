@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/auth"
@@ -200,6 +201,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	if resumeConvID == "" && job.EnvVars != nil {
 		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
 	}
+	var convWg sync.WaitGroup
 	execReq := engines.ExecutionRequest{
 		Engine:                     engineName,
 		Kind:                       job.Kind,
@@ -215,14 +217,37 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		ResumeConversationID:       resumeConvID,
 		OnConversationID: func(cid string) {
 			if cid != "" {
-				go func() {
-					_ = controlplane.PostConversation(context.Background(), api, token, jobID, cid)
-				}()
+				convWg.Add(1)
+				go func(c string) {
+					defer convWg.Done()
+					var err error
+					for attempt := 1; attempt <= 3; attempt++ {
+						err = controlplane.PostConversation(context.Background(), api, token, jobID, c)
+						if err == nil {
+							return
+						}
+						time.Sleep(100 * time.Millisecond)
+					}
+					if err != nil {
+						log.Printf("warning: failed to post conversation ID %s for job %s: %v", c, jobID, err)
+					}
+				}(cid)
 			}
 		},
 	}
 	execRes, execErr := runner.Execute(ctx, execReq, sp)
 	stopFlush()
+
+	// Wait for any in-flight conversation ID registrations with a bounded timeout
+	convDone := make(chan struct{})
+	go func() {
+		convWg.Wait()
+		close(convDone)
+	}()
+	select {
+	case <-convDone:
+	case <-time.After(3 * time.Second):
+	}
 
 	// Final spool flush
 	for _, ev := range sp.Flush() {

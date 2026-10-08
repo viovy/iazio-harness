@@ -224,7 +224,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 			logOffset = fi.Size()
 			if cid := extractConversationIDFromText(string(data)); cid != "" {
 				scanned = true
-				go req.OnConversationID(cid)
+				req.OnConversationID(cid)
 			}
 		}
 	}
@@ -328,7 +328,7 @@ func (w rawWriter) Write(p []byte) (int, error) {
 		if !*w.scanned {
 			if cid := extractConversationID(string(p)); cid != "" {
 				*w.scanned = true
-				go w.onConv(cid)
+				w.onConv(cid)
 			}
 		}
 		w.mu.Unlock()
@@ -345,6 +345,11 @@ func extractConversationIDFromText(sData string) string {
 		"Created conversation ",
 		"Print mode: conversation=",
 		"conversation=",
+		"conversationID=",
+		"conversation_id=",
+		"Conversation ID: ",
+		"Conversation ID=",
+		"conversation: ",
 		"Streaming conversation ",
 		"GetConversationDetail: found conversation ",
 	}
