@@ -233,12 +233,29 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	if resumeConvID == "" && job.EnvVars != nil {
 		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
 	}
-	if resumeConvID == "" && job.Kind == "resume" {
+	if job.Kind == "resume" {
 		resolver := sessionstore.DefaultResolver()
-		if sess, err := resolver.ResolveLatest(worktree); err == nil && sess != nil {
-			resumeConvID = sess.ConversationID
-			log.Printf("[harness] Auto-discovered prior conversation %s (source: %s, updated: %s) for worktree %s", resumeConvID, sess.Source, sess.UpdatedAt.Format(time.RFC3339), worktree)
-			_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Resuming execution: auto-discovered conversation %s from %s\n", resumeConvID, sess.Source)))
+		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
+		if job.StoryID == "" && dCtx.StoryID != "" {
+			job.StoryID = dCtx.StoryID
+		}
+		if resumeConvID == "" {
+			if dCtx.ConversationID != "" {
+				resumeConvID = dCtx.ConversationID
+				log.Printf("[harness] Discovered prior conversation %s from dirty context (review: %s, verdict: %s)", resumeConvID, dCtx.ReviewFile, dCtx.Verdict)
+			} else if job.StoryID != "" {
+				if sess, err := resolver.ResolveForStory(worktree, job.StoryID); err == nil && sess != nil {
+					resumeConvID = sess.ConversationID
+				}
+			} else {
+				if sess, err := resolver.ResolveLatest(worktree); err == nil && sess != nil {
+					resumeConvID = sess.ConversationID
+				}
+			}
+		}
+		if resumeConvID != "" {
+			log.Printf("[harness] Auto-discovered prior conversation %s (story: %s) for worktree %s", resumeConvID, job.StoryID, worktree)
+			_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Resuming execution: auto-discovered conversation %s (story: %s)\n", resumeConvID, job.StoryID)))
 		}
 	}
 	if resumeConvID != "" {
