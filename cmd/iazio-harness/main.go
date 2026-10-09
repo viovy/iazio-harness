@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/auth"
+	"github.com/viovy/iazio-harness/internal/checkpoint"
 	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/prompt"
@@ -113,6 +114,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	token, _ := auth.Bearer(ctx)
 	job, err := controlplane.GetJob(ctx, api, token, jobID)
 	if err != nil {
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: get job %s: %v\n", jobID, err))
+		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
 		return fmt.Errorf("get job: %w", err)
 	}
 	if worktree == "" {
@@ -123,10 +126,14 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	}
 	targetDir, err := engines.CheckoutDir(job.Kind, worktree, docsHub)
 	if err != nil {
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: checkout dir %s: %v\n", targetDir, err))
+		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
 		return err
 	}
 	lock, err := engines.Hold(targetDir, "")
 	if err != nil {
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: checkout lock on %s: %v\n", targetDir, err))
+		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
 		return fmt.Errorf("checkout lock: %w", err)
 	}
 	defer lock.Release()
@@ -145,14 +152,34 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		},
 	})
 	if err != nil {
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: prepare prompt for job %s: %v\n", jobID, err))
+		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
 		return fmt.Errorf("prepare prompt: %w", err)
 	}
 
 	sp, err := spool.Open(spool.DefaultDir(), jobID)
 	if err != nil {
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: open spool for job %s: %v\n", jobID, err))
+		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
 		return fmt.Errorf("open spool: %w", err)
 	}
 	defer sp.Close()
+
+	engineName := job.Engine
+	if engineName == "" {
+		engineName = "agy"
+	}
+
+	// Immediately post startup diagnostic chunk so UI never sits on blank "Waiting for output..."
+	_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Initializing execution for job %s on %s (engine: %s, kind: %s)\n", jobID, worktree, engineName, job.Kind)))
+	_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
+		JobID:        job.ID,
+		ScheduleID:   job.ScheduleID,
+		Engine:       engineName,
+		WorktreePath: worktree,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       "RUNNING",
+	})
 
 	flushCtx, stopFlush := context.WithCancel(ctx)
 	defer stopFlush()
@@ -160,6 +187,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		var lastTickSent time.Time
+		var lastSilenceWarning time.Time
 		for {
 			select {
 			case <-flushCtx.Done():
@@ -182,16 +210,19 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 								lastTickSent = now
 							}
 						}
+						// If the engine has been silent for >= 30s, emit an explicit diagnostic chunk
+						// so the user in iazio-web can see the process is alive and waiting for model response
+						if ev.SilentForMs >= 30000 && now.Sub(lastSilenceWarning) >= 30*time.Second {
+							lastSilenceWarning = now
+							diag := fmt.Sprintf("[iazio-harness] Execution active (job %s, engine: %s); silent for %ds (waiting for model output/response)...\n", jobID, engineName, ev.SilentForMs/1000)
+							_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", diag)
+						}
 					}
 				}
 			}
 		}
 	}()
 
-	engineName := job.Engine
-	if engineName == "" {
-		engineName = "agy"
-	}
 	runner := engines.CLI{Engine: engineName}
 	printTimeout := "10m"
 	if job.MaxExecutionDurationSeconds > 0 {
@@ -217,6 +248,15 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		ResumeConversationID:       resumeConvID,
 		OnConversationID: func(cid string) {
 			if cid != "" {
+				_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
+					JobID:          job.ID,
+					ScheduleID:     job.ScheduleID,
+					Engine:         engineName,
+					WorktreePath:   worktree,
+					ConversationID: cid,
+					StartedAt:      time.Now().UTC().Format(time.RFC3339),
+					Status:         "RUNNING",
+				})
 				convWg.Add(1)
 				go func(c string) {
 					defer convWg.Done()
@@ -255,6 +295,22 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 			_ = controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text)
 		}
 	}
+
+	// Save terminal execution checkpoint
+	finalStatus := "COMPLETED"
+	if execErr != nil || execRes.ExitCode != 0 {
+		finalStatus = "FAILED"
+	}
+	_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
+		JobID:          job.ID,
+		ScheduleID:     job.ScheduleID,
+		Engine:         engineName,
+		WorktreePath:   worktree,
+		ConversationID: resumeConvID,
+		StartedAt:      time.Now().UTC().Format(time.RFC3339),
+		Status:         finalStatus,
+		ExitCode:       execRes.ExitCode,
+	})
 
 	// Explicitly release checkout file lock before posting exit to control plane,
 	// ensuring subsequent jobs can immediately acquire the lock without race or contention.

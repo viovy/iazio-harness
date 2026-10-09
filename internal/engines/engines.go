@@ -4,6 +4,7 @@ package engines
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -181,7 +182,13 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		return ExecutionResult{}, err
 	}
 	if err := cmd.Start(); err != nil {
+		if stream != nil {
+			_ = stream.AppendRaw("stderr", []byte(fmt.Sprintf("[iazio-harness] FATAL: failed to spawn %s: %v\n", bin, err)))
+		}
 		return ExecutionResult{}, err
+	}
+	if cmd.Process != nil && stream != nil {
+		_ = stream.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Spawned engine process %s with PID %d\n", filepath.Base(bin), cmd.Process.Pid)))
 	}
 	done := make(chan struct{})
 	go watchCancel(ctx, cmd, done)
