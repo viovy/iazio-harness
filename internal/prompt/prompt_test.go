@@ -32,3 +32,23 @@ func TestTranscriptNotInBody(t *testing.T) {
 		t.Fatal(res.Prompt)
 	}
 }
+
+func TestPrepareResumeKind(t *testing.T) {
+	res, err := Prepare(Input{
+		JobID: "job-99", Kind: "resume",
+		Body: "implement story", Values: Values{WorktreePath: "/repos/sample"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Prompt, "harness-job: job-99 [RESUME]") {
+		t.Fatalf("expected resume header, got %q", res.Prompt)
+	}
+	if !strings.Contains(res.Prompt, "[RESUMPTION NOTICE]") {
+		t.Fatalf("expected resumption notice, got %q", res.Prompt)
+	}
+	if !strings.Contains(res.Prompt, "implement story") {
+		t.Fatalf("expected original prompt body, got %q", res.Prompt)
+	}
+}
+

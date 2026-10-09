@@ -16,6 +16,7 @@ import (
 	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/prompt"
+	"github.com/viovy/iazio-harness/internal/sessionstore"
 	"github.com/viovy/iazio-harness/internal/spool"
 )
 
@@ -231,6 +232,34 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	resumeConvID := job.ResumeConversationID
 	if resumeConvID == "" && job.EnvVars != nil {
 		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
+	}
+	if job.Kind == "resume" {
+		resolver := sessionstore.DefaultResolver()
+		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
+		if job.StoryID == "" && dCtx.StoryID != "" {
+			job.StoryID = dCtx.StoryID
+		}
+		if resumeConvID == "" {
+			if dCtx.ConversationID != "" {
+				resumeConvID = dCtx.ConversationID
+				log.Printf("[harness] Discovered prior conversation %s from dirty context (review: %s, verdict: %s)", resumeConvID, dCtx.ReviewFile, dCtx.Verdict)
+			} else if job.StoryID != "" {
+				if sess, err := resolver.ResolveForStory(worktree, job.StoryID); err == nil && sess != nil {
+					resumeConvID = sess.ConversationID
+				}
+			} else {
+				if sess, err := resolver.ResolveLatest(worktree); err == nil && sess != nil {
+					resumeConvID = sess.ConversationID
+				}
+			}
+		}
+		if resumeConvID != "" {
+			log.Printf("[harness] Auto-discovered prior conversation %s (story: %s) for worktree %s", resumeConvID, job.StoryID, worktree)
+			_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Resuming execution: auto-discovered conversation %s (story: %s)\n", resumeConvID, job.StoryID)))
+		}
+	}
+	if resumeConvID != "" {
+		_ = controlplane.PostConversation(context.Background(), api, token, jobID, resumeConvID)
 	}
 	var convWg sync.WaitGroup
 	execReq := engines.ExecutionRequest{
