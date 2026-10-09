@@ -98,6 +98,12 @@ func Prepare(in Input) (Result, error) {
 		return Result{}, errors.New("transcript bytes must not be placed in the prompt")
 	}
 	prompt := "harness-job: " + in.JobID + "\n" + filled
+	if in.Kind == "resume" {
+		prompt = "harness-job: " + in.JobID + " [RESUME]\n" +
+			"[RESUMPTION NOTICE]: You are resuming an interrupted execution in " + in.Values.WorktreePath + ".\n" +
+			"Do NOT discard or revert uncommitted changes or submodule commits. Inspect existing git status, reviews, and test status first.\n" +
+			"If implementation is already committed in submodules and initial review scheme has run, advance directly to subsequent review iterations and execute-story-flow closeout.\n\n" + filled
+	}
 	return Result{Prompt: prompt, SourceTranscriptPath: transcriptPath}, nil
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/prompt"
+	"github.com/viovy/iazio-harness/internal/sessionstore"
 	"github.com/viovy/iazio-harness/internal/spool"
 )
 
@@ -231,6 +232,17 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	resumeConvID := job.ResumeConversationID
 	if resumeConvID == "" && job.EnvVars != nil {
 		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
+	}
+	if resumeConvID == "" && job.Kind == "resume" {
+		resolver := sessionstore.DefaultResolver()
+		if sess, err := resolver.ResolveLatest(worktree); err == nil && sess != nil {
+			resumeConvID = sess.ConversationID
+			log.Printf("[harness] Auto-discovered prior conversation %s (source: %s, updated: %s) for worktree %s", resumeConvID, sess.Source, sess.UpdatedAt.Format(time.RFC3339), worktree)
+			_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Resuming execution: auto-discovered conversation %s from %s\n", resumeConvID, sess.Source)))
+		}
+	}
+	if resumeConvID != "" {
+		_ = controlplane.PostConversation(context.Background(), api, token, jobID, resumeConvID)
 	}
 	var convWg sync.WaitGroup
 	execReq := engines.ExecutionRequest{
