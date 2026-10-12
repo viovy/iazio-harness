@@ -1,6 +1,7 @@
 package sessionstore
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -127,14 +128,17 @@ conversation_id: "` + convRev + `"
 	conv3 := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	iazioDir := filepath.Join(worktree, ".iazio")
 	_ = os.MkdirAll(iazioDir, 0o755)
-	cpJSON := `{
-  "job_id": "job-99",
-  "engine": "agy",
-  "worktree_path": "` + worktree + `",
-  "conversation_id": "` + conv3 + `",
-  "started_at": "` + time.Now().Add(10*time.Minute).UTC().Format(time.RFC3339) + `"
-}`
-	_ = os.WriteFile(filepath.Join(iazioDir, "execution-checkpoint.json"), []byte(cpJSON), 0o644)
+	cpData, err := json.Marshal(map[string]any{
+		"job_id":          "job-99",
+		"engine":          "agy",
+		"worktree_path":   worktree,
+		"conversation_id": conv3,
+		"started_at":      time.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(iazioDir, "execution-checkpoint.json"), cpData, 0o644)
 
 	sess, err = resolver.ResolveLatest(worktree)
 	if err != nil || sess == nil {
