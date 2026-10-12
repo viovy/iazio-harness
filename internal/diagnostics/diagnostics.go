@@ -199,7 +199,7 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 			Code:        CodePermissionDenied,
 			Severity:    "ERROR",
 			Message:     "Execution encountered permission or authentication denial.",
-			Remediation: "Verify Bitwarden BWS token, GitHub auth credentials, or environment permissions.",
+			Remediation: "Verify secret vault token, GitHub auth credentials, or environment permissions.",
 		})
 	}
 

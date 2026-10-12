@@ -51,10 +51,10 @@ func TestDiagnose_AlreadyDoneOnMain(t *testing.T) {
 
 	report := Diagnose(DiagnosticInput{
 		JobID:        "job-1051",
-		StoryID:      "STORY-IAZIO-0098",
+		StoryID:      "STORY-APP-0098",
 		WorktreePath: tmpDir,
 		ExitCode:     0,
-		OutputText:   "After reviewing git log, STORY-IAZIO-0098 is already landed on origin/main via PR #3045.",
+		OutputText:   "After reviewing git log, STORY-APP-0098 is already landed on origin/main via PR #3045.",
 		GitRunner:    gitRunner,
 	})
 
@@ -92,7 +92,7 @@ func TestDiagnose_DirtyWorktreePostExit(t *testing.T) {
 
 	report := Diagnose(DiagnosticInput{
 		JobID:        "job-200",
-		StoryID:      "STORY-IAZIO-0100",
+		StoryID:      "STORY-APP-0100",
 		WorktreePath: tmpDir,
 		ExitCode:     0,
 		OutputText:   "I have edited the files for you.",
