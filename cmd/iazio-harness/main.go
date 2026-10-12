@@ -14,6 +14,7 @@ import (
 	"github.com/viovy/iazio-harness/internal/auth"
 	"github.com/viovy/iazio-harness/internal/checkpoint"
 	"github.com/viovy/iazio-harness/internal/controlplane"
+	"github.com/viovy/iazio-harness/internal/diagnostics"
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/prompt"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
@@ -261,6 +262,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	if resumeConvID != "" {
 		_ = controlplane.PostConversation(context.Background(), api, token, jobID, resumeConvID)
 	}
+	modelName, agentName, disableSlashCommands := resolveExecutionOptions(job, prepRes.Prompt)
+
 	var convWg sync.WaitGroup
 	execReq := engines.ExecutionRequest{
 		Engine:                     engineName,
@@ -269,8 +272,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		WorktreePath:               worktree,
 		DocsHubPath:                docsHub,
 		PrintTimeout:               printTimeout,
-		Model:                      "gemini-3.8-flash-high",
-		DisableSlashCommands:       true,
+		Model:                      modelName,
+		Agent:                      agentName,
+		DisableSlashCommands:       disableSlashCommands,
 		DangerouslySkipPermissions: true,
 		ScheduleEnv:                job.EnvVars,
 		LogFile:                    filepath.Join(spool.DefaultDir(), jobID+".engine.log"),
@@ -325,6 +329,36 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		}
 	}
 
+	// Execution Diagnosis & Anomaly Detection
+	engineLogData, _ := os.ReadFile(execReq.LogFile)
+	diagReport := diagnostics.Diagnose(diagnostics.DiagnosticInput{
+		JobID:        job.ID,
+		StoryID:      job.StoryID,
+		WorktreePath: worktree,
+		ExitCode:     execRes.ExitCode,
+		OutputText:   string(engineLogData),
+	})
+	if len(diagReport.Findings) > 0 {
+		for _, f := range diagReport.Findings {
+			diagMsg := fmt.Sprintf("[iazio-harness] Anomaly detected: [%s] (%s): %s Remediation: %s\n", f.Code, f.Severity, f.Message, f.Remediation)
+			_ = sp.AppendRaw("stdout", []byte(diagMsg))
+			_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", diagMsg)
+		}
+		if diagReport.SIR != nil {
+			sirMsg := fmt.Sprintf("[iazio-harness] Emitted Structured Intervention Request (SIR): %s (category: %s, auto-healable: %v)\n", diagReport.SIR.ID, diagReport.SIR.Category, diagReport.SIR.AutoHealable)
+			_ = sp.AppendRaw("stdout", []byte(sirMsg))
+			_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", sirMsg)
+			if diagReport.SIRPath != "" {
+				persMsg := fmt.Sprintf("[iazio-harness] SIR report persisted to: %s\n", diagReport.SIRPath)
+				_ = sp.AppendRaw("stdout", []byte(persMsg))
+				_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", persMsg)
+			}
+		}
+	}
+	if !diagReport.Healthy && execRes.ExitCode == 0 {
+		execRes.ExitCode = 1
+	}
+
 	// Save terminal execution checkpoint
 	finalStatus := "COMPLETED"
 	if execErr != nil || execRes.ExitCode != 0 {
@@ -375,4 +409,33 @@ func formatVersion() string {
 		sha = sha[:12]
 	}
 	return "iazio-harness " + version + "+" + sha
+}
+
+func resolveExecutionOptions(job controlplane.JobDetail, promptBody string) (model string, agent string, disableSlash bool) {
+	model = job.Model
+	if model == "" && job.EnvVars != nil {
+		model = job.EnvVars["MODEL"]
+	}
+	if model == "" {
+		model = "gemini-3.8-flash-high"
+	}
+
+	agent = job.Agent
+	if agent == "" && job.EnvVars != nil {
+		agent = job.EnvVars["AGENT"]
+	}
+
+	disableSlash = true
+	trimmedPrompt := strings.TrimSpace(promptBody)
+	if job.DisableSlashCommands != nil {
+		disableSlash = *job.DisableSlashCommands
+	} else if strings.HasPrefix(trimmedPrompt, "/") {
+		disableSlash = false
+	} else if job.EnvVars != nil {
+		if strings.ToLower(job.EnvVars["ENABLE_SLASH_COMMANDS"]) == "true" ||
+			strings.ToLower(job.EnvVars["DISABLE_SLASH_COMMANDS"]) == "false" {
+			disableSlash = false
+		}
+	}
+	return
 }
