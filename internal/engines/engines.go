@@ -195,8 +195,9 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 
 	var scanned bool
 	var convMu sync.Mutex
-	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, mu: &convMu}
-	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, mu: &convMu}
+	var recentOut, recentErr string
+	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentOut, mu: &convMu}
+	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentErr, mu: &convMu}
 
 	var logOffset int64
 	scanLogFile := func() {
@@ -323,6 +324,7 @@ type rawWriter struct {
 	dst     EventStream
 	onConv  func(string)
 	scanned *bool
+	recent  *string
 	mu      *sync.Mutex
 }
 
@@ -333,7 +335,17 @@ func (w rawWriter) Write(p []byte) (int, error) {
 	if w.onConv != nil && w.scanned != nil && w.mu != nil {
 		w.mu.Lock()
 		if !*w.scanned {
-			if cid := extractConversationID(string(p)); cid != "" {
+			var combined string
+			if w.recent != nil {
+				combined = *w.recent + string(p)
+				if len(combined) > 4096 {
+					combined = combined[len(combined)-4096:]
+				}
+				*w.recent = combined
+			} else {
+				combined = string(p)
+			}
+			if cid := extractConversationID(combined); cid != "" {
 				*w.scanned = true
 				w.onConv(cid)
 			}
