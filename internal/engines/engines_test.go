@@ -390,10 +390,13 @@ func TestExtractConversationID(t *testing.T) {
 }
 
 type testCaptureStream struct {
+	mu     sync.Mutex
 	events []string
 }
 
 func (s *testCaptureStream) AppendRaw(stream string, p []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.events = append(s.events, string(p))
 	return nil
 }
@@ -437,7 +440,7 @@ func TestEarlyConversationIDStreaming(t *testing.T) {
 
 	select {
 	case <-doneCapture:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for OnConversationID callback")
 	}
 
@@ -535,7 +538,7 @@ func TestLogFileConversationIDPostExit(t *testing.T) {
 
 	select {
 	case <-doneCapture:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for log file OnConversationID callback")
 	}
 

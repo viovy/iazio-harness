@@ -111,6 +111,9 @@ type JobDetail struct {
 	EnvVars                     map[string]string `json:"env_vars"`
 	MaxExecutionDurationSeconds int               `json:"max_execution_duration_seconds"`
 	ResumeConversationID        string            `json:"resume_conversation_id,omitempty"`
+	Model                       string            `json:"model,omitempty"`
+	Agent                       string            `json:"agent,omitempty"`
+	DisableSlashCommands        *bool             `json:"disable_slash_commands,omitempty"`
 }
 
 // GetJob fetches the job definition from the control plane.
