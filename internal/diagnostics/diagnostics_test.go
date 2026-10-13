@@ -197,3 +197,33 @@ func TestDiagnose_MergeConflict(t *testing.T) {
 		t.Fatalf("expected MERGE_CONFLICT finding, got: %+v", report)
 	}
 }
+
+func TestDiagnose_QuotaExhausted(t *testing.T) {
+	report := Diagnose(DiagnosticInput{
+		JobID:        "job-1067",
+		StoryID:      "STORY-IAZIO-0098",
+		WorktreePath: "/work/meta-repo-04",
+		ExitCode:     1,
+		OutputText:   "ActionRequiredError: Increase limits for faster responses You're out of usage. Switch to Auto, or ask your admin to increase your limit to continue.",
+		GitRunner: func(args ...string) (string, error) {
+			return "", nil
+		},
+	})
+
+	if report.Healthy {
+		t.Fatalf("expected unhealthy report for quota exhaustion")
+	}
+	found := false
+	for _, f := range report.Findings {
+		if f.Code == CodeQuotaExhausted {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected QUOTA_EXHAUSTED finding, got: %+v", report.Findings)
+	}
+	if report.SIR == nil || report.SIR.Category != "QUOTA_EXHAUSTED" {
+		t.Fatalf("expected SIR with category QUOTA_EXHAUSTED, got: %+v", report.SIR)
+	}
+}
