@@ -662,7 +662,7 @@ func getDirtyFiles(worktree string) map[string]bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "-C", worktree, "status", "--porcelain")
+	cmd := exec.CommandContext(ctx, "git", "-C", worktree, "status", "--porcelain", "-uall")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return dirty
