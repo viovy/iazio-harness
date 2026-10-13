@@ -362,6 +362,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 				_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", persMsg)
 			}
 		}
+		summaryText := "\n" + diagReport.TroubleshootingSummary() + "\n"
+		_ = sp.AppendRaw("stdout", []byte(summaryText))
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", summaryText)
 	}
 	if !diagReport.Healthy && execRes.ExitCode == 0 {
 		execRes.ExitCode = 1

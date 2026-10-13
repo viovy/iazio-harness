@@ -1,0 +1,2 @@
+go: build failed: syntax error: unexpected semicolon, expecting comma or )
+internal/engine.go:42: undefined: FooBar

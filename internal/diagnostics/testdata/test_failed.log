@@ -1,0 +1,4 @@
+=== RUN TestSomething
+--- FAIL: TestSomething (0.01s)
+FAIL github.com/viovy/iazio-harness/internal/engine [test failed]
+FAILED (failures=1)
