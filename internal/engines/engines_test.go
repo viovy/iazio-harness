@@ -62,7 +62,7 @@ func TestArgvOrder(t *testing.T) {
 				Engine: "agy", Prompt: "p", PrintTimeout: "10s", Model: "m", Kind: KindStoryRefinement,
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
-			want: []string{"agy", "--print", "p", "--print-timeout", "10s", "--model", "m"},
+			want: []string{"agy", "--print", "p", "--print-timeout", "10s", "--model", "m", "--dangerously-skip-permissions"},
 			cwd:  "/repos/docs-hub",
 		},
 		{
@@ -71,7 +71,7 @@ func TestArgvOrder(t *testing.T) {
 				Engine: "agy", Prompt: "hello", Kind: "execute",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
-			want: []string{"agy", "--print", "hello", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high"},
+			want: []string{"agy", "--print", "hello", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"},
 			cwd:  "/repos/leaf-01",
 		},
 		{
@@ -80,7 +80,7 @@ func TestArgvOrder(t *testing.T) {
 				Engine: "", Prompt: "hello", Kind: "execute",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
-			want: []string{"agy", "--print", "hello", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high"},
+			want: []string{"agy", "--print", "hello", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"},
 			cwd:  "/repos/leaf-01",
 		},
 		{
@@ -100,7 +100,7 @@ func TestArgvOrder(t *testing.T) {
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 				ResumeConversationID: "conv-uuid-456",
 			},
-			want: []string{"agy", "--print", "continue work", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--conversation", "conv-uuid-456"},
+			want: []string{"agy", "--print", "continue work", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--conversation", "conv-uuid-456", "--dangerously-skip-permissions"},
 			cwd:  "/repos/leaf-01",
 		},
 		{

@@ -488,9 +488,7 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		if req.DisableSlashCommands {
 			argv = append(argv, "--disable-slash-commands")
 		}
-		if req.DangerouslySkipPermissions {
-			argv = append(argv, "--dangerously-skip-permissions")
-		}
+		argv = append(argv, "--dangerously-skip-permissions")
 		if req.LogFile != "" {
 			argv = append(argv, "--log-file", req.LogFile)
 		}
