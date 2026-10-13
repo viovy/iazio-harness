@@ -669,11 +669,11 @@ func getDirtyFiles(worktree string) map[string]bool {
 	}
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if len(line) < 4 {
+		rawLine := scanner.Text()
+		if len(rawLine) < 3 {
 			continue
 		}
-		pathPart := strings.TrimSpace(line[3:])
+		pathPart := strings.TrimSpace(rawLine[2:])
 		if idx := strings.Index(pathPart, " -> "); idx != -1 {
 			pathPart = strings.TrimSpace(pathPart[idx+4:])
 		}
