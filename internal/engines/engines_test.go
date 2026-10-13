@@ -25,7 +25,7 @@ func TestArgvOrder(t *testing.T) {
 				Engine: "agent", Prompt: "do thing", Kind: "execute",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
-			want: []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--", "do thing"},
+			want: []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--model", "auto", "--", "do thing"},
 			cwd:  "/repos/leaf-01",
 		},
 		{
@@ -34,7 +34,7 @@ func TestArgvOrder(t *testing.T) {
 				Engine: "agent", Prompt: "-n", Kind: "execute",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
-			want: []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--", "-n"},
+			want: []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--model", "auto", "--", "-n"},
 			cwd:  "/repos/leaf-01",
 		},
 		{
@@ -43,7 +43,7 @@ func TestArgvOrder(t *testing.T) {
 				Engine: "agent", Prompt: "p", Kind: KindStoryRefinement,
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
-			want: []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--", "p"},
+			want: []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--model", "auto", "--", "p"},
 			cwd:  "/repos/docs-hub",
 		},
 		{
@@ -62,7 +62,7 @@ func TestArgvOrder(t *testing.T) {
 				Engine: "agy", Prompt: "p", PrintTimeout: "10s", Model: "m", Kind: KindStoryRefinement,
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
-			want: []string{"agy", "--print", "p", "--print-timeout", "10s", "--model", "m"},
+			want: []string{"agy", "--print", "p", "--print-timeout", "10s", "--model", "m", "--dangerously-skip-permissions"},
 			cwd:  "/repos/docs-hub",
 		},
 		{
@@ -71,7 +71,7 @@ func TestArgvOrder(t *testing.T) {
 				Engine: "agy", Prompt: "hello", Kind: "execute",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
-			want: []string{"agy", "--print", "hello", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high"},
+			want: []string{"agy", "--print", "hello", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"},
 			cwd:  "/repos/leaf-01",
 		},
 		{
@@ -80,7 +80,7 @@ func TestArgvOrder(t *testing.T) {
 				Engine: "", Prompt: "hello", Kind: "execute",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
-			want: []string{"agy", "--print", "hello", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high"},
+			want: []string{"agy", "--print", "hello", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"},
 			cwd:  "/repos/leaf-01",
 		},
 		{
@@ -88,9 +88,9 @@ func TestArgvOrder(t *testing.T) {
 			req: ExecutionRequest{
 				Engine: "agent", Prompt: "continue work", Kind: "execute",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
-				ResumeConversationID: "chat-uuid-123",
+				ResumeConversationID: "cursor-uuid-123",
 			},
-			want: []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--resume", "chat-uuid-123", "--", "continue work"},
+			want: []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--model", "auto", "--resume", "cursor-uuid-123", "--", "continue work"},
 			cwd:  "/repos/leaf-01",
 		},
 		{
@@ -100,7 +100,17 @@ func TestArgvOrder(t *testing.T) {
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 				ResumeConversationID: "conv-uuid-456",
 			},
-			want: []string{"agy", "--print", "continue work", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--conversation", "conv-uuid-456"},
+			want: []string{"agy", "--print", "continue work", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--conversation", "conv-uuid-456", "--dangerously-skip-permissions"},
+			cwd:  "/repos/leaf-01",
+		},
+		{
+			name: "agent explicit model",
+			req: ExecutionRequest{
+				Engine: "agent", Prompt: "build feature", Kind: "execute",
+				Model: "gpt-5",
+				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
+			},
+			want: []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--model", "gpt-5", "--", "build feature"},
 			cwd:  "/repos/leaf-01",
 		},
 		{

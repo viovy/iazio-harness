@@ -108,6 +108,21 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	if err := ctx.Err(); err != nil {
 		return ExecutionResult{}, err
 	}
+	if req.Engine != "" && c.Engine != req.Engine {
+		c.Engine = req.Engine
+	}
+	// If attempting to run agent with an Antigravity conversation ID, auto-correct engine to agy
+	if req.Engine == "agent" && req.ResumeConversationID != "" && (isAntigravityConversation(req.ResumeConversationID) || !strings.HasPrefix(strings.ToLower(req.ResumeConversationID), "cursor-")) {
+		req.Engine = "agy"
+		c.Engine = "agy"
+		if req.Model == "" || req.Model == "auto" {
+			req.Model = "gemini-3.8-flash-high"
+		}
+		if len(req.Argv) == 0 {
+			req.Argv = nil
+		}
+	}
+
 	argv := req.Argv
 	if len(argv) == 0 {
 		built, err := BuildArgv(req)
@@ -424,12 +439,31 @@ func WorkingDirectory(kind, worktree, docsHub string) string {
 	return worktree
 }
 
+// isAntigravityConversation reports whether a conversation ID resides in the Antigravity brain store.
+func isAntigravityConversation(cid string) bool {
+	if cid == "" {
+		return false
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return false
+	}
+	brainPath := filepath.Join(home, ".gemini", "antigravity-cli", "brain", cid)
+	fi, err := os.Stat(brainPath)
+	return err == nil && fi.IsDir()
+}
+
 // BuildArgv returns the IDE CLI arguments for the engine.
 // The prompt is a single argv element.
 func BuildArgv(req ExecutionRequest) ([]string, error) {
 	switch req.Engine {
 	case "agent":
 		argv := []string{"agent", "--print", "--output-format", "text", "--trust", "--force"}
+		model := req.Model
+		if model == "" || model == "gemini-3.8-flash-high" {
+			model = "auto"
+		}
+		argv = append(argv, "--model", model)
 		if req.ResumeConversationID != "" {
 			argv = append(argv, "--resume", req.ResumeConversationID)
 		}
@@ -454,9 +488,7 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		if req.DisableSlashCommands {
 			argv = append(argv, "--disable-slash-commands")
 		}
-		if req.DangerouslySkipPermissions {
-			argv = append(argv, "--dangerously-skip-permissions")
-		}
+		argv = append(argv, "--dangerously-skip-permissions")
 		if req.LogFile != "" {
 			argv = append(argv, "--log-file", req.LogFile)
 		}
