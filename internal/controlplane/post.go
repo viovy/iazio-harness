@@ -140,9 +140,25 @@ func GetJob(ctx context.Context, baseURL, token, jobID string) (JobDetail, error
 	return job, nil
 }
 
+// ExitOptions provides structured completion and failure metadata.
+type ExitOptions struct {
+	ExitCode       int    `json:"exit_code"`
+	Reason         string `json:"reason,omitempty"`
+	ErrorMessage   string `json:"error_message,omitempty"`
+	DiagnosticCode string `json:"diagnostic_code,omitempty"`
+	Engine         string `json:"engine,omitempty"`
+	Model          string `json:"model,omitempty"`
+	Remediation    string `json:"remediation,omitempty"`
+}
+
 // PostExit reports the process exit code to the control plane.
 func PostExit(ctx context.Context, baseURL, token, jobID string, exitCode int) error {
-	raw, err := json.Marshal(map[string]int{"exit_code": exitCode})
+	return PostExitWithOptions(ctx, baseURL, token, jobID, ExitOptions{ExitCode: exitCode})
+}
+
+// PostExitWithOptions reports detailed process exit status, error messages, and diagnostic codes.
+func PostExitWithOptions(ctx context.Context, baseURL, token, jobID string, opts ExitOptions) error {
+	raw, err := json.Marshal(opts)
 	if err != nil {
 		return err
 	}

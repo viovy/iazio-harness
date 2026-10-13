@@ -361,6 +361,61 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		ExitCode:     execRes.ExitCode,
 		OutputText:   combinedOutput,
 	})
+
+	// Check for quota exhaustion auto-fallback
+	isQuotaExhausted := false
+	for _, f := range diagReport.Findings {
+		if f.Code == diagnostics.CodeQuotaExhausted {
+			isQuotaExhausted = true
+			break
+		}
+	}
+	if !isQuotaExhausted && (strings.Contains(combinedOutput, "ActionRequiredError") || strings.Contains(combinedOutput, "out of usage")) {
+		isQuotaExhausted = true
+	}
+
+	if isQuotaExhausted && engineName == "agent" && ctx.Err() == nil {
+		fallbackEngine := "agy"
+		fallbackModel := "gemini-3.8-flash-high"
+		fallbackMsg := fmt.Sprintf("[iazio-harness] Quota/usage limit exhausted on engine 'agent' (Cursor CLI): ActionRequiredError: You're out of usage.\n[iazio-harness] Activating auto-engine fallback: switching to '%s' (model: %s) and re-executing prompt in-place...\n", fallbackEngine, fallbackModel)
+		_ = sp.AppendRaw("stdout", []byte(fallbackMsg))
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", fallbackMsg)
+
+		fallbackReq := execReq
+		fallbackReq.Engine = fallbackEngine
+		fallbackReq.Model = fallbackModel
+		fallbackRunner := engines.CLI{Engine: fallbackEngine}
+		if checkErr := fallbackRunner.HealthCheck(); checkErr == nil {
+			log.Printf("[harness] Auto-engine fallback: switching from agent to agy for job %s", jobID)
+			engineName = fallbackEngine
+			modelName = fallbackModel
+			execRes, execErr = fallbackRunner.Execute(ctx, fallbackReq, sp)
+
+			// Re-flush spool after fallback
+			for _, ev := range sp.Flush() {
+				if ev.Type == spool.EventOutputChunk {
+					_ = controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text)
+				}
+			}
+
+			// Re-diagnose after fallback run
+			engineLogData, _ = os.ReadFile(fallbackReq.LogFile)
+			spoolLogData, _ = os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
+			combinedOutput = string(engineLogData) + "\n" + string(spoolLogData)
+			diagReport = diagnostics.Diagnose(diagnostics.DiagnosticInput{
+				JobID:        job.ID,
+				StoryID:      job.StoryID,
+				WorktreePath: worktree,
+				ExitCode:     execRes.ExitCode,
+				OutputText:   combinedOutput,
+			})
+		} else {
+			warnMsg := fmt.Sprintf("[iazio-harness] Auto-fallback engine '%s' is not installed on host PATH: %v\n", fallbackEngine, checkErr)
+			_ = sp.AppendRaw("stdout", []byte(warnMsg))
+			_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", warnMsg)
+		}
+	}
+
 	if len(diagReport.Findings) > 0 {
 		for _, f := range diagReport.Findings {
 			diagMsg := fmt.Sprintf("[iazio-harness] Anomaly detected: [%s] (%s): %s Remediation: %s\n", f.Code, f.Severity, f.Message, f.Remediation)
@@ -405,9 +460,37 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	// ensuring subsequent jobs can immediately acquire the lock without race or contention.
 	_ = lock.Release()
 
+	exitOpts := controlplane.ExitOptions{
+		ExitCode: execRes.ExitCode,
+		Engine:   engineName,
+		Model:    modelName,
+	}
+	if execRes.ExitCode != 0 || !diagReport.Healthy {
+		if len(diagReport.Findings) > 0 {
+			f := diagReport.Findings[0]
+			exitOpts.DiagnosticCode = string(f.Code)
+			exitOpts.Reason = string(f.Code)
+			exitOpts.ErrorMessage = f.Message
+			exitOpts.Remediation = f.Remediation
+		}
+		for _, line := range strings.Split(combinedOutput, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.Contains(trimmed, "ActionRequiredError") || strings.Contains(trimmed, "out of usage") {
+				exitOpts.ErrorMessage = trimmed
+				exitOpts.DiagnosticCode = string(diagnostics.CodeQuotaExhausted)
+				exitOpts.Reason = string(diagnostics.CodeQuotaExhausted)
+				exitOpts.Remediation = "Switch execution engine (e.g. to agy with Gemini Flash / Auto model) or increase model usage limit."
+				break
+			}
+		}
+		if exitOpts.Reason == "" {
+			exitOpts.Reason = "NON_ZERO_EXIT"
+		}
+	}
+
 	var postExitErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		postExitErr = controlplane.PostExit(context.Background(), api, token, jobID, execRes.ExitCode)
+		postExitErr = controlplane.PostExitWithOptions(context.Background(), api, token, jobID, exitOpts)
 		if postExitErr == nil {
 			break
 		}
@@ -421,7 +504,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		return execErr
 	}
 	if execRes.ExitCode != 0 {
-		return fmt.Errorf("engine %s exited with code %d", job.Engine, execRes.ExitCode)
+		return fmt.Errorf("engine %s exited with code %d", engineName, execRes.ExitCode)
 	}
 	return nil
 }
