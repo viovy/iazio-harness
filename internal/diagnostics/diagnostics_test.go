@@ -202,8 +202,8 @@ func TestDiagnose_MergeConflict(t *testing.T) {
 func TestDiagnose_QuotaExhausted(t *testing.T) {
 	report := Diagnose(DiagnosticInput{
 		JobID:        "job-1067",
-		StoryID:      "STORY-IAZIO-0098",
-		WorktreePath: "/work/meta-repo-04",
+		StoryID:      "STORY-APP-0098",
+		WorktreePath: t.TempDir(),
 		ExitCode:     1,
 		OutputText:   "ActionRequiredError: Increase limits for faster responses You're out of usage. Switch to Auto, or ask your admin to increase your limit to continue.",
 		GitRunner: func(args ...string) (string, error) {
@@ -232,7 +232,7 @@ func TestDiagnose_QuotaExhausted(t *testing.T) {
 func TestDiagnose_ProcessKilled(t *testing.T) {
 	report := Diagnose(DiagnosticInput{
 		JobID:        "job-1068",
-		StoryID:      "STORY-IAZIO-0098",
+		StoryID:      "STORY-APP-0098",
 		WorktreePath: t.TempDir(),
 		ExitCode:     137,
 		OutputText:   "fatal error: out of memory allocating 2147483648 bytes\nsignal: killed\nKilled: 9\nexit status 137",
@@ -266,7 +266,7 @@ func TestDiagnose_ProcessKilled(t *testing.T) {
 func TestDiagnose_BinaryNotFound(t *testing.T) {
 	report := Diagnose(DiagnosticInput{
 		JobID:        "job-1069",
-		StoryID:      "STORY-IAZIO-0099",
+		StoryID:      "STORY-APP-0099",
 		WorktreePath: t.TempDir(),
 		ExitCode:     127,
 		OutputText:   `exec: "agy": executable file not found in $PATH` + "\n" + `bash: command not found: agy`,
@@ -296,7 +296,7 @@ func TestDiagnose_BinaryNotFound(t *testing.T) {
 func TestDiagnose_ContextExceeded(t *testing.T) {
 	report := Diagnose(DiagnosticInput{
 		JobID:        "job-1070",
-		StoryID:      "STORY-IAZIO-0100",
+		StoryID:      "STORY-APP-0100",
 		WorktreePath: t.TempDir(),
 		ExitCode:     1,
 		OutputText:   "API Error: context length exceeded (requested 128500 tokens, maximum context length is 128000)\ntoken limit exceeded",
@@ -326,7 +326,7 @@ func TestDiagnose_ContextExceeded(t *testing.T) {
 func TestDiagnose_BuildFailed(t *testing.T) {
 	report := Diagnose(DiagnosticInput{
 		JobID:        "job-1071",
-		StoryID:      "STORY-IAZIO-0101",
+		StoryID:      "STORY-APP-0101",
 		WorktreePath: t.TempDir(),
 		ExitCode:     2,
 		OutputText:   "go: build failed: syntax error: unexpected semicolon, expecting comma or )\ninternal/engine.go:42: undefined: FooBar",
@@ -356,7 +356,7 @@ func TestDiagnose_BuildFailed(t *testing.T) {
 func TestDiagnose_TestFailed(t *testing.T) {
 	report := Diagnose(DiagnosticInput{
 		JobID:        "job-1072",
-		StoryID:      "STORY-IAZIO-0102",
+		StoryID:      "STORY-APP-0102",
 		WorktreePath: t.TempDir(),
 		ExitCode:     1,
 		OutputText:   "=== RUN TestSomething\n--- FAIL: TestSomething (0.01s)\nFAIL github.com/viovy/iazio-harness/internal/engine [test failed]\nFAILED (failures=1)",
@@ -386,7 +386,7 @@ func TestDiagnose_TestFailed(t *testing.T) {
 func TestDiagnose_AlreadyDoneOnMainBranchInfo(t *testing.T) {
 	report := Diagnose(DiagnosticInput{
 		JobID:        "job-1073",
-		StoryID:      "STORY-IAZIO-0103",
+		StoryID:      "STORY-APP-0103",
 		WorktreePath: t.TempDir(),
 		ExitCode:     0,
 		OutputText:   "Story is already landed on main.",
