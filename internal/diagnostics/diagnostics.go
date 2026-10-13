@@ -107,12 +107,15 @@ var mergeConflictRegexes = []*regexp.Regexp{
 }
 
 var quotaExhaustedRegexes = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)ActionRequiredError:\s*Increase\s+limits`),
+	regexp.MustCompile(`(?i)ActionRequiredError`),
+	regexp.MustCompile(`(?i)Increase\s+limits\s+for\s+faster\s+responses`),
 	regexp.MustCompile(`(?i)You're\s+out\s+of\s+usage`),
+	regexp.MustCompile(`(?i)out\s+of\s+usage`),
 	regexp.MustCompile(`(?i)Switch\s+to\s+Auto,\s+or\s+ask\s+your\s+admin\s+to\s+increase\s+your\s+limit`),
 	regexp.MustCompile(`(?i)rate\s+limit\s+exceeded`),
 	regexp.MustCompile(`(?i)quota\s+exceeded`),
 	regexp.MustCompile(`(?i)RESOURCE_EXHAUSTED`),
+	regexp.MustCompile(`(?i)insufficient_quota`),
 	regexp.MustCompile(`(?i)429\s+Too\s+Many\s+Requests`),
 }
 
