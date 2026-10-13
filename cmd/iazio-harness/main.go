@@ -240,7 +240,6 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		}
 	}()
 
-	runner := engines.CLI{Engine: engineName}
 	printTimeout := "10m"
 	if job.MaxExecutionDurationSeconds > 0 {
 		printTimeout = fmt.Sprintf("%ds", job.MaxExecutionDurationSeconds)
@@ -283,6 +282,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		_ = controlplane.PostConversation(context.Background(), api, token, jobID, resumeConvID)
 	}
 	modelName, agentName, disableSlashCommands := resolveExecutionOptions(job, prepRes.Prompt)
+	runner := engines.CLI{Engine: engineName}
 
 	var convWg sync.WaitGroup
 	execReq := engines.ExecutionRequest{
@@ -384,6 +384,10 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		fallbackReq := execReq
 		fallbackReq.Engine = fallbackEngine
 		fallbackReq.Model = fallbackModel
+		fallbackReq.Argv = nil
+		if fallbackReq.ResumeConversationID != "" && strings.HasPrefix(strings.ToLower(fallbackReq.ResumeConversationID), "cursor-") {
+			fallbackReq.ResumeConversationID = ""
+		}
 		fallbackRunner := engines.CLI{Engine: fallbackEngine}
 		if checkErr := fallbackRunner.HealthCheck(); checkErr == nil {
 			log.Printf("[harness] Auto-engine fallback: switching from agent to agy for job %s", jobID)
