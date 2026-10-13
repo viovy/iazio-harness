@@ -140,6 +140,21 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	}
 	defer lock.Release()
 
+	storyID := job.StoryID
+	if strings.TrimSpace(storyID) == "" {
+		dCtx := sessionstore.DefaultResolver().DetectDirtyWorktreeContext(worktree)
+		if dCtx.StoryID != "" {
+			storyID = dCtx.StoryID
+		}
+	}
+	if strings.TrimSpace(storyID) == "" {
+		if job.Kind == "resume" {
+			storyID = "STORY-RESUME-INPLACE"
+		} else {
+			storyID = "resume complete current ase flow"
+		}
+	}
+
 	prepRes, err := prompt.Prepare(prompt.Input{
 		Kind:       job.Kind,
 		JobID:      job.ID,
@@ -147,7 +162,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		Transcript: job.Transcript,
 		SpoolDir:   spool.DefaultDir(),
 		Values: prompt.Values{
-			StoryID:        job.StoryID,
+			StoryID:        storyID,
 			TargetLeafName: filepath.Base(worktree),
 			WorktreePath:   worktree,
 			DocsHubPath:    docsHub,

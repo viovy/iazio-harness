@@ -52,3 +52,16 @@ func TestPrepareResumeKind(t *testing.T) {
 	}
 }
 
+func TestPrepareResumeEmptyStoryID(t *testing.T) {
+	res, err := Prepare(Input{
+		JobID: "job-100", Kind: "resume",
+		Body: "finish story {{.StoryID}} in {{.WorktreePath}}", Values: Values{WorktreePath: "/repos/app"},
+	})
+	if err != nil {
+		t.Fatalf("expected Prepare to succeed with fallback StoryID, got error: %v", err)
+	}
+	if !strings.Contains(res.Prompt, "finish story STORY-RESUME-INPLACE in /repos/app") {
+		t.Fatalf("expected fallback StoryID in prompt, got %q", res.Prompt)
+	}
+}
+
