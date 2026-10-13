@@ -15,14 +15,19 @@ import (
 
 // Anomaly codes.
 const (
-	CodeAlreadyDoneOnMain    = "ALREADY_DONE_ON_MAIN"
-	CodeDirtyWorktreePostExit = "DIRTY_WORKTREE_POST_EXIT"
-	CodeBranchSuperseded     = "BRANCH_SUPERSEDED"
-	CodeSlashCommandIgnored  = "SLASH_COMMAND_IGNORED"
-	CodePermissionDenied     = "PERMISSION_DENIED"
-	CodeMergeConflict        = "MERGE_CONFLICT"
-	CodeQuotaExhausted       = "QUOTA_EXHAUSTED"
-	CodeNonZeroExit          = "NON_ZERO_EXIT"
+	CodeAlreadyDoneOnMain     = "ALREADY_DONE_ON_MAIN"
+	CodeDirtyWorktreePostExit  = "DIRTY_WORKTREE_POST_EXIT"
+	CodeBranchSuperseded      = "BRANCH_SUPERSEDED"
+	CodeSlashCommandIgnored   = "SLASH_COMMAND_IGNORED"
+	CodePermissionDenied      = "PERMISSION_DENIED"
+	CodeMergeConflict         = "MERGE_CONFLICT"
+	CodeQuotaExhausted        = "QUOTA_EXHAUSTED"
+	CodeProcessKilled         = "PROCESS_KILLED"
+	CodeBinaryNotFound        = "BINARY_NOT_FOUND"
+	CodeContextExceeded       = "CONTEXT_EXCEEDED"
+	CodeBuildFailed           = "BUILD_FAILED"
+	CodeTestFailed            = "TEST_FAILED"
+	CodeNonZeroExit           = "NON_ZERO_EXIT"
 )
 
 // Finding represents one detected issue or anomaly.
@@ -111,6 +116,41 @@ var quotaExhaustedRegexes = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)429\s+Too\s+Many\s+Requests`),
 }
 
+var processKilledRegexes = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)Killed:\s*9`),
+	regexp.MustCompile(`(?i)signal:\s*(killed|terminated)`),
+	regexp.MustCompile(`(?i)fatal\s+error:\s*out\s+of\s+memory`),
+	regexp.MustCompile(`(?i)runtime:\s*out\s+of\s+memory`),
+	regexp.MustCompile(`(?i)exit\s+status\s+(137|143)`),
+	regexp.MustCompile(`(?i)segmentation\s+fault`),
+	regexp.MustCompile(`(?i)process_disappeared_on_host`),
+}
+
+var binaryNotFoundRegexes = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)executable\s+file\s+not\s+found`),
+	regexp.MustCompile(`(?i)command\s+not\s+found:\s*([a-zA-Z0-9_-]+)`),
+	regexp.MustCompile(`(?i)no\s+such\s+file\s+or\s+directory.*(?:bin|agy|agent|cursor|autopilot|git)`),
+}
+
+var contextExceededRegexes = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)context\s+length\s+exceeded`),
+	regexp.MustCompile(`(?i)maximum\s+context\s+length`),
+	regexp.MustCompile(`(?i)token\s+limit\s+exceeded`),
+}
+
+var buildFailedRegexes = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)build\s+failed`),
+	regexp.MustCompile(`(?i)compilation\s+error`),
+	regexp.MustCompile(`(?i)syntax\s+error:`),
+	regexp.MustCompile(`(?i)undefined:\s+[a-zA-Z0-9_]+`),
+}
+
+var testFailedRegexes = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)---\s+FAIL:`),
+	regexp.MustCompile(`(?i)FAIL\s+github\.com/`),
+	regexp.MustCompile(`(?i)FAILED\s+\(failures=\d+\)`),
+}
+
 // Diagnose evaluates execution logs and worktree state to detect anomalies.
 func Diagnose(input DiagnosticInput) DiagnosticReport {
 	report := DiagnosticReport{
@@ -185,6 +225,46 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 		}
 	}
 
+	hasProcessKilled := false
+	for _, re := range processKilledRegexes {
+		if re.MatchString(input.OutputText) {
+			hasProcessKilled = true
+			break
+		}
+	}
+
+	hasBinaryNotFound := false
+	for _, re := range binaryNotFoundRegexes {
+		if re.MatchString(input.OutputText) {
+			hasBinaryNotFound = true
+			break
+		}
+	}
+
+	hasContextExceeded := false
+	for _, re := range contextExceededRegexes {
+		if re.MatchString(input.OutputText) {
+			hasContextExceeded = true
+			break
+		}
+	}
+
+	hasBuildFailed := false
+	for _, re := range buildFailedRegexes {
+		if re.MatchString(input.OutputText) {
+			hasBuildFailed = true
+			break
+		}
+	}
+
+	hasTestFailed := false
+	for _, re := range testFailedRegexes {
+		if re.MatchString(input.OutputText) {
+			hasTestFailed = true
+			break
+		}
+	}
+
 	// 4. Compile findings
 	if hasAlreadyDone {
 		if report.Branch != "" && report.Branch != "main" && report.Branch != "master" {
@@ -210,6 +290,51 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 			Severity:    "ERROR",
 			Message:     "Execution engine encountered model usage/quota exhaustion or rate limit (ActionRequiredError/RESOURCE_EXHAUSTED).",
 			Remediation: "Switch execution engine (e.g. to agy with Auto/alternate model tier) or increase model usage quota.",
+		})
+	}
+
+	if hasProcessKilled {
+		report.Findings = append(report.Findings, Finding{
+			Code:        CodeProcessKilled,
+			Severity:    "ERROR",
+			Message:     "Child execution process was killed, crashed, or disappeared on host (OOM / SIGKILL / SIGSEGV).",
+			Remediation: "Verify host resource limits (memory/swap), check system logs for OOM events, and resume job using a smaller model tier.",
+		})
+	}
+
+	if hasBinaryNotFound {
+		report.Findings = append(report.Findings, Finding{
+			Code:        CodeBinaryNotFound,
+			Severity:    "ERROR",
+			Message:     "Required tool executable or binary was not found on host PATH.",
+			Remediation: "Ensure tool binary is installed in ~/.local/bin or ~/.iazio/bin and present in the agent host PATH.",
+		})
+	}
+
+	if hasContextExceeded {
+		report.Findings = append(report.Findings, Finding{
+			Code:        CodeContextExceeded,
+			Severity:    "ERROR",
+			Message:     "Model context length or token limit exceeded during prompt execution.",
+			Remediation: "Compact conversation history, reduce prompt size, or switch to a high-capacity model tier.",
+		})
+	}
+
+	if hasBuildFailed {
+		report.Findings = append(report.Findings, Finding{
+			Code:        CodeBuildFailed,
+			Severity:    "ERROR",
+			Message:     "Compilation, build, or syntax check failed during execution.",
+			Remediation: "Inspect compiler output, correct syntax/type errors, and verify local build passes.",
+		})
+	}
+
+	if hasTestFailed {
+		report.Findings = append(report.Findings, Finding{
+			Code:        CodeTestFailed,
+			Severity:    "ERROR",
+			Message:     "Automated unit or integration tests failed during execution.",
+			Remediation: "Run test suite locally, fix failing assertions, and verify 100% test pass rate.",
 		})
 	}
 
@@ -321,6 +446,30 @@ func createSIR(input DiagnosticInput, report DiagnosticReport) *SIRRecord {
 			category = "QUOTA_EXHAUSTED"
 			remediation = f.Remediation
 			summary = f.Message
+		} else if f.Code == CodeProcessKilled {
+			category = "PROCESS_KILLED"
+			remediation = f.Remediation
+			summary = f.Message
+		} else if f.Code == CodeBinaryNotFound {
+			category = "TOOL_UNAVAILABLE"
+			remediation = f.Remediation
+			summary = f.Message
+		} else if f.Code == CodeContextExceeded {
+			category = "CONTEXT_EXCEEDED"
+			remediation = f.Remediation
+			summary = f.Message
+		} else if f.Code == CodeBuildFailed {
+			category = "BUILD_FAILURE"
+			remediation = f.Remediation
+			summary = f.Message
+		} else if f.Code == CodeTestFailed {
+			category = "TEST_FAILURE"
+			remediation = f.Remediation
+			summary = f.Message
+		} else if f.Code == CodeMergeConflict {
+			category = "MERGE_CONFLICT"
+			remediation = f.Remediation
+			summary = f.Message
 		}
 	}
 
@@ -343,6 +492,43 @@ func createSIR(input DiagnosticInput, report DiagnosticReport) *SIRRecord {
 		Remediation:   remediation,
 		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
 	}
+}
+
+// TroubleshootingSummary formats a human-readable markdown troubleshooting report.
+func (r DiagnosticReport) TroubleshootingSummary() string {
+	var sb strings.Builder
+	status := "HEALTHY"
+	if !r.Healthy {
+		status = "UNHEALTHY / DEGRADED"
+	}
+	sb.WriteString(fmt.Sprintf("### Diagnostics & Troubleshooting Report [%s]\n\n", status))
+	sb.WriteString(fmt.Sprintf("- **Exit Code:** %d\n", r.ExitCode))
+	if r.StoryID != "" {
+		sb.WriteString(fmt.Sprintf("- **Story ID:** %s\n", r.StoryID))
+	}
+	if r.Branch != "" {
+		sb.WriteString(fmt.Sprintf("- **Branch:** `%s`\n", r.Branch))
+	}
+	if r.WorktreePath != "" {
+		sb.WriteString(fmt.Sprintf("- **Worktree:** `%s`\n", r.WorktreePath))
+	}
+	if r.SIRPath != "" {
+		sb.WriteString(fmt.Sprintf("- **SIR Generated:** [`%s`](file://%s)\n", filepath.Base(r.SIRPath), r.SIRPath))
+	}
+
+	if len(r.Findings) == 0 {
+		sb.WriteString("\n*No anomalies or failure signatures detected.*\n")
+		return sb.String()
+	}
+
+	sb.WriteString("\n#### Detected Anomalies & Actionable Remedies:\n\n")
+	for i, f := range r.Findings {
+		sb.WriteString(fmt.Sprintf("%d. **[%s] %s**\n", i+1, f.Severity, f.Code))
+		sb.WriteString(fmt.Sprintf("   - **Message:** %s\n", f.Message))
+		sb.WriteString(fmt.Sprintf("   - **Remediation Action:** %s\n\n", f.Remediation))
+	}
+
+	return sb.String()
 }
 
 func writeSIR(worktree, jobID, storyID string, sir *SIRRecord) (string, error) {

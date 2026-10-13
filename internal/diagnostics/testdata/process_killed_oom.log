@@ -1,0 +1,4 @@
+fatal error: out of memory allocating 2147483648 bytes
+signal: killed
+Killed: 9
+exit status 137
