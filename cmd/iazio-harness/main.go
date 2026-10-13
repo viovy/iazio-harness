@@ -255,8 +255,13 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 			}
 		}
 		if resumeConvID != "" {
-			log.Printf("[harness] Auto-discovered prior conversation %s (story: %s) for worktree %s", resumeConvID, job.StoryID, worktree)
-			_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Resuming execution: auto-discovered conversation %s (story: %s)\n", resumeConvID, job.StoryID)))
+			lowConv := strings.ToLower(resumeConvID)
+			if !strings.HasPrefix(lowConv, "cursor-") && engineName == "agent" {
+				engineName = "agy"
+				log.Printf("[harness] Auto-corrected engine from agent to agy for session %s", resumeConvID)
+			}
+			log.Printf("[harness] Auto-discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
+			_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Resuming execution: auto-discovered conversation %s (story: %s, engine: %s)\n", resumeConvID, job.StoryID, engineName)))
 		}
 	}
 	if resumeConvID != "" {
@@ -331,12 +336,15 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 
 	// Execution Diagnosis & Anomaly Detection
 	engineLogData, _ := os.ReadFile(execReq.LogFile)
+	spoolLogData, _ := os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
+	combinedOutput := string(engineLogData) + "\n" + string(spoolLogData)
+
 	diagReport := diagnostics.Diagnose(diagnostics.DiagnosticInput{
 		JobID:        job.ID,
 		StoryID:      job.StoryID,
 		WorktreePath: worktree,
 		ExitCode:     execRes.ExitCode,
-		OutputText:   string(engineLogData),
+		OutputText:   combinedOutput,
 	})
 	if len(diagReport.Findings) > 0 {
 		for _, f := range diagReport.Findings {

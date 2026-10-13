@@ -21,6 +21,7 @@ const (
 	CodeSlashCommandIgnored  = "SLASH_COMMAND_IGNORED"
 	CodePermissionDenied     = "PERMISSION_DENIED"
 	CodeMergeConflict        = "MERGE_CONFLICT"
+	CodeQuotaExhausted       = "QUOTA_EXHAUSTED"
 	CodeNonZeroExit          = "NON_ZERO_EXIT"
 )
 
@@ -100,6 +101,16 @@ var mergeConflictRegexes = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)Automatic\s+merge\s+failed;\s+fix\s+conflicts`),
 }
 
+var quotaExhaustedRegexes = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)ActionRequiredError:\s*Increase\s+limits`),
+	regexp.MustCompile(`(?i)You're\s+out\s+of\s+usage`),
+	regexp.MustCompile(`(?i)Switch\s+to\s+Auto,\s+or\s+ask\s+your\s+admin\s+to\s+increase\s+your\s+limit`),
+	regexp.MustCompile(`(?i)rate\s+limit\s+exceeded`),
+	regexp.MustCompile(`(?i)quota\s+exceeded`),
+	regexp.MustCompile(`(?i)RESOURCE_EXHAUSTED`),
+	regexp.MustCompile(`(?i)429\s+Too\s+Many\s+Requests`),
+}
+
 // Diagnose evaluates execution logs and worktree state to detect anomalies.
 func Diagnose(input DiagnosticInput) DiagnosticReport {
 	report := DiagnosticReport{
@@ -166,6 +177,14 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 		}
 	}
 
+	hasQuotaExhausted := false
+	for _, re := range quotaExhaustedRegexes {
+		if re.MatchString(input.OutputText) {
+			hasQuotaExhausted = true
+			break
+		}
+	}
+
 	// 4. Compile findings
 	if hasAlreadyDone {
 		if report.Branch != "" && report.Branch != "main" && report.Branch != "master" {
@@ -183,6 +202,15 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 				Remediation: "Close out story or pull latest origin/main.",
 			})
 		}
+	}
+
+	if hasQuotaExhausted {
+		report.Findings = append(report.Findings, Finding{
+			Code:        CodeQuotaExhausted,
+			Severity:    "ERROR",
+			Message:     "Execution engine encountered model usage/quota exhaustion or rate limit (ActionRequiredError/RESOURCE_EXHAUSTED).",
+			Remediation: "Switch execution engine (e.g. to agy with Auto/alternate model tier) or increase model usage quota.",
+		})
 	}
 
 	if hasSlashDisabled {
@@ -287,6 +315,10 @@ func createSIR(input DiagnosticInput, report DiagnosticReport) *SIRRecord {
 			summary = f.Message
 		} else if f.Code == CodePermissionDenied {
 			category = "AUTH_PERMISSION"
+			remediation = f.Remediation
+			summary = f.Message
+		} else if f.Code == CodeQuotaExhausted {
+			category = "QUOTA_EXHAUSTED"
 			remediation = f.Remediation
 			summary = f.Message
 		}
