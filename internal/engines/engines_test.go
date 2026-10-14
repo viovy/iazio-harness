@@ -310,7 +310,25 @@ func TestCancelStopsChild(t *testing.T) {
 	}
 }
 
+func testShCommand(t *testing.T) (string, string) {
+	t.Helper()
+	path, err := exec.LookPath("sh")
+	if err != nil {
+		path, err = exec.LookPath("bash")
+	}
+	if err != nil {
+		if _, err := os.Stat("/bin/sh"); err == nil {
+			path = "/bin/sh"
+		}
+	}
+	if path == "" {
+		t.Skip("sh/bash not found on PATH")
+	}
+	return path, os.Getenv("PATH")
+}
+
 func TestChildStdinIsDevNull(t *testing.T) {
+	shPath, sysPath := testShCommand(t)
 	dir := t.TempDir()
 	out := filepath.Join(dir, "stdin.txt")
 	script := filepath.Join(dir, "read.sh")
@@ -323,8 +341,8 @@ func TestChildStdinIsDevNull(t *testing.T) {
 		Kind:         "execute",
 		WorktreePath: dir,
 		DocsHubPath:  dir,
-		Argv:         []string{"/bin/sh", script},
-		BaseEnv:      []string{"OUT=" + out, "PATH=/bin"},
+		Argv:         []string{shPath, script},
+		BaseEnv:      []string{"OUT=" + out, "PATH=" + sysPath},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -339,6 +357,7 @@ func TestChildStdinIsDevNull(t *testing.T) {
 }
 
 func TestChildEnvForcedOnProcess(t *testing.T) {
+	shPath, sysPath := testShCommand(t)
 	dir := t.TempDir()
 	out := filepath.Join(dir, "env.txt")
 	script := filepath.Join(dir, "env.sh")
@@ -351,8 +370,8 @@ func TestChildEnvForcedOnProcess(t *testing.T) {
 		Kind:         "execute",
 		WorktreePath: dir,
 		DocsHubPath:  "/repos/docs-hub",
-		Argv:         []string{"/bin/sh", script},
-		BaseEnv:      []string{"OUT=" + out, "PATH=/bin"},
+		Argv:         []string{shPath, script},
+		BaseEnv:      []string{"OUT=" + out, "PATH=" + sysPath},
 		ScheduleEnv: map[string]string{
 			"GIT_TERMINAL_PROMPT": "1",
 			"SSH_BATCHMODE":       "no",
@@ -367,9 +386,10 @@ func TestChildEnvForcedOnProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	gotNorm := strings.ReplaceAll(string(got), "\r\n", "\n")
 	want := "0\nyes\n\n/repos/docs-hub\n"
-	if string(got) != want {
-		t.Fatalf("got %q want %q", got, want)
+	if gotNorm != want {
+		t.Fatalf("got %q want %q", gotNorm, want)
 	}
 }
 
@@ -412,6 +432,7 @@ func (s *testCaptureStream) AppendRaw(stream string, p []byte) error {
 }
 
 func TestEarlyConversationIDStreaming(t *testing.T) {
+	shPath, sysPath := testShCommand(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "emit.sh")
 	body := "#!/bin/sh\necho '{\"event\":\"init\",\"conversation_id\":\"streamed-conv-123\"}'\necho 'second line'\n"
@@ -429,7 +450,8 @@ func TestEarlyConversationIDStreaming(t *testing.T) {
 		Kind:         "execute",
 		WorktreePath: dir,
 		DocsHubPath:  dir,
-		Argv:         []string{"/bin/sh", script},
+		Argv:         []string{shPath, script},
+		BaseEnv:      []string{"PATH=" + sysPath},
 		OnConversationID: func(cid string) {
 			mu.Lock()
 			capturedID = cid
@@ -505,13 +527,14 @@ func TestExtractConversationIDFromText(t *testing.T) {
 }
 
 func TestLogFileConversationIDPostExit(t *testing.T) {
+	shPath, sysPath := testShCommand(t)
 	dir := t.TempDir()
 	logFile := filepath.Join(dir, "engine.log")
 	uuid := "e1234567-89ab-cdef-0123-456789abcdef"
 
 	script := filepath.Join(dir, "run_log.sh")
 	// Writes to log file right before exiting
-	body := "#!/bin/sh\nsleep 0.05\necho 'Created conversation " + uuid + "' > \"" + logFile + "\"\n"
+	body := "#!/bin/sh\nsleep 0.05\necho 'Created conversation " + uuid + "' > \"" + filepath.ToSlash(logFile) + "\"\n"
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +550,8 @@ func TestLogFileConversationIDPostExit(t *testing.T) {
 		WorktreePath: dir,
 		DocsHubPath:  dir,
 		LogFile:      logFile,
-		Argv:         []string{"/bin/sh", script},
+		Argv:         []string{shPath, script},
+		BaseEnv:      []string{"PATH=" + sysPath},
 		OnConversationID: func(cid string) {
 			mu.Lock()
 			capturedID = cid
