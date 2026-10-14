@@ -149,6 +149,7 @@ type ExitOptions struct {
 	Engine         string `json:"engine,omitempty"`
 	Model          string `json:"model,omitempty"`
 	Remediation    string `json:"remediation,omitempty"`
+	ASEComplete    bool   `json:"ase_complete,omitempty"`
 }
 
 // PostExit reports the process exit code to the control plane.

@@ -1,7 +1,9 @@
 package diagnostics
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -532,3 +534,162 @@ func TestTroubleshootingSummary_FullFields(t *testing.T) {
 		t.Fatalf("missing expected fields in troubleshooting summary: %s", summary)
 	}
 }
+
+func TestCheckASECompletion_MergedBranch(t *testing.T) {
+	commandsRun := []string{}
+	gitRunner := func(args ...string) (string, error) {
+		cmdStr := strings.Join(args, " ")
+		commandsRun = append(commandsRun, cmdStr)
+		switch {
+		case strings.HasPrefix(cmdStr, "status --porcelain"):
+			return "", nil
+		case strings.HasPrefix(cmdStr, "rev-parse --abbrev-ref HEAD"):
+			return "chore/feature-123\n", nil
+		case strings.HasPrefix(cmdStr, "merge-base --is-ancestor HEAD origin/main"):
+			return "", nil // ancestor!
+		case strings.HasPrefix(cmdStr, "checkout main"):
+			return "", nil
+		case strings.HasPrefix(cmdStr, "pull --ff-only"):
+			return "", nil
+		case strings.HasPrefix(cmdStr, "branch -D chore/feature-123"):
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	complete, branchMerged, autoHealed := CheckASECompletion("/tmp/repo", "STORY-123", gitRunner)
+	if !complete {
+		t.Fatalf("expected complete=true, got false")
+	}
+	if !branchMerged {
+		t.Fatalf("expected branchMerged=true, got false")
+	}
+	if !autoHealed {
+		t.Fatalf("expected autoHealed=true, got false")
+	}
+}
+
+func TestCheckASECompletion_SquashMergedStoryCommit(t *testing.T) {
+	gitRunner := func(args ...string) (string, error) {
+		cmdStr := strings.Join(args, " ")
+		switch {
+		case strings.HasPrefix(cmdStr, "status --porcelain"):
+			return "", nil
+		case strings.HasPrefix(cmdStr, "rev-parse --abbrev-ref HEAD"):
+			return "chore/feature-123\n", nil
+		case strings.HasPrefix(cmdStr, "merge-base --is-ancestor HEAD origin/main"):
+			return "", fmt.Errorf("exit status 1")
+		case strings.HasPrefix(cmdStr, "log origin/main -n 1 --grep=STORY-123"):
+			return "02f1c2f2875d78d71b9f441e15cc2fe564dbfa56\n", nil
+		case strings.HasPrefix(cmdStr, "checkout main"):
+			return "", nil
+		case strings.HasPrefix(cmdStr, "pull --ff-only"):
+			return "", nil
+		case strings.HasPrefix(cmdStr, "branch -D chore/feature-123"):
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	complete, branchMerged, autoHealed := CheckASECompletion("/tmp/repo", "STORY-123", gitRunner)
+	if !complete || !branchMerged || !autoHealed {
+		t.Fatalf("expected complete, merged, and autoHealed for squash merge; got complete=%v, merged=%v, autoHealed=%v", complete, branchMerged, autoHealed)
+	}
+}
+
+func TestDiagnose_ASEComplete_ReconcilesExit(t *testing.T) {
+	report := Diagnose(DiagnosticInput{
+		JobID:        "job-1081",
+		StoryID:      "STORY-APP-0113",
+		WorktreePath: t.TempDir(),
+		ExitCode:     1, // Engine timed out after 1h
+		OutputText:   "print timeout after 1h0m0s",
+		GitRunner: func(args ...string) (string, error) {
+			cmdStr := strings.Join(args, " ")
+			switch {
+			case strings.HasPrefix(cmdStr, "status --porcelain"):
+				return "", nil
+			case strings.HasPrefix(cmdStr, "rev-parse --abbrev-ref HEAD"):
+				return "chore/feature-0098\n", nil
+			case strings.HasPrefix(cmdStr, "merge-base --is-ancestor HEAD origin/main"):
+				return "", fmt.Errorf("exit status 1")
+			case strings.HasPrefix(cmdStr, "log origin/main -n 1 --grep=STORY-APP-0113"):
+				return "02f1c2f2875d78d71b9f441e15cc2fe564dbfa56\n", nil
+			case strings.HasPrefix(cmdStr, "checkout main"):
+				return "", nil
+			case strings.HasPrefix(cmdStr, "pull --ff-only"):
+				return "", nil
+			case strings.HasPrefix(cmdStr, "branch -D chore/feature-0098"):
+				return "", nil
+			default:
+				return "", nil
+			}
+		},
+	})
+
+	if !report.ASEComplete {
+		t.Fatalf("expected ASEComplete=true, got false")
+	}
+	if !report.Healthy {
+		t.Fatalf("expected Healthy=true when ASE is complete, got false")
+	}
+	if report.SIR != nil {
+		t.Fatalf("expected no SIR when ASE is complete, got: %+v", report.SIR)
+	}
+}
+
+func TestCheckASECompletion_FailedOnMain_NotComplete(t *testing.T) {
+	// A job that failed on main without modifying files must NOT report complete
+	gitRunner := func(args ...string) (string, error) {
+		cmdStr := strings.Join(args, " ")
+		switch {
+		case strings.HasPrefix(cmdStr, "status --porcelain"):
+			return "", nil
+		case strings.HasPrefix(cmdStr, "rev-parse --abbrev-ref HEAD"):
+			return "main\n", nil
+		case strings.HasPrefix(cmdStr, "log origin/main -n 1 --grep=STORY-FAIL-01"):
+			return "", nil // Story commit not found on origin/main
+		default:
+			return "", nil
+		}
+	}
+
+	complete, branchMerged, autoHealed := CheckASECompletion(t.TempDir(), "STORY-FAIL-01", gitRunner)
+	if complete {
+		t.Fatalf("expected complete=false for failed job on main without merge/DONE, got true")
+	}
+	if branchMerged {
+		t.Fatalf("expected branchMerged=false, got true")
+	}
+	if autoHealed {
+		t.Fatalf("expected autoHealed=false, got true")
+	}
+}
+
+func TestCheckASECompletion_StoryDone_Complete(t *testing.T) {
+	dir := t.TempDir()
+	storiesDir := filepath.Join(dir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0755)
+	storyFile := filepath.Join(storiesDir, "2026-10-14-test.story.md")
+	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-DONE-01\nstatus: DONE\n---\n"), 0644)
+
+	gitRunner := func(args ...string) (string, error) {
+		cmdStr := strings.Join(args, " ")
+		switch {
+		case strings.HasPrefix(cmdStr, "status --porcelain"):
+			return "", nil
+		case strings.HasPrefix(cmdStr, "rev-parse --abbrev-ref HEAD"):
+			return "main\n", nil
+		default:
+			return "", nil
+		}
+	}
+
+	complete, _, _ := CheckASECompletion(dir, "STORY-DONE-01", gitRunner)
+	if !complete {
+		t.Fatalf("expected complete=true when story is DONE on disk, got false")
+	}
+}
+
