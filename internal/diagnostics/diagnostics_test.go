@@ -3,6 +3,7 @@ package diagnostics
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -636,6 +637,59 @@ func TestDiagnose_ASEComplete_ReconcilesExit(t *testing.T) {
 	}
 	if report.SIR != nil {
 		t.Fatalf("expected no SIR when ASE is complete, got: %+v", report.SIR)
+	}
+}
+
+func TestCheckASECompletion_FailedOnMain_NotComplete(t *testing.T) {
+	// A job that failed on main without modifying files must NOT report complete
+	gitRunner := func(args ...string) (string, error) {
+		cmdStr := strings.Join(args, " ")
+		switch {
+		case strings.HasPrefix(cmdStr, "status --porcelain"):
+			return "", nil
+		case strings.HasPrefix(cmdStr, "rev-parse --abbrev-ref HEAD"):
+			return "main\n", nil
+		case strings.HasPrefix(cmdStr, "log origin/main -n 1 --grep=STORY-FAIL-01"):
+			return "", nil // Story commit not found on origin/main
+		default:
+			return "", nil
+		}
+	}
+
+	complete, branchMerged, autoHealed := CheckASECompletion(t.TempDir(), "STORY-FAIL-01", gitRunner)
+	if complete {
+		t.Fatalf("expected complete=false for failed job on main without merge/DONE, got true")
+	}
+	if branchMerged {
+		t.Fatalf("expected branchMerged=false, got true")
+	}
+	if autoHealed {
+		t.Fatalf("expected autoHealed=false, got true")
+	}
+}
+
+func TestCheckASECompletion_StoryDone_Complete(t *testing.T) {
+	dir := t.TempDir()
+	storiesDir := filepath.Join(dir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0755)
+	storyFile := filepath.Join(storiesDir, "2026-10-14-test.story.md")
+	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-DONE-01\nstatus: DONE\n---\n"), 0644)
+
+	gitRunner := func(args ...string) (string, error) {
+		cmdStr := strings.Join(args, " ")
+		switch {
+		case strings.HasPrefix(cmdStr, "status --porcelain"):
+			return "", nil
+		case strings.HasPrefix(cmdStr, "rev-parse --abbrev-ref HEAD"):
+			return "main\n", nil
+		default:
+			return "", nil
+		}
+	}
+
+	complete, _, _ := CheckASECompletion(dir, "STORY-DONE-01", gitRunner)
+	if !complete {
+		t.Fatalf("expected complete=true when story is DONE on disk, got false")
 	}
 }
 
