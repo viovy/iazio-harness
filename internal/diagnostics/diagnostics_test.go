@@ -602,7 +602,7 @@ func TestCheckASECompletion_SquashMergedStoryCommit(t *testing.T) {
 func TestDiagnose_ASEComplete_ReconcilesExit(t *testing.T) {
 	report := Diagnose(DiagnosticInput{
 		JobID:        "job-1081",
-		StoryID:      "STORY-IAZIO-0113",
+		StoryID:      "STORY-APP-0113",
 		WorktreePath: t.TempDir(),
 		ExitCode:     1, // Engine timed out after 1h
 		OutputText:   "print timeout after 1h0m0s",
@@ -612,16 +612,16 @@ func TestDiagnose_ASEComplete_ReconcilesExit(t *testing.T) {
 			case strings.HasPrefix(cmdStr, "status --porcelain"):
 				return "", nil
 			case strings.HasPrefix(cmdStr, "rev-parse --abbrev-ref HEAD"):
-				return "chore/iazio-0098\n", nil
+				return "chore/feature-0098\n", nil
 			case strings.HasPrefix(cmdStr, "merge-base --is-ancestor HEAD origin/main"):
 				return "", fmt.Errorf("exit status 1")
-			case strings.HasPrefix(cmdStr, "log origin/main -n 1 --grep=STORY-IAZIO-0113"):
+			case strings.HasPrefix(cmdStr, "log origin/main -n 1 --grep=STORY-APP-0113"):
 				return "02f1c2f2875d78d71b9f441e15cc2fe564dbfa56\n", nil
 			case strings.HasPrefix(cmdStr, "checkout main"):
 				return "", nil
 			case strings.HasPrefix(cmdStr, "pull --ff-only"):
 				return "", nil
-			case strings.HasPrefix(cmdStr, "branch -D chore/iazio-0098"):
+			case strings.HasPrefix(cmdStr, "branch -D chore/feature-0098"):
 				return "", nil
 			default:
 				return "", nil
