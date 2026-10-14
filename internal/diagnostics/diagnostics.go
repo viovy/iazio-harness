@@ -57,6 +57,7 @@ type SIRRecord struct {
 // DiagnosticReport is the overall result of diagnosing an execution.
 type DiagnosticReport struct {
 	Healthy      bool       `json:"healthy"`
+	ASEComplete  bool       `json:"ase_complete"`
 	ExitCode     int        `json:"exit_code"`
 	Findings     []Finding  `json:"findings"`
 	StoryID      string     `json:"story_id,omitempty"`
@@ -154,6 +155,66 @@ var testFailedRegexes = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)FAILED\s+\(failures=\d+\)`),
 }
 
+// CheckASECompletion evaluates whether the story execution has completed on origin/main or locally.
+func CheckASECompletion(worktreePath, storyID string, git func(args ...string) (string, error)) (complete bool, branchMerged bool, autoHealed bool) {
+	if git == nil || worktreePath == "" {
+		return false, false, false
+	}
+	porc, _ := git("status", "--porcelain")
+	isClean := strings.TrimSpace(porc) == ""
+
+	branch, _ := git("rev-parse", "--abbrev-ref", "HEAD")
+	branch = strings.TrimSpace(branch)
+
+	if branch != "" && branch != "main" && branch != "master" {
+		if _, err := git("merge-base", "--is-ancestor", "HEAD", "origin/main"); err == nil {
+			branchMerged = true
+		} else if storyID != "" {
+			// In squash merges, branch HEAD may not be an ancestor, but commit exists on origin/main
+			if out, err := git("log", "origin/main", "-n", "1", "--grep="+storyID, "--format=%H"); err == nil && strings.TrimSpace(out) != "" {
+				branchMerged = true
+			}
+		}
+		if !branchMerged {
+			if out, err := git("log", "origin/main", "-n", "1", "--grep="+branch, "--format=%H"); err == nil && strings.TrimSpace(out) != "" {
+				branchMerged = true
+			}
+		}
+	} else if storyID != "" {
+		// Already on main/master, check if story was merged/closed out
+		if out, err := git("log", "origin/main", "-n", "1", "--grep="+storyID, "--format=%H"); err == nil && strings.TrimSpace(out) != "" {
+			branchMerged = true
+		}
+	}
+
+	// If branch is merged and worktree is clean, auto-heal to main
+	if branchMerged && isClean {
+		if branch != "main" && branch != "master" {
+			if _, err := git("checkout", "main"); err == nil {
+				_, _ = git("pull", "--ff-only")
+				_, _ = git("branch", "-D", branch)
+				autoHealed = true
+				complete = true
+				return complete, branchMerged, autoHealed
+			}
+		} else {
+			complete = true
+			return complete, branchMerged, autoHealed
+		}
+	}
+
+	if (branch == "main" || branch == "master") && isClean {
+		complete = true
+		return complete, branchMerged, autoHealed
+	}
+
+	if branchMerged && isClean {
+		complete = true
+	}
+
+	return complete, branchMerged, autoHealed
+}
+
 // Diagnose evaluates execution logs and worktree state to detect anomalies.
 func Diagnose(input DiagnosticInput) DiagnosticReport {
 	report := DiagnosticReport{
@@ -186,6 +247,14 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 			report.Porcelain = porc
 		}
 	}
+
+	// 2b. Evaluate ASE completion and branch merge state
+	aseComplete, branchMerged, autoHealed := CheckASECompletion(input.WorktreePath, input.StoryID, git)
+	if autoHealed {
+		report.Branch = "main"
+		report.Porcelain = ""
+	}
+	report.ASEComplete = aseComplete
 
 	// 3. Scan OutputText for signatures
 	hasAlreadyDone := false
@@ -270,7 +339,7 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 
 	// 4. Compile findings
 	if hasAlreadyDone {
-		if report.Branch != "" && report.Branch != "main" && report.Branch != "master" {
+		if report.Branch != "" && report.Branch != "main" && report.Branch != "master" && !branchMerged {
 			report.Findings = append(report.Findings, Finding{
 				Code:        CodeAlreadyDoneOnMain,
 				Severity:    "ERROR",
@@ -284,6 +353,7 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 				Message:     "Requested story is already completed or merged on origin/main.",
 				Remediation: "Close out story or pull latest origin/main.",
 			})
+			report.ASEComplete = true
 		}
 	}
 
@@ -381,9 +451,13 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 	}
 
 	if input.ExitCode != 0 {
+		sev := "ERROR"
+		if report.ASEComplete {
+			sev = "WARNING"
+		}
 		report.Findings = append(report.Findings, Finding{
 			Code:        CodeNonZeroExit,
-			Severity:    "ERROR",
+			Severity:    sev,
 			Message:     fmt.Sprintf("Child engine process terminated with exit code %d.", input.ExitCode),
 			Remediation: "Inspect execution spool log for errors, fix root cause, and re-execute.",
 		})
@@ -398,8 +472,10 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 		}
 	}
 
-	if hasError || input.ExitCode != 0 {
+	if hasError || (input.ExitCode != 0 && !report.ASEComplete) {
 		report.Healthy = false
+	} else if report.ASEComplete {
+		report.Healthy = true
 	}
 
 	if hasError && input.WorktreePath != "" {

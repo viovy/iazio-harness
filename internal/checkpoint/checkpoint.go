@@ -20,6 +20,7 @@ type State struct {
 	Status         string `json:"status"` // "RUNNING", "COMPLETED", "FAILED"
 	ExitCode       int    `json:"exit_code"`
 	PID            int    `json:"pid,omitempty"`
+	ASEComplete    bool   `json:"ase_complete,omitempty"`
 }
 
 // CheckpointFileName is the file name stored under .iazio/ in the worktree.

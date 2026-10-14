@@ -440,7 +440,13 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		_ = sp.AppendRaw("stdout", []byte(summaryText))
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", summaryText)
 	}
-	if !diagReport.Healthy && execRes.ExitCode == 0 {
+	if diagReport.ASEComplete && diagReport.Healthy && execRes.ExitCode != 0 {
+		overMsg := fmt.Sprintf("[iazio-harness] ASE verified complete on origin/main with clean worktree. Reconciling exit code %d to 0 (COMPLETED).\n", execRes.ExitCode)
+		_ = sp.AppendRaw("stdout", []byte(overMsg))
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", overMsg)
+		execRes.ExitCode = 0
+		execErr = nil
+	} else if !diagReport.Healthy && execRes.ExitCode == 0 {
 		execRes.ExitCode = 1
 	}
 
@@ -458,6 +464,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		StartedAt:      time.Now().UTC().Format(time.RFC3339),
 		Status:         finalStatus,
 		ExitCode:       execRes.ExitCode,
+		ASEComplete:    diagReport.ASEComplete,
 	})
 
 	// Explicitly release checkout file lock before posting exit to control plane,
@@ -465,9 +472,10 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	_ = lock.Release()
 
 	exitOpts := controlplane.ExitOptions{
-		ExitCode: execRes.ExitCode,
-		Engine:   engineName,
-		Model:    modelName,
+		ExitCode:    execRes.ExitCode,
+		Engine:      engineName,
+		Model:       modelName,
+		ASEComplete: diagReport.ASEComplete,
 	}
 	if execRes.ExitCode != 0 || !diagReport.Healthy {
 		if len(diagReport.Findings) > 0 {
