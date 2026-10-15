@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -129,6 +130,66 @@ func TestPostConversation(t *testing.T) {
 	}
 	if !strings.Contains(body, `"conversation_id":"conv-uuid-789"`) {
 		t.Fatalf("unexpected body: %s", body)
+	}
+}
+
+func TestTransientStatusAndError(t *testing.T) {
+	if !IsTransientStatus(502) || !IsTransientStatus(503) || !IsTransientStatus(504) || !IsTransientStatus(429) {
+		t.Fatal("expected transient statuses")
+	}
+	if IsTransientStatus(400) || IsTransientStatus(404) || IsTransientStatus(500) {
+		t.Fatal("non-transient status considered transient")
+	}
+	if !IsTransientError(errors.New("dial tcp: connection refused")) {
+		t.Fatal("connection refused should be transient error")
+	}
+}
+
+func TestPostExitTransientRetrySuccess(t *testing.T) {
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`updating`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := PostExit(context.Background(), srv.URL, "tok", "job-1", 0)
+	if err != nil {
+		t.Fatalf("expected success on retry, got: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
+	}
+}
+
+func TestGetJobTransientRetrySuccess(t *testing.T) {
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 2 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`gateway restart`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"job-1","engine":"agy"}`))
+	}))
+	defer srv.Close()
+
+	job, err := GetJob(context.Background(), srv.URL, "tok", "job-1")
+	if err != nil {
+		t.Fatalf("expected success on retry, got: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
+	}
+	if job.ID != "job-1" {
+		t.Fatalf("expected ID job-1, got %s", job.ID)
 	}
 }
 
