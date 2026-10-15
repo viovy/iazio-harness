@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -48,5 +49,15 @@ func TestSaveAndReadCheckpoint(t *testing.T) {
 	}
 	if spoolLoaded.Engine != "agy" {
 		t.Errorf("expected engine agy, got %s", spoolLoaded.Engine)
+	}
+
+	// Verify defense-in-depth .gitignore in worktree .iazio directory
+	giPath := filepath.Join(tempWorktree, ".iazio", ".gitignore")
+	rawGi, err := os.ReadFile(giPath)
+	if err != nil {
+		t.Fatalf("expected .iazio/.gitignore to exist: %v", err)
+	}
+	if string(rawGi) != "*\n" {
+		t.Errorf("expected .iazio/.gitignore to contain '*\\n', got %q", string(rawGi))
 	}
 }
