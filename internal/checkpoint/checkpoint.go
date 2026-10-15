@@ -40,6 +40,11 @@ func Save(worktree, spoolDir string, state State) error {
 	if worktree != "" {
 		iazioDir := filepath.Join(worktree, ".iazio")
 		if err := os.MkdirAll(iazioDir, 0o755); err == nil {
+			// Defense-in-depth: ensure .iazio/.gitignore exists so worktree is never dirtied
+			giPath := filepath.Join(iazioDir, ".gitignore")
+			if _, statErr := os.Stat(giPath); os.IsNotExist(statErr) {
+				_ = os.WriteFile(giPath, []byte("*\n"), 0o644)
+			}
 			target := filepath.Join(iazioDir, CheckpointFileName)
 			_ = os.WriteFile(target, data, 0o644)
 		}

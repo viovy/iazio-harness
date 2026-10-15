@@ -1,0 +1,18 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+
+# OS
+.DS_Store
+
+# Temporary
+tmp/
+*.tmp
+
+# Runtime
+.iazio/
