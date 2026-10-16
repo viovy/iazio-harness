@@ -13,6 +13,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/sandbox"
 )
 
 // KindStoryRefinement selects the docs hub as the child working directory and lock target.
@@ -55,6 +57,9 @@ type ExecutionRequest struct {
 	// BaseEnv, when non-nil, replaces the inherited environment before schedule and forced keys.
 	BaseEnv     []string
 	ScheduleEnv map[string]string
+	// Sandbox executes child in an isolated ephemeral worktree snapshot.
+	Sandbox       bool
+	OnSandboxDiff func(string)
 }
 
 // ExecutionResult is the child exit state.
@@ -175,7 +180,25 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		}
 	}
 	cmd := exec.Command(bin, argv[1:]...)
-	cmd.Dir = WorkingDirectory(req.Kind, req.WorktreePath, req.DocsHubPath)
+	workDir := WorkingDirectory(req.Kind, req.WorktreePath, req.DocsHubPath)
+	var sb *sandbox.Sandbox
+	if req.Sandbox && workDir != "" {
+		s, errS := sandbox.Create(workDir, sandbox.Options{})
+		if errS != nil {
+			return ExecutionResult{}, fmt.Errorf("create sandbox: %w", errS)
+		}
+		sb = s
+		defer func() {
+			if req.OnSandboxDiff != nil {
+				if diff, errD := sb.Diff(); errD == nil {
+					req.OnSandboxDiff(diff)
+				}
+			}
+			_ = sb.Cleanup()
+		}()
+		workDir = sb.SandboxPath
+	}
+	cmd.Dir = workDir
 	base := req.BaseEnv
 	if req.BaseEnv == nil {
 		base = os.Environ()
