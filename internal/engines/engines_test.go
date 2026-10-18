@@ -583,3 +583,35 @@ func TestLogFileConversationIDPostExit(t *testing.T) {
 	}
 }
 
+func TestHold_FallbackToGitDir(t *testing.T) {
+	work := t.TempDir()
+	gitDir := filepath.Join(work, ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use an invalid unwritable path for lockDir (pointing to an existing non-directory file)
+	dummyFile := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(dummyFile, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	invalidLockDir := filepath.Join(dummyFile, "cannot-create-dir")
+
+	lk, err := Hold(work, invalidLockDir)
+	if err != nil {
+		t.Fatalf("expected fallback to succeed, got error: %v", err)
+	}
+	defer func() { _ = lk.Release() }()
+
+	expectedFallback := filepath.Join(gitDir, "execution.lock")
+	if lk.Path != expectedFallback {
+		t.Fatalf("expected fallback path %s, got %s", expectedFallback, lk.Path)
+	}
+
+	// Second hold on same worktree with invalidLockDir should fail with ErrLockHeld
+	_, err2 := Hold(work, invalidLockDir)
+	if !errors.Is(err2, ErrLockHeld) {
+		t.Fatalf("expected ErrLockHeld on fallback lock, got %v", err2)
+	}
+}
+
