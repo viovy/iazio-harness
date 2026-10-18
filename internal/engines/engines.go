@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/viovy/iazio-harness/internal/idempotency"
 	"github.com/viovy/iazio-harness/internal/sandbox"
 )
 
@@ -60,6 +61,9 @@ type ExecutionRequest struct {
 	// Sandbox executes child in an isolated ephemeral worktree snapshot.
 	Sandbox       bool
 	OnSandboxDiff func(string)
+	IdempotencyClient *idempotency.Client
+	StepIndex         int
+	JobID             string
 }
 
 // ExecutionResult is the child exit state.
@@ -164,6 +168,22 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		}
 	}
 
+	if req.IdempotencyClient != nil && req.ResumeConversationID != "" {
+		commandStr := strings.Join(argv, " ")
+		stepResp, err := req.IdempotencyClient.CheckOrRecordStep(ctx, idempotency.StepRequest{
+			ConversationID: req.ResumeConversationID,
+			SessionID:      req.JobID,
+			StepIndex:      req.StepIndex,
+			Command:        commandStr,
+		})
+		if err == nil && stepResp.AlreadyExecuted {
+			if stream != nil {
+				_ = stream.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Step %d already executed in conversation %s; skipping to preserve resume idempotency.\n", req.StepIndex, req.ResumeConversationID)))
+			}
+			return ExecutionResult{ExitCode: 0}, nil
+		}
+	}
+
 	bin := argv[0]
 	if resolved, err := exec.LookPath(bin); err == nil {
 		bin = resolved
@@ -225,6 +245,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		}
 		return ExecutionResult{}, err
 	}
+	postStartProcessGroup(cmd)
 	if cmd.Process != nil && stream != nil {
 		_ = stream.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Spawned engine process %s with PID %d\n", filepath.Base(bin), cmd.Process.Pid)))
 	}
@@ -323,6 +344,16 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 			return ExecutionResult{ExitCode: code}, nil
 		}
 		return ExecutionResult{ExitCode: code}, waitErr
+	}
+	if code == 0 && req.IdempotencyClient != nil && req.ResumeConversationID != "" {
+		commandStr := strings.Join(argv, " ")
+		_, _ = req.IdempotencyClient.CheckOrRecordStep(context.Background(), idempotency.StepRequest{
+			ConversationID: req.ResumeConversationID,
+			SessionID:      req.JobID,
+			StepIndex:      req.StepIndex,
+			Command:        commandStr,
+			Status:         "completed",
+		})
 	}
 	return ExecutionResult{ExitCode: code}, nil
 }
