@@ -225,6 +225,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		}
 		return ExecutionResult{}, err
 	}
+	postStartProcessGroup(cmd)
 	if cmd.Process != nil && stream != nil {
 		_ = stream.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Spawned engine process %s with PID %d\n", filepath.Base(bin), cmd.Process.Pid)))
 	}
