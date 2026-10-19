@@ -95,3 +95,22 @@ func TestRunStoryCommand_Validations(t *testing.T) {
 	}
 }
 
+func TestRunPromptCommand_Validations(t *testing.T) {
+	// Missing args
+	err := runPromptCommand([]string{})
+	if err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("expected usage error, got %v", err)
+	}
+
+	// Unknown subcommand
+	err = runPromptCommand([]string{"destroy"})
+	if err == nil || !strings.Contains(err.Error(), "unknown prompt subcommand") {
+		t.Fatalf("expected unknown subcommand error, got %v", err)
+	}
+
+	// Missing --json flag
+	err = runPromptRun([]string{})
+	if err == nil || !strings.Contains(err.Error(), "requires --json") {
+		t.Fatalf("expected requires --json error, got %v", err)
+	}
+}

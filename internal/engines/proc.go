@@ -7,13 +7,16 @@ import (
 	"syscall"
 )
 
-func setProcGroup(cmd *exec.Cmd) {
+// SetProcGroup configures cmd to run in its own process group on Unix.
+func SetProcGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func postStartProcessGroup(cmd *exec.Cmd) {}
+// PostStartProcessGroup is a hook called immediately after cmd.Start.
+func PostStartProcessGroup(cmd *exec.Cmd) {}
 
-func stopProcessGroup(cmd *exec.Cmd) {
+// StopProcessGroup attempts graceful termination via SIGTERM to the process group.
+func StopProcessGroup(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
@@ -26,7 +29,8 @@ func stopProcessGroup(cmd *exec.Cmd) {
 	}
 }
 
-func killProcessGroup(cmd *exec.Cmd) {
+// KillProcessGroup forcefully terminates the process group via SIGKILL.
+func KillProcessGroup(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
@@ -38,3 +42,8 @@ func killProcessGroup(cmd *exec.Cmd) {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
 	}
 }
+
+func setProcGroup(cmd *exec.Cmd)          { SetProcGroup(cmd) }
+func postStartProcessGroup(cmd *exec.Cmd) { PostStartProcessGroup(cmd) }
+func stopProcessGroup(cmd *exec.Cmd)      { StopProcessGroup(cmd) }
+func killProcessGroup(cmd *exec.Cmd)      { KillProcessGroup(cmd) }
