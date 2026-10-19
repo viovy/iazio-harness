@@ -8,7 +8,8 @@ import (
 	"syscall"
 )
 
-func fileLock(f *os.File) error {
+// FileLock acquires a non-blocking exclusive lock on f.
+func FileLock(f *os.File) error {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
 			return ErrLockHeld
@@ -18,6 +19,10 @@ func fileLock(f *os.File) error {
 	return nil
 }
 
-func fileUnlock(f *os.File) error {
+// FileUnlock releases the lock on f.
+func FileUnlock(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
+
+func fileLock(f *os.File) error   { return FileLock(f) }
+func fileUnlock(f *os.File) error { return FileUnlock(f) }

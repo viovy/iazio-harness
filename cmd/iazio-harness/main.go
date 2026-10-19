@@ -36,7 +36,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: iazio-harness version|auth|run|story")
+		return fmt.Errorf("usage: iazio-harness version|auth|run|story|prompt")
 	}
 	switch args[0] {
 	case "version":
@@ -56,6 +56,8 @@ func run(args []string) error {
 		return runJob(args[1:])
 	case "story":
 		return runStoryCommand(args[1:])
+	case "prompt":
+		return runPromptCommand(args[1:])
 	default:
 		return fmt.Errorf("unknown command")
 	}

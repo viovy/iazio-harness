@@ -17,10 +17,11 @@ var (
 const (
 	lockfileFailImmediately = 0x00000001
 	lockfileExclusiveLock   = 0x00000002
-	errLockViolation         = syscall.Errno(33) // ERROR_LOCK_VIOLATION
+	errLockViolation        = syscall.Errno(33) // ERROR_LOCK_VIOLATION
 )
 
-func fileLock(f *os.File) error {
+// FileLock acquires a non-blocking exclusive lock on f using LockFileEx.
+func FileLock(f *os.File) error {
 	var ol syscall.Overlapped
 	r1, _, err := procLockFileEx.Call(
 		f.Fd(),
@@ -39,7 +40,8 @@ func fileLock(f *os.File) error {
 	return nil
 }
 
-func fileUnlock(f *os.File) error {
+// FileUnlock releases the lock on f using UnlockFileEx.
+func FileUnlock(f *os.File) error {
 	var ol syscall.Overlapped
 	r1, _, err := procUnlockFileEx.Call(
 		f.Fd(),
@@ -54,3 +56,5 @@ func fileUnlock(f *os.File) error {
 	return nil
 }
 
+func fileLock(f *os.File) error   { return FileLock(f) }
+func fileUnlock(f *os.File) error { return FileUnlock(f) }

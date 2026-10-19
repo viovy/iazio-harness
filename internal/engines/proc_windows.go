@@ -49,7 +49,7 @@ type ioCounters struct {
 }
 
 type jobObjectExtendedLimitInformation struct {
-	BasicLimitInformation jobObjectBasicLimitInformation
+	BasicLimitInformation  jobObjectBasicLimitInformation
 	IoInfo                 ioCounters
 	ProcessMemoryLimit     uintptr
 	JobMemoryLimit         uintptr
@@ -62,9 +62,11 @@ var (
 	harnessJobs  = make(map[int]uintptr)
 )
 
-func setProcGroup(cmd *exec.Cmd) {}
+// SetProcGroup configures cmd to run in its own job object on Windows.
+func SetProcGroup(cmd *exec.Cmd) {}
 
-func postStartProcessGroup(cmd *exec.Cmd) {
+// PostStartProcessGroup assigns the started process to a Windows Job Object with KILL_ON_JOB_CLOSE.
+func PostStartProcessGroup(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
 		return
 	}
@@ -96,11 +98,13 @@ func postStartProcessGroup(cmd *exec.Cmd) {
 	harnessJobMu.Unlock()
 }
 
-func stopProcessGroup(cmd *exec.Cmd) {
-	killProcessGroup(cmd)
+// StopProcessGroup terminates the Windows Job Object and process tree.
+func StopProcessGroup(cmd *exec.Cmd) {
+	KillProcessGroup(cmd)
 }
 
-func killProcessGroup(cmd *exec.Cmd) {
+// KillProcessGroup forcefully terminates the process and job object on Windows.
+func KillProcessGroup(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
@@ -120,3 +124,8 @@ func killProcessGroup(cmd *exec.Cmd) {
 	_ = exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
 	_ = cmd.Process.Kill()
 }
+
+func setProcGroup(cmd *exec.Cmd)          { SetProcGroup(cmd) }
+func postStartProcessGroup(cmd *exec.Cmd) { PostStartProcessGroup(cmd) }
+func stopProcessGroup(cmd *exec.Cmd)      { StopProcessGroup(cmd) }
+func killProcessGroup(cmd *exec.Cmd)      { KillProcessGroup(cmd) }

@@ -1,12 +1,14 @@
 package engines
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // ErrLockHeld is returned when the checkout lock is already held.
@@ -96,6 +98,43 @@ func Hold(checkout, lockDir string) (*Lock, error) {
 		return nil, err
 	}
 	return &Lock{f: f, Path: lockPath}, nil
+}
+
+// NewLock constructs a Lock holding open file f.
+func NewLock(f *os.File, path string) *Lock {
+	return &Lock{f: f, Path: path}
+}
+
+// HoldPath acquires an exclusive lock on lockPath, waiting until acquired or ctx is canceled.
+func HoldPath(ctx context.Context, lockPath string) (*Lock, error) {
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return nil, fmt.Errorf("create lock parent dir: %w", err)
+	}
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open lock file at %s: %w", lockPath, err)
+	}
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		err := FileLock(f)
+		if err == nil {
+			return &Lock{f: f, Path: lockPath}, nil
+		}
+		if !errors.Is(err, ErrLockHeld) {
+			_ = f.Close()
+			return nil, fmt.Errorf("acquire lock on %s: %w", lockPath, err)
+		}
+
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, fmt.Errorf("waiting for lock on %s: %w", lockPath, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // Release unlocks the checkout.
