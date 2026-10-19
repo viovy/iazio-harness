@@ -74,3 +74,24 @@ func TestResolveExecutionOptions(t *testing.T) {
 		t.Fatalf("expected env vars applied, got m=%s, a=%s, disableSlash=%v", m, a, disableSlash)
 	}
 }
+
+func TestRunStoryCommand_Validations(t *testing.T) {
+	// Missing args
+	err := runStoryCommand([]string{})
+	if err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("expected usage error, got %v", err)
+	}
+
+	// Unknown subcommand
+	err = runStoryCommand([]string{"destroy"})
+	if err == nil || !strings.Contains(err.Error(), "unknown story subcommand") {
+		t.Fatalf("expected unknown subcommand error, got %v", err)
+	}
+
+	// Missing --json flag
+	err = runStoryCreate([]string{})
+	if err == nil || !strings.Contains(err.Error(), "requires --json") {
+		t.Fatalf("expected requires --json error, got %v", err)
+	}
+}
+
