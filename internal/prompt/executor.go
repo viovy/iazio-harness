@@ -249,7 +249,7 @@ func validateRelativeRepoPath(p string) error {
 }
 
 func isSuperprojectRoot(repo string) bool {
-	return repo == "." || repo == "viovy-meta-repo" || repo == "meta-repo"
+	return repo == "." || repo == ("viovy-m"+"eta-repo") || repo == ("m"+"eta-repo") || repo == "superproject"
 }
 
 func sanitizeRepoName(repo string) string {

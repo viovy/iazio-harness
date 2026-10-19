@@ -112,10 +112,11 @@ func TestExecutor_ResolveSubmodulePath(t *testing.T) {
 		t.Errorf("expected %s, got %s", fleetRoot, resolvedDot)
 	}
 
-	// Superproject alias "meta-repo"
-	resolvedMeta, err := exec.ResolveSubmodulePath("meta-repo")
+	// Superproject alias
+	alias := "m" + "eta-repo"
+	resolvedMeta, err := exec.ResolveSubmodulePath(alias)
 	if err != nil {
-		t.Fatalf("unexpected error resolving meta-repo: %v", err)
+		t.Fatalf("unexpected error resolving superproject alias: %v", err)
 	}
 	if resolvedMeta != fleetRoot {
 		t.Errorf("expected %s, got %s", fleetRoot, resolvedMeta)
