@@ -106,7 +106,45 @@ func (c *CLIClient) CreateStory(ctx context.Context, opts CreateStoryOptions) (*
 		storiesDir = filepath.Join(workingDir, "docs", "stories")
 	}
 
-	// 1. Invoke autopilot story create / scaffold
+	// 1. Try atomic autopilot story-create --json delegation via stdin (Story 11 contract)
+	payloadBytes, mErr := json.Marshal(map[string]any{
+		"submodule":             opts.Submodule,
+		"title":                 opts.Title,
+		"priority":              priority,
+		"problem":               opts.Problem,
+		"acceptance_criteria":   opts.AcceptanceCriteria,
+		"target_files":          opts.TargetFiles,
+		"depends_on":            opts.DependsOn,
+		"verification_commands": opts.VerificationCommands,
+	})
+	if mErr == nil {
+		cmdJSON := exec.CommandContext(ctx, c.AutopilotBinary, "story-create", "--json")
+		cmdJSON.Dir = workingDir
+		cmdJSON.Stdin = bytes.NewReader(payloadBytes)
+		var outBuf, errBuf bytes.Buffer
+		cmdJSON.Stdout = &outBuf
+		cmdJSON.Stderr = &errBuf
+		if runErr := cmdJSON.Run(); runErr == nil {
+			var res struct {
+				OK           bool   `json:"ok"`
+				StoryID      string `json:"story_id"`
+				Submodule    string `json:"submodule"`
+				StoryPath    string `json:"story_path"`
+				IndexUpdated bool   `json:"index_updated"`
+				Validated    bool   `json:"validated"`
+			}
+			if jErr := json.Unmarshal(outBuf.Bytes(), &res); jErr == nil && res.StoryID != "" {
+				return &StoryResult{
+					StoryID:      res.StoryID,
+					Submodule:    res.Submodule,
+					StoryPath:    res.StoryPath,
+					IndexUpdated: res.IndexUpdated,
+				}, nil
+			}
+		}
+	}
+
+	// 2. Fallback to legacy autopilot story create / scaffold
 	args := []string{
 		"story", "create",
 		"-json",
