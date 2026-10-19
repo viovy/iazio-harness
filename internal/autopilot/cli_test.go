@@ -206,3 +206,55 @@ exit 2
 		t.Errorf("expected story file %s to be deleted on failure, but it still exists", storyPath)
 	}
 }
+
+func TestCLIClient_CreateStory_AtomicDelegation(t *testing.T) {
+	tmpDir := t.TempDir()
+	fakeAutopilot := filepath.Join(tmpDir, "fake-autopilot-atomic")
+
+	script := `#!/bin/sh
+cmd="$1"
+sub="$2"
+if [ "$cmd" = "story-create" ] && [ "$sub" = "--json" ]; then
+  # Read stdin payload to verify it arrives
+  payload=$(cat)
+  if [ -z "$payload" ]; then
+    echo '{"ok":false,"rule_id":"EMPTY_STDIN"}'
+    exit 1
+  fi
+  echo '{"ok":true,"story_id":"STORY-TEST-0131","submodule":"iazio-mcp","story_path":"docs/stories/2026-10-19-test.story.md","index_updated":true,"validated":true}'
+  exit 0
+fi
+exit 2
+`
+	if err := os.WriteFile(fakeAutopilot, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write fake script: %v", err)
+	}
+
+	client := NewCLIClient(fakeAutopilot)
+	opts := CreateStoryOptions{
+		Submodule:          "iazio-mcp",
+		Title:              "Route Fleet Repository Discovery",
+		Problem:            "Problem statement",
+		AcceptanceCriteria: []string{"AC1"},
+		TargetFiles:        []string{"internal/mcp/tool.go"},
+		WorkingDir:         tmpDir,
+	}
+
+	res, err := client.CreateStory(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("CreateStory failed: %v", err)
+	}
+	if res.StoryID != "STORY-TEST-0131" {
+		t.Errorf("expected STORY-TEST-0131, got %s", res.StoryID)
+	}
+	if res.Submodule != "iazio-mcp" {
+		t.Errorf("expected iazio-mcp, got %s", res.Submodule)
+	}
+	if res.StoryPath != "docs/stories/2026-10-19-test.story.md" {
+		t.Errorf("unexpected story path: %s", res.StoryPath)
+	}
+	if !res.IndexUpdated {
+		t.Errorf("expected IndexUpdated=true")
+	}
+}
+
