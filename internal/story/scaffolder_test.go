@@ -22,7 +22,7 @@ func (m *mockAutopilot) CreateStory(ctx context.Context, opts autopilot.CreateSt
 		return m.createStoryFunc(ctx, opts)
 	}
 	return &autopilot.StoryResult{
-		StoryID:      "STORY-IAZIO-0131",
+		StoryID:      "STORY-MOCK-001",
 		Submodule:    opts.Submodule,
 		StoryPath:    "docs/stories/2026-10-19-story.md",
 		IndexUpdated: true,
@@ -98,7 +98,7 @@ func TestScaffolder_ScaffoldStory_Success(t *testing.T) {
 		createStoryFunc: func(ctx context.Context, opts autopilot.CreateStoryOptions) (*autopilot.StoryResult, error) {
 			capturedOpts = opts
 			return &autopilot.StoryResult{
-				StoryID:      "STORY-IAZIO-0131",
+				StoryID:      "STORY-MOCK-001",
 				Submodule:    opts.Submodule,
 				StoryPath:    "docs/stories/story.md",
 				IndexUpdated: true,
@@ -123,8 +123,8 @@ func TestScaffolder_ScaffoldStory_Success(t *testing.T) {
 		t.Fatalf("unexpected ScaffoldStory error: %v", err)
 	}
 
-	if res.StoryID != "STORY-IAZIO-0131" {
-		t.Errorf("expected story ID STORY-IAZIO-0131, got %s", res.StoryID)
+	if res.StoryID != "STORY-MOCK-001" {
+		t.Errorf("expected story ID STORY-MOCK-001, got %s", res.StoryID)
 	}
 	if capturedOpts.WorkingDir != subDir {
 		t.Errorf("expected working dir %s, got %s", subDir, capturedOpts.WorkingDir)

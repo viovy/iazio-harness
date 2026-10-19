@@ -107,7 +107,7 @@ sub="$2"
 if [ "$cmd" = "story" ] && [ "$sub" = "create" ]; then
   cat <<'EOF' > "%s"
 ---
-id: STORY-IAZIO-999
+id: STORY-TEST-999
 ---
 ## 1. Rationale
 Old
@@ -116,7 +116,7 @@ Old
 ## 3. Acceptance Criteria
 - [ ] Old
 EOF
-  echo '{"story_id":"STORY-IAZIO-999","path":"%s"}'
+  echo '{"story_id":"STORY-TEST-999","path":"%s"}'
   exit 0
 fi
 if [ "$cmd" = "story" ] && [ "$sub" = "index-gate" ]; then
@@ -144,8 +144,8 @@ exit 2
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if res.StoryID != "STORY-IAZIO-999" {
-		t.Errorf("expected story ID STORY-IAZIO-999, got %s", res.StoryID)
+	if res.StoryID != "STORY-TEST-999" {
+		t.Errorf("expected story ID STORY-TEST-999, got %s", res.StoryID)
 	}
 	if !res.IndexUpdated {
 		t.Error("expected index_updated=true")
