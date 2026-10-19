@@ -114,3 +114,30 @@ func TestRunPromptCommand_Validations(t *testing.T) {
 		t.Fatalf("expected requires --json error, got %v", err)
 	}
 }
+
+func TestRunCodebaseCommand_Validations(t *testing.T) {
+	// Missing args
+	err := runCodebaseCommand([]string{})
+	if err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("expected usage error, got %v", err)
+	}
+
+	// Unknown subcommand
+	err = runCodebaseCommand([]string{"destroy"})
+	if err == nil || !strings.Contains(err.Error(), "unknown codebase subcommand") {
+		t.Fatalf("expected unknown subcommand error, got %v", err)
+	}
+
+	// Missing --json flag on repos
+	err = runCodebaseRepos([]string{})
+	if err == nil || !strings.Contains(err.Error(), "requires --json") {
+		t.Fatalf("expected requires --json error on repos, got %v", err)
+	}
+
+	// Missing --json flag on export
+	err = runCodebaseExport([]string{})
+	if err == nil || !strings.Contains(err.Error(), "requires --json") {
+		t.Fatalf("expected requires --json error on export, got %v", err)
+	}
+}
+
