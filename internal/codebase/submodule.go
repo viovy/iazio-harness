@@ -17,6 +17,12 @@ func IsSuperprojectRoot(repo string) bool {
 // CandidateFleetRoots returns candidate host paths where a fleet superproject may reside.
 func CandidateFleetRoots() []string {
 	var candidates []string
+	if env := os.Getenv("IAZIO_FLEET_ROOT"); env != "" {
+		candidates = append(candidates, env)
+	}
+	if env := os.Getenv("FLEET_ROOT"); env != "" {
+		candidates = append(candidates, env)
+	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		workDir := filepath.Join(home, "work")
 		if entries, err := os.ReadDir(workDir); err == nil {
@@ -26,6 +32,16 @@ func CandidateFleetRoots() []string {
 					if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
 						candidates = append(candidates, cand)
 					}
+				}
+			}
+		}
+	}
+	if entries, err := os.ReadDir("/work"); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				cand := filepath.Join("/work", e.Name())
+				if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+					candidates = append(candidates, cand)
 				}
 			}
 		}
@@ -71,14 +87,16 @@ func ResolveSubmodulePath(fleetRoot, submodule string) (string, error) {
 		fleetRoot = ResolveFleetRoot()
 	}
 
-	if IsSuperprojectRoot(cleanRepo) {
-		if _, err := os.Stat(filepath.Join(fleetRoot, ".gitmodules")); err != nil {
-			for _, cand := range CandidateFleetRoots() {
-				if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
-					return filepath.Abs(cand)
-				}
+	if _, err := os.Stat(filepath.Join(fleetRoot, ".gitmodules")); err != nil {
+		for _, cand := range CandidateFleetRoots() {
+			if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+				fleetRoot = cand
+				break
 			}
 		}
+	}
+
+	if IsSuperprojectRoot(cleanRepo) {
 		return filepath.Abs(fleetRoot)
 	}
 
