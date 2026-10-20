@@ -56,8 +56,12 @@ func (e *Executor) SetLockDir(dir string) {
 // Execute validates payload, resolves target submodule directory, acquires exclusive lock,
 // and invokes autopilot.PromptRunner.
 func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopilot.PromptResult, error) {
-	if strings.TrimSpace(payload.PromptID) == "" && strings.TrimSpace(payload.StoryID) != "" {
-		payload.PromptID = "prompt-" + strings.TrimSpace(payload.StoryID)
+	if strings.TrimSpace(payload.PromptID) == "" {
+		if strings.TrimSpace(payload.StoryID) != "" {
+			payload.PromptID = "prompt-" + strings.TrimSpace(payload.StoryID)
+		} else {
+			payload.PromptID = fmt.Sprintf("prompt-%d", time.Now().UnixNano())
+		}
 	}
 
 	if err := validatePayload(payload); err != nil {
@@ -165,7 +169,7 @@ func validatePayload(p PromptPayload) error {
 		promptID = strings.TrimSpace(p.StoryID)
 	}
 	if promptID == "" {
-		return errors.New("prompt_id is required")
+		promptID = fmt.Sprintf("prompt-%d", time.Now().UnixNano())
 	}
 	if strings.ContainsAny(promptID, `/\`) || strings.Contains(promptID, "..") {
 		return errors.New("invalid prompt_id: path traversal characters not permitted")
