@@ -13,6 +13,7 @@ bin/
 # Temporary
 tmp/
 *.tmp
+.scannerwork/
 
 # Runtime
 .iazio/

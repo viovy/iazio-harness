@@ -258,3 +258,18 @@ exit 2
 	}
 }
 
+func TestNewCLIClientDefaults(t *testing.T) {
+	t.Setenv("AUTOPILOT_BIN", "/custom/autopilot")
+	c1 := NewCLIClient("")
+	if c1.AutopilotBinary != "/custom/autopilot" {
+		t.Errorf("expected /custom/autopilot, got %s", c1.AutopilotBinary)
+	}
+
+	t.Setenv("AUTOPILOT_BIN", "")
+	c2 := NewCLIClient("")
+	if c2.AutopilotBinary != "autopilot" {
+		t.Errorf("expected autopilot, got %s", c2.AutopilotBinary)
+	}
+}
+
+

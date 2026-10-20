@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -383,3 +384,30 @@ func TestResolveGitDir_SubmodulePointer(t *testing.T) {
 		t.Errorf("expected resolved gitdir %s, got %s", cleanExpected, cleanResolved)
 	}
 }
+
+func TestExecutor_ResolveFleetRootAndLockPath(t *testing.T) {
+	// 1. ResolveFleetRoot with env
+	t.Setenv("IAZIO_FLEET_ROOT", "/custom/fleet/path")
+	if ResolveFleetRoot() != "/custom/fleet/path" {
+		t.Errorf("expected /custom/fleet/path, got %s", ResolveFleetRoot())
+	}
+	t.Setenv("IAZIO_FLEET_ROOT", "")
+	if ResolveFleetRoot() == "" {
+		t.Error("expected non-empty fleet root")
+	}
+
+	// 2. resolveLockPath
+	ex1 := NewExecutor("", nil)
+	ex1.SetLockDir("/tmp/custom-locks")
+	lp1 := ex1.resolveLockPath("/some/dir", "my-repo")
+	if !strings.HasPrefix(lp1, "/tmp/custom-locks") {
+		t.Errorf("expected custom lock dir in %s", lp1)
+	}
+
+	ex2 := NewExecutor("", nil)
+	lp2 := ex2.resolveLockPath(t.TempDir(), "my-repo")
+	if !strings.Contains(lp2, "iazio-harness-prompt.lock") {
+		t.Errorf("expected default prompt lock in %s", lp2)
+	}
+}
+

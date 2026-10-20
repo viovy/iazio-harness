@@ -216,3 +216,45 @@ func TestScaffolder_ConcurrentAccessSerializes(t *testing.T) {
 		t.Errorf("expected 1 success and 1 lock contention error, got %d successes and %d lock errors (%v)", successCount, lockErrCount, results)
 	}
 }
+
+func TestResolveFleetRoot_And_Validations(t *testing.T) {
+	// 1. ResolveFleetRoot with env
+	t.Setenv("IAZIO_FLEET_ROOT", "/custom/fleet")
+	if ResolveFleetRoot() != "/custom/fleet" {
+		t.Errorf("expected /custom/fleet, got %s", ResolveFleetRoot())
+	}
+
+	// 2. ResolveFleetRoot without env
+	t.Setenv("IAZIO_FLEET_ROOT", "")
+	root := ResolveFleetRoot()
+	if root == "" {
+		t.Error("expected non-empty fleet root")
+	}
+
+	// 3. validateRelativePath
+	if err := validateRelativePath(""); err == nil {
+		t.Error("expected error for empty path")
+	}
+	if err := validateRelativePath("../escape"); err == nil {
+		t.Error("expected error for traversal")
+	}
+	if err := validateRelativePath("/absolute/path"); err == nil {
+		t.Error("expected error for / prefix")
+	}
+	if err := validateRelativePath("\\windows\\path"); err == nil {
+		t.Error("expected error for \\ prefix")
+	}
+	if err := validateRelativePath("C:drive"); err == nil {
+		t.Error("expected error for volume prefix")
+	}
+	if err := validateRelativePath("sub/dir/file.txt"); err != nil {
+		t.Errorf("expected valid relative path, got %v", err)
+	}
+
+	// 4. NewScaffolder without client
+	sc := NewScaffolder("", nil)
+	if sc == nil {
+		t.Error("expected non-nil scaffolder")
+	}
+}
+

@@ -134,4 +134,86 @@ func TestWorkspaceSnapshotAndDiff(t *testing.T) {
 	if string(restoredF2) != "original content 2" {
 		t.Errorf("expected restored file2 content, got %s", string(restoredF2))
 	}
+
+	// Cleanup snapshot
+	if err := snap.Cleanup(); err != nil {
+		t.Errorf("snap.Cleanup: %v", err)
+	}
+
+	// Cleanup nil and empty checks
+	var nilSnap *WorkspaceSnapshot
+	if err := nilSnap.Cleanup(); err != nil {
+		t.Errorf("expected nil from nilSnap.Cleanup, got %v", err)
+	}
+	emptySnap := &WorkspaceSnapshot{}
+	if err := emptySnap.Cleanup(); err != nil {
+		t.Errorf("expected nil from emptySnap.Cleanup, got %v", err)
+	}
+
+	var nilBox *Sandbox
+	if err := nilBox.Cleanup(); err != nil {
+		t.Errorf("expected nil from nilBox.Cleanup, got %v", err)
+	}
+	if _, err := nilBox.Diff(); err == nil {
+		t.Errorf("expected error from nilBox.Diff")
+	}
+
+	emptyBox := &Sandbox{}
+	if err := emptyBox.Cleanup(); err != nil {
+		t.Errorf("expected nil from emptyBox.Cleanup, got %v", err)
+	}
+	if _, err := emptyBox.Diff(); err == nil {
+		t.Errorf("expected error from emptyBox.Diff")
+	}
+
+	// Real sandbox lifecycle
+	sbDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(sbDir, "f.txt"), []byte("hello"), 0o644)
+	realBox, err := Create(sbDir, Options{})
+	if err != nil {
+		t.Fatalf("Create sandbox failed: %v", err)
+	}
+	diffOut, err := realBox.Diff()
+	if err != nil {
+		t.Fatalf("realBox.Diff failed: %v", err)
+	}
+	if diffOut != "" {
+		t.Errorf("expected empty diff on fresh clone, got %s", diffOut)
+	}
+	if err := realBox.Cleanup(); err != nil {
+		t.Errorf("realBox.Cleanup failed: %v", err)
+	}
+
+	// Proxy empty upstream and cassette paths
+	noUpstreamProxy := &RecordReplayProxy{}
+	if _, err := noUpstreamProxy.forwardToUpstream(httptest.NewRequest(http.MethodGet, "/x", nil), nil); err == nil {
+		t.Errorf("expected error when forwardToUpstream with empty upstreamURL")
+	}
+	if err := noUpstreamProxy.LoadCassette(); err != nil {
+		t.Errorf("expected nil for LoadCassette with empty cassettePath, got %v", err)
+	}
+	if err := noUpstreamProxy.saveCassetteLocked(); err != nil {
+		t.Errorf("expected nil for saveCassetteLocked with empty cassettePath, got %v", err)
+	}
+
+	// AddInteraction
+	noUpstreamProxy.AddInteraction(RecordedInteraction{
+		Method:       "GET",
+		URL:          "http://test.com",
+		StatusCode:   200,
+		ResponseBody: "ok",
+	})
+	if len(noUpstreamProxy.cassette.Interactions) != 1 {
+		t.Errorf("expected 1 interaction, got %d", len(noUpstreamProxy.cassette.Interactions))
+	}
+
+	// CreateSnapshot edge cases
+	if _, err := CreateSnapshot("", "snap-id"); err == nil {
+		t.Errorf("expected error for empty sourceDir in CreateSnapshot")
+	}
+	snapAutoID, err := CreateSnapshot(sbDir, "")
+	if err != nil {
+		t.Fatalf("CreateSnapshot with empty snapshotID failed: %v", err)
+	}
+	_ = snapAutoID.Cleanup()
 }

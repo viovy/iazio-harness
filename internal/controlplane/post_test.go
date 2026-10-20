@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -192,5 +193,93 @@ func TestGetJobTransientRetrySuccess(t *testing.T) {
 		t.Fatalf("expected ID job-1, got %s", job.ID)
 	}
 }
+
+func TestControlplaneExtraCoverage(t *testing.T) {
+	// 1. PostExitWithOptions
+	var receivedOpts ExitOptions
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/exit") {
+			_ = json.NewDecoder(r.Body).Decode(&receivedOpts)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/bad-json" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{invalid-json"))
+			return
+		}
+		if r.URL.Path == "/v1/jobs/not-found" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/fail-post") {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	opts := ExitOptions{
+		ExitCode:       2,
+		Reason:         "QUOTA",
+		DiagnosticCode: "QUOTA_EXHAUSTED",
+		Engine:         "agy",
+		Model:          "gemini-flash",
+		Remediation:    "Switch model",
+		ASEComplete:    false,
+	}
+	err := PostExitWithOptions(context.Background(), srv.URL, "tok", "j-opt", opts)
+	if err != nil {
+		t.Fatalf("PostExitWithOptions failed: %v", err)
+	}
+	if receivedOpts.Reason != "QUOTA" || receivedOpts.DiagnosticCode != "QUOTA_EXHAUSTED" {
+		t.Errorf("unexpected options: %+v", receivedOpts)
+	}
+
+	// 2. GetJob errors
+	_, err = GetJob(context.Background(), srv.URL, "tok", "bad-json")
+	if err == nil || !strings.Contains(err.Error(), "decode job") {
+		t.Errorf("expected decode job error, got %v", err)
+	}
+
+	_, err = GetJob(context.Background(), srv.URL, "tok", "not-found")
+	if err == nil || !strings.Contains(err.Error(), "status 404") {
+		t.Errorf("expected 404 status error, got %v", err)
+	}
+
+	// 3. doPostWithRetry non-transient error
+	err = doPostWithRetry(context.Background(), srv.URL+"/v1/jobs/fail-post", "tok", []byte(`{}`), "test-op")
+	if err == nil || !strings.Contains(err.Error(), "test-op: 400") {
+		t.Errorf("expected 400 error from doPostWithRetry, got %v", err)
+	}
+
+	// 4. Transient error checks
+	if !IsTransientError(errors.New("connection reset by peer")) {
+		t.Error("expected connection reset to be transient")
+	}
+	if !IsTransientError(errors.New("broken pipe")) {
+		t.Error("expected broken pipe to be transient")
+	}
+	if !IsTransientError(errors.New("unexpected EOF")) {
+		t.Error("expected EOF to be transient")
+	}
+	if IsTransientError(nil) {
+		t.Error("expected nil to not be transient")
+	}
+	if IsTransientError(errors.New("permission denied")) {
+		t.Error("expected permission denied to not be transient")
+	}
+
+	// 5. Canceled context in doPostWithRetry and GetJob
+	ctxCanceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = doPostWithRetry(ctxCanceled, srv.URL, "tok", []byte(`{}`), "canceled-op")
+	_, _ = GetJob(ctxCanceled, srv.URL, "tok", "job-1")
+
+	// 6. Non-retryable GetJob on non-transient status
+	_, _ = GetJob(context.Background(), srv.URL, "tok", "fail-post")
+}
+
 
 

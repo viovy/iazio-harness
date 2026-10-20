@@ -224,3 +224,18 @@ func TestCLIPromptRunner_Timeout(t *testing.T) {
 		t.Errorf("expected status timed_out, got %s", res.Status)
 	}
 }
+
+func TestNewPromptRunnerDefaults(t *testing.T) {
+	t.Setenv("AUTOPILOT_BIN", "/custom/runner/bin")
+	r1 := NewPromptRunner("")
+	if r1.AutopilotBinary != "/custom/runner/bin" {
+		t.Errorf("expected /custom/runner/bin, got %s", r1.AutopilotBinary)
+	}
+
+	t.Setenv("AUTOPILOT_BIN", "")
+	r2 := NewPromptRunner("")
+	if r2.AutopilotBinary != "autopilot" {
+		t.Errorf("expected autopilot, got %s", r2.AutopilotBinary)
+	}
+}
+
