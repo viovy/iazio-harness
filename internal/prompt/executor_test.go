@@ -195,13 +195,6 @@ func TestExecutor_Execute_ValidationErrors(t *testing.T) {
 		payload PromptPayload
 	}{
 		{
-			name: "missing prompt_id",
-			payload: PromptPayload{
-				Repo:   "iazio-mcp",
-				Prompt: "do work",
-			},
-		},
-		{
 			name: "invalid prompt_id with traversal",
 			payload: PromptPayload{
 				PromptID: "../bad-id",
@@ -262,6 +255,35 @@ func TestExecutor_Execute_DerivesPromptIDFromStoryID(t *testing.T) {
 	}
 	if recordedOpts.PromptID != "prompt-STORY-GOV-0001" {
 		t.Fatalf("expected derived prompt ID 'prompt-STORY-GOV-0001', got %q", recordedOpts.PromptID)
+	}
+}
+
+func TestExecutor_Execute_AutoGeneratesPromptIDWhenMissing(t *testing.T) {
+	fleetRoot, _, _ := setupTestFleet(t)
+	lockDir := t.TempDir()
+
+	var recordedOpts autopilot.RunPromptOptions
+	runner := &mockPromptRunner{
+		onRun: func(opts autopilot.RunPromptOptions) {
+			recordedOpts = opts
+		},
+	}
+
+	exec := NewExecutor(fleetRoot, runner)
+	exec.SetLockDir(lockDir)
+
+	res, err := exec.Execute(context.Background(), PromptPayload{
+		Repo:   "iazio-mcp",
+		Prompt: "execute prompt without prompt_id",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected result, got nil")
+	}
+	if !strings.HasPrefix(recordedOpts.PromptID, "prompt-") {
+		t.Fatalf("expected auto-generated prompt ID starting with 'prompt-', got %q", recordedOpts.PromptID)
 	}
 }
 
