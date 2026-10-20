@@ -68,6 +68,9 @@ func runStoryCreate(args []string) error {
 }
 
 func writeStoryError(err error) error {
+	if err == nil {
+		return nil
+	}
 	errPayload := map[string]string{
 		"error": err.Error(),
 	}

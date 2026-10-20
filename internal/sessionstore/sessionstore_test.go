@@ -3,6 +3,7 @@ package sessionstore
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -151,3 +152,115 @@ conversation_id: "` + convRev + `"
 		t.Fatalf("expected source 'checkpoint', got %s", sess.Source)
 	}
 }
+
+func TestDefaultResolver(t *testing.T) {
+	r := DefaultResolver()
+	if r == nil {
+		t.Fatal("expected non-nil default resolver")
+	}
+	if r.SpoolDir == "" {
+		t.Error("expected non-empty spool dir")
+	}
+}
+
+func TestDetectDirtyWorktreeContext(t *testing.T) {
+	resolver := DefaultResolver()
+
+	// 1. Empty worktree path
+	ctx := resolver.DetectDirtyWorktreeContext("")
+	if ctx.IsDirty || ctx.StoryID != "" {
+		t.Errorf("expected empty ctx for blank worktree")
+	}
+
+	// 2. Non-git directory
+	emptyDir := t.TempDir()
+	ctx = resolver.DetectDirtyWorktreeContext(emptyDir)
+	if ctx.IsDirty {
+		t.Errorf("expected non-dirty for empty non-git dir")
+	}
+
+	// 3. Git repo with clean status
+	gitDir := t.TempDir()
+	cmdInit := exec.Command("git", "init", "-b", "feat/app-0099-test", gitDir)
+	_ = cmdInit.Run()
+	cmdConfig1 := exec.Command("git", "-C", gitDir, "config", "user.email", "test@example.com")
+	_ = cmdConfig1.Run()
+	cmdConfig2 := exec.Command("git", "-C", gitDir, "config", "user.name", "Test Runner")
+	_ = cmdConfig2.Run()
+
+	_ = os.WriteFile(filepath.Join(gitDir, "README.md"), []byte("# Hello"), 0o644)
+	_ = exec.Command("git", "-C", gitDir, "add", "README.md").Run()
+	_ = exec.Command("git", "-C", gitDir, "commit", "-m", "initial").Run()
+
+	ctx = resolver.DetectDirtyWorktreeContext(gitDir)
+	if ctx.IsDirty {
+		t.Errorf("expected clean git repo to not be dirty")
+	}
+
+	// 4. Dirty review file
+	revDir := filepath.Join(gitDir, "docs", "reviews")
+	_ = os.MkdirAll(revDir, 0o755)
+	revContent := `---
+date: 2026-10-20
+tool: agy
+story_id: STORY-APP-0099
+verdict: CLEAN
+iteration: 2
+conversation_id: "conv-dirty-1234"
+---
+`
+	_ = os.WriteFile(filepath.Join(revDir, "2026-10-20-review.md"), []byte(revContent), 0o644)
+	ctx = resolver.DetectDirtyWorktreeContext(gitDir)
+	if !ctx.IsDirty {
+		t.Errorf("expected dirty status with untracked review file")
+	}
+	if ctx.StoryID != "STORY-APP-0099" {
+		t.Errorf("expected STORY-APP-0099, got %s", ctx.StoryID)
+	}
+	if ctx.ConversationID != "conv-dirty-1234" {
+		t.Errorf("expected conv-dirty-1234, got %s", ctx.ConversationID)
+	}
+	if ctx.Verdict != "CLEAN" {
+		t.Errorf("expected CLEAN verdict, got %s", ctx.Verdict)
+	}
+
+	// 5. Dirty story file without review file
+	_ = os.Remove(filepath.Join(revDir, "2026-10-20-review.md"))
+	storyDir := filepath.Join(gitDir, "docs", "stories")
+	_ = os.MkdirAll(storyDir, 0o755)
+	_ = os.WriteFile(filepath.Join(storyDir, "2026-10-20-app-0099-feature.story.md"), []byte("# Story"), 0o644)
+	ctx = resolver.DetectDirtyWorktreeContext(gitDir)
+	if !ctx.IsDirty || ctx.StoryID != "STORY-APP-0099" {
+		t.Errorf("expected STORY-APP-0099 from dirty story file, got %+v", ctx)
+	}
+}
+
+func TestScanBrainSessionsByStory(t *testing.T) {
+	brainDir := t.TempDir()
+	convID := "22222222-3333-4444-5555-666666666666"
+	logDir := filepath.Join(brainDir, convID, ".system_generated", "logs")
+	_ = os.MkdirAll(logDir, 0o755)
+	transcript := `{"step_index":0,"content":"Working on STORY-TEST-7777"}
+{"step_index":1,"content":"Executing tests"}
+`
+	_ = os.WriteFile(filepath.Join(logDir, "transcript.jsonl"), []byte(transcript), 0o644)
+
+	resolver := &Resolver{
+		BrainDir: brainDir,
+	}
+
+	sessions := resolver.scanBrainSessionsByStory("/work/repo", "STORY-TEST-7777")
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session matching STORY-TEST-7777, got %d", len(sessions))
+	}
+	if sessions[0].ConversationID != convID {
+		t.Errorf("expected %s, got %s", convID, sessions[0].ConversationID)
+	}
+
+	// Non-matching story returns 0
+	none := resolver.scanBrainSessionsByStory("/work/repo", "STORY-UNKNOWN")
+	if len(none) != 0 {
+		t.Errorf("expected 0 sessions, got %d", len(none))
+	}
+}
+

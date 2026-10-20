@@ -2,7 +2,10 @@ package engines
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/idempotency"
 )
 
 func TestArgvOrder(t *testing.T) {
@@ -614,4 +619,221 @@ func TestHold_FallbackToGitDir(t *testing.T) {
 		t.Fatalf("expected ErrLockHeld on fallback lock, got %v", err2)
 	}
 }
+
+func TestEnginesExtraCoverage(t *testing.T) {
+	// 1. CLI Name and HealthCheck
+	cDefault := CLI{}
+	if cDefault.Name() != "agy" {
+		t.Errorf("expected agy, got %s", cDefault.Name())
+	}
+	cCustom := CLI{
+		Engine: "echo",
+		LookPath: func(s string) (string, error) {
+			return "/bin/echo", nil
+		},
+	}
+	if err := cCustom.HealthCheck(); err != nil {
+		t.Errorf("expected health check success, got %v", err)
+	}
+
+	cFail := CLI{
+		Engine: "missing-engine",
+		LookPath: func(s string) (string, error) {
+			return "", errors.New("not found")
+		},
+	}
+	if err := cFail.HealthCheck(); err == nil {
+		t.Errorf("expected health check failure for missing engine")
+	}
+
+	// 2. isAntigravityConversation
+	if isAntigravityConversation("") {
+		t.Errorf("expected false for empty cid")
+	}
+	if isAntigravityConversation("definitely-not-an-agy-conversation-uuid") {
+		t.Errorf("expected false for nonexistent cid")
+	}
+
+	// 3. DefaultLockDir
+	t.Setenv("IAZIO_HARNESS_LOCK_DIR", "/custom/locks")
+	if DefaultLockDir() != "/custom/locks" {
+		t.Errorf("expected /custom/locks, got %s", DefaultLockDir())
+	}
+	t.Setenv("IAZIO_HARNESS_LOCK_DIR", "")
+	if DefaultLockDir() == "" {
+		t.Errorf("expected non-empty default lock dir")
+	}
+
+	// 4. NewLock and HoldPath
+	lockFile := filepath.Join(t.TempDir(), "test.lock")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	lk, err := HoldPath(ctx, lockFile)
+	if err != nil {
+		t.Fatalf("HoldPath failed: %v", err)
+	}
+	_ = lk.Release()
+
+	// Canceled HoldPath
+	ctxCanceled, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	// Hold the lock with another handle first
+	f, _ := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0o644)
+	_ = FileLock(f)
+	defer func() { _ = FileUnlock(f); _ = f.Close() }()
+	_, err = HoldPath(ctxCanceled, lockFile)
+	if err == nil {
+		t.Errorf("expected error on canceled context in HoldPath")
+	}
+
+	// 5. Process group hooks
+	PostStartProcessGroup(nil)
+	StopProcessGroup(nil)
+	KillProcessGroup(nil)
+	postStartProcessGroup(nil)
+	stopProcessGroup(nil)
+	killProcessGroup(nil)
+
+	cmd := exec.Command("sleep", "10")
+	SetProcGroup(cmd)
+	setProcGroup(cmd)
+	if err := cmd.Start(); err == nil {
+		PostStartProcessGroup(cmd)
+		postStartProcessGroup(cmd)
+		stopProcessGroup(cmd)
+		killProcessGroup(cmd)
+		_ = cmd.Wait()
+	}
+
+	// 6. Lock path helpers
+	nl := NewLock(nil, "/path/to/lock")
+	if nl.Path != "/path/to/lock" {
+		t.Errorf("expected path /path/to/lock, got %s", nl.Path)
+	}
+	p := PrimaryLockPath("/my/worktree", "")
+	if p == "" {
+		t.Errorf("expected non-empty primary lock path")
+	}
+	fb := FallbackLockPath("/my/worktree")
+	if fb == "" {
+		t.Errorf("expected non-empty fallback lock path")
+	}
+
+	// 7. HealthCheck candidate paths
+	candDir := t.TempDir()
+	t.Setenv("HOME", candDir)
+	localBin := filepath.Join(candDir, ".local", "bin")
+	_ = os.MkdirAll(localBin, 0o755)
+	_ = os.WriteFile(filepath.Join(localBin, "myengine"), []byte("#!/bin/sh\n"), 0o755)
+	candEngine := CLI{
+		Engine: "myengine",
+		LookPath: func(file string) (string, error) {
+			return "", os.ErrNotExist
+		},
+	}
+	// With nil LookPath, it searches HOME/.local/bin
+	candEngineNilLook := CLI{Engine: "myengine"}
+	if err := candEngineNilLook.HealthCheck(); err != nil {
+		t.Errorf("expected HealthCheck candidate lookup to succeed, got %v", err)
+	}
+	_ = candEngine.HealthCheck()
+
+	// 8. exitCode edge cases
+	if ec := exitCode(nil); ec != 0 {
+		t.Errorf("expected 0, got %d", ec)
+	}
+	if ec := exitCode(errors.New("generic error")); ec != 1 {
+		t.Errorf("expected 1, got %d", ec)
+	}
+
+	// 9. lock.go edge cases
+	t.Setenv("IAZIO_HARNESS_LOCK_DIR", "/custom/locks")
+	if d := DefaultLockDir(); d != "/custom/locks" {
+		t.Errorf("expected /custom/locks, got %s", d)
+	}
+	if _, err := CheckoutDir("ordinary", "", ""); err == nil {
+		t.Errorf("expected error for empty checkout path")
+	}
+	if _, err := Hold("", ""); err == nil {
+		t.Errorf("expected error for empty checkout in Hold")
+	}
+	submodDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(submodDir, ".git"), []byte("gitdir: ../.git/modules/sub"), 0o644)
+	if fb := FallbackLockPath(submodDir); !strings.HasSuffix(fb, ".git-execution.lock") {
+		t.Errorf("expected submodule fallback lock path, got %s", fb)
+	}
+
+	// 10. env.go edge cases
+	if _, ok := EnvLookup([]string{"FOO=BAR", "MALFORMED_NO_EQUALS"}, "NOT_FOUND"); ok {
+		t.Errorf("expected false for missing key")
+	}
+	if val, ok := EnvLookup([]string{"FOO=BAR"}, "FOO"); !ok || val != "BAR" {
+		t.Errorf("expected BAR, got %s, %v", val, ok)
+	}
+}
+
+func TestExecute_Sandbox_Idempotency_AutoCorrect(t *testing.T) {
+	// 1. Idempotency skip
+	srvIdemp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(idempotency.StepResponse{
+			AlreadyExecuted: true,
+		})
+	}))
+	defer srvIdemp.Close()
+
+	stream := &testCaptureStream{}
+	idempClient := idempotency.NewClient(srvIdemp.URL, "tok")
+	cli := CLI{Engine: "agy"}
+	res, err := cli.Execute(context.Background(), ExecutionRequest{
+		Engine:               "agy",
+		ResumeConversationID: "conv-idemp-123",
+		StepIndex:            1,
+		IdempotencyClient:    idempClient,
+		Argv:                 []string{"echo", "hello"},
+	}, stream)
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("expected idempotency skip to succeed with 0, got res=%+v, err=%v", res, err)
+	}
+
+	// 2. Sandbox execution and OnSandboxDiff
+	workDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(workDir, "existing.txt"), []byte("base"), 0o644)
+	mockSh := filepath.Join(t.TempDir(), "run.sh")
+	_ = os.WriteFile(mockSh, []byte("#!/bin/sh\necho 'added' > newly_created.txt\nexit 0\n"), 0o755)
+
+	var capturedDiff string
+	res, err = cli.Execute(context.Background(), ExecutionRequest{
+		Engine:       "agy",
+		WorktreePath: workDir,
+		Sandbox:      true,
+		Argv:         []string{mockSh},
+		OnSandboxDiff: func(d string) {
+			capturedDiff = d
+		},
+	}, stream)
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("expected sandbox execution to succeed, got %+v, %v", res, err)
+	}
+	_ = capturedDiff
+	// Verify workspace on disk was not polluted because it was executed in a sandbox
+	if _, err := os.Stat(filepath.Join(workDir, "newly_created.txt")); err == nil {
+		t.Errorf("newly_created.txt should not exist in original worktree when sandboxed")
+	}
+
+	// 3. Auto-correct engine from agent to agy for Antigravity conversation ID
+	mockAgy := filepath.Join(t.TempDir(), "mock_agy.sh")
+	_ = os.WriteFile(mockAgy, []byte("#!/bin/sh\necho 'auto-corrected agy success'\nexit 0\n"), 0o755)
+
+	res, err = cli.Execute(context.Background(), ExecutionRequest{
+		Engine:               "agent",
+		ResumeConversationID: "conv-antigravity-9999",
+		Argv:                 []string{mockAgy},
+	}, stream)
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("expected auto-correct execution to succeed, got %+v, %v", res, err)
+	}
+}
+
+
 

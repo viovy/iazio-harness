@@ -328,3 +328,152 @@ func TestCodebaseIncrementalExport(t *testing.T) {
 		t.Error("expected pkg/new_feature.go in incremental chunks")
 	}
 }
+
+func TestCodebaseExtraCoverage(t *testing.T) {
+	// 1. ResolveFleetRoot
+	t.Setenv("IAZIO_FLEET_ROOT", "/fleet/custom")
+	if ResolveFleetRoot() != "/fleet/custom" {
+		t.Errorf("expected /fleet/custom, got %s", ResolveFleetRoot())
+	}
+	t.Setenv("IAZIO_FLEET_ROOT", "")
+	if ResolveFleetRoot() == "" {
+		t.Error("expected non-empty default fleet root")
+	}
+
+	// 2. defaultSubBranch
+	if defaultSubBranch("") != "main" {
+		t.Errorf("expected main, got %s", defaultSubBranch(""))
+	}
+	if defaultSubBranch("develop") != "develop" {
+		t.Errorf("expected develop, got %s", defaultSubBranch("develop"))
+	}
+
+	// 3. resolveRootRepoName and resolveRepoDescription
+	tmpDir := t.TempDir()
+	metaContent := "id: custom-submodule-id\nsummary: \"A very important test submodule\"\n"
+	_ = os.WriteFile(filepath.Join(tmpDir, "metadata.yml"), []byte(metaContent), 0o644)
+
+	name := resolveRootRepoName(tmpDir)
+	if name != "custom-submodule-id" {
+		t.Errorf("expected custom-submodule-id, got %s", name)
+	}
+	desc := resolveRepoDescription(tmpDir, "default")
+	if desc != "A very important test submodule" {
+		t.Errorf("expected summary, got %s", desc)
+	}
+
+	emptyDir := t.TempDir()
+	if resolveRootRepoName(emptyDir) != filepath.Base(emptyDir) {
+		t.Errorf("expected base dir fallback")
+	}
+	if resolveRepoDescription(emptyDir, "fallback") != "fallback" {
+		t.Errorf("expected fallback description")
+	}
+
+	// 4. resolveRepoDirectory
+	fleetDir := t.TempDir()
+	superDir, err := resolveRepoDirectory(fleetDir, ".")
+	if err != nil || superDir != fleetDir {
+		t.Errorf("expected fleetDir for '.', got %s, %v", superDir, err)
+	}
+
+	subPath := filepath.Join(fleetDir, "sub-a")
+	_ = os.MkdirAll(subPath, 0o755)
+	resolvedSub, err := resolveRepoDirectory(fleetDir, "sub-a")
+	if err != nil || resolvedSub != subPath {
+		t.Errorf("expected direct subDir, got %s, %v", resolvedSub, err)
+	}
+
+	_, err = resolveRepoDirectory(fleetDir, "nonexistent-sub")
+	if err == nil {
+		t.Error("expected error for nonexistent repo directory")
+	}
+
+	// 4b. resolveRepoDirectory via .gitmodules
+	gitmodulesContent := `[submodule "sub-b"]
+	path = modules/sub-b
+	url = git@github.com:viovy/sub-b.git
+`
+	_ = os.WriteFile(filepath.Join(fleetDir, ".gitmodules"), []byte(gitmodulesContent), 0o644)
+	subBPath := filepath.Join(fleetDir, "modules", "sub-b")
+	_ = os.MkdirAll(subBPath, 0o755)
+	resolvedGitmoduleSub, err := resolveRepoDirectory(fleetDir, "sub-b")
+	if err != nil || resolvedGitmoduleSub != subBPath {
+		t.Errorf("expected gitmodule resolution to %s, got %s, err: %v", subBPath, resolvedGitmoduleSub, err)
+	}
+
+	// 4c. Git helpers (gitDetectBranch, gitRevParseTree)
+	gitDir := t.TempDir()
+	runCmd := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = gitDir
+		_ = cmd.Run()
+	}
+	runCmd("init", "-b", "feature-xyz")
+	runCmd("config", "user.email", "test@example.com")
+	runCmd("config", "user.name", "Tester")
+	_ = os.WriteFile(filepath.Join(gitDir, "hello.txt"), []byte("hello"), 0o644)
+	runCmd("add", "hello.txt")
+	runCmd("commit", "-m", "initial commit")
+
+	branch, err := gitDetectBranch(context.Background(), gitDir)
+	if err != nil || (branch != "feature-xyz" && branch != "main") {
+		t.Errorf("expected branch detection to succeed, got %q, %v", branch, err)
+	}
+
+	treeHash, err := gitRevParseTree(context.Background(), gitDir, "HEAD^{tree}")
+	if err != nil || treeHash == "" {
+		t.Errorf("expected tree hash from gitRevParseTree, got %q, %v", treeHash, err)
+	}
+
+	// 5. validateRelativeRepoPath
+	if err := validateRelativeRepoPath(""); err == nil {
+		t.Error("expected error for empty path")
+	}
+	if err := validateRelativeRepoPath("../escape"); err == nil {
+		t.Error("expected error for traversal")
+	}
+	if err := validateRelativeRepoPath("/root/path"); err == nil {
+		t.Error("expected error for / prefix")
+	}
+	if err := validateRelativeRepoPath("\\win\\path"); err == nil {
+		t.Error("expected error for \\ prefix")
+	}
+	if err := validateRelativeRepoPath("D:drive"); err == nil {
+		t.Error("expected error for volume prefix")
+	}
+	if err := validateRelativeRepoPath("src/main.go"); err != nil {
+		t.Errorf("expected valid relative path, got %v", err)
+	}
+
+	// 6. isBinaryContent
+	if !isBinaryContent([]byte("binary\x00data")) {
+		t.Error("expected true for null bytes in isBinaryContent")
+	}
+	if isBinaryContent([]byte("plain utf-8 text file")) {
+		t.Error("expected false for plain text in isBinaryContent")
+	}
+
+	// 7. DetectSymbolOnLine
+	symbols := []struct {
+		line string
+		want string
+	}{
+		{"func HandleRequest(w http.ResponseWriter) {", "HandleRequest"},
+		{"type ServiceManager struct {", "ServiceManager"},
+		{"def process_payment(amount, token):", "process_payment"},
+		{"class InvoiceGenerator:", "InvoiceGenerator"},
+		{"class AngularComponent {", "AngularComponent"},
+		{"fn execute_task() -> Result<()> {", "execute_task"},
+		{"struct ThreadPool {", "ThreadPool"},
+		{"## Section Header", "Section Header"},
+		{"const unhandled = 42;", ""},
+	}
+	for _, tc := range symbols {
+		got := DetectSymbolOnLine(tc.line)
+		if got != tc.want {
+			t.Errorf("DetectSymbolOnLine(%q) = %q, want %q", tc.line, got, tc.want)
+		}
+	}
+}
+

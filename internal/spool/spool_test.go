@@ -170,3 +170,67 @@ func openTestSpool(t *testing.T) *Spool {
 	t.Cleanup(func() { _ = sp.Close() })
 	return sp
 }
+
+func TestDefaultDirAndFlush(t *testing.T) {
+	d := DefaultDir()
+	if d == "" {
+		t.Error("expected non-empty default dir")
+	}
+
+	sp := openTestSpool(t)
+	_ = sp.AppendRaw("stdout", []byte("hello world\n"))
+	events := sp.Flush()
+	if len(events) == 0 {
+		t.Error("expected events from Flush")
+	}
+
+	// 1. toValid
+	valid := toValid("hello world")
+	if valid != "hello world" {
+		t.Errorf("expected clean string, got %s", valid)
+	}
+	cleaned := toValid("invalid\xff\xfeutf8")
+	if !utf8.ValidString(cleaned) {
+		t.Errorf("expected valid utf8, got %s", cleaned)
+	}
+
+	// 2. Truncate
+	h, tail, drop := Truncate("", 10)
+	if h != "" || tail != "" || drop != 0 {
+		t.Errorf("expected empty truncate on empty string")
+	}
+	h, tail, drop = Truncate("hello", -1)
+	if h != "" || tail != "" || drop != 5 {
+		t.Errorf("expected drop all on negative limit")
+	}
+	h, tail, drop = Truncate("hello world", 100)
+	if h != "hello world" || tail != "" || drop != 0 {
+		t.Errorf("expected no truncation for short string")
+	}
+	h, tail, drop = Truncate("start-middle-part-end", 10)
+	if drop <= 0 || len(h)+len(tail) > 10 {
+		t.Errorf("expected valid truncation, got head=%q tail=%q dropped=%d", h, tail, drop)
+	}
+
+	// 3. limit
+	if sp.limit() != MaxTextBytes {
+		t.Errorf("expected default limit %d, got %d", MaxTextBytes, sp.limit())
+	}
+	sp.maxText = 1234
+	if sp.limit() != 1234 {
+		t.Errorf("expected custom limit 1234, got %d", sp.limit())
+	}
+
+	// 4. Close when s.f == nil
+	emptySpool := &Spool{}
+	if err := emptySpool.Close(); err != nil {
+		t.Errorf("expected nil from emptySpool.Close, got %v", err)
+	}
+
+	// 5. StripANSI
+	stripped := StripANSI("\x1b]0;Title\x07Hello \x1b[32mWorld\x1b[0m\r\n")
+	if stripped != "Hello World\n" {
+		t.Errorf("expected 'Hello World\\n', got %q", stripped)
+	}
+}
+
