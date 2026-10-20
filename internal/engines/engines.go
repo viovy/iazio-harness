@@ -507,10 +507,46 @@ func isAntigravityConversation(cid string) bool {
 	return err == nil && fi.IsDir()
 }
 
+// ResolveDynamicTool resolves the preferred tool using priority list and PATH availability.
+func ResolveDynamicTool(engine string, priorityList []string) string {
+	engine = strings.TrimSpace(strings.ToLower(engine))
+	if engine != "" && engine != "auto" {
+		return engine
+	}
+	if len(priorityList) == 0 {
+		priorityList = []string{"agy", "agent", "copilot", "opencode"}
+	}
+	for _, tool := range priorityList {
+		tool = strings.TrimSpace(strings.ToLower(tool))
+		if tool == "" {
+			continue
+		}
+		if _, err := exec.LookPath(tool); err == nil {
+			return tool
+		}
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			candidates := []string{
+				filepath.Join(home, ".local", "bin", tool),
+				filepath.Join(home, ".iazio", "bin", tool),
+			}
+			for _, cand := range candidates {
+				if fi, errS := os.Stat(cand); errS == nil && !fi.IsDir() {
+					return tool
+				}
+			}
+		}
+	}
+	return "agy"
+}
+
 // BuildArgv returns the IDE CLI arguments for the engine.
 // The prompt is a single argv element.
 func BuildArgv(req ExecutionRequest) ([]string, error) {
-	switch req.Engine {
+	engine := strings.TrimSpace(strings.ToLower(req.Engine))
+	if engine == "" || engine == "auto" {
+		engine = ResolveDynamicTool(engine, nil)
+	}
+	switch engine {
 	case "agent":
 		argv := []string{"agent", "--print", "--output-format", "text", "--trust", "--force"}
 		model := req.Model
@@ -523,7 +559,7 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		}
 		argv = append(argv, "--", req.Prompt)
 		return argv, nil
-	case "agy", "":
+	case "agy":
 		timeout := req.PrintTimeout
 		if timeout == "" {
 			timeout = "10m"
@@ -547,8 +583,16 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 			argv = append(argv, "--log-file", req.LogFile)
 		}
 		return argv, nil
+	case "copilot":
+		argv := []string{"copilot", "--prompt", req.Prompt}
+		if req.Model != "" && req.Model != "auto" {
+			argv = append(argv, "--model", req.Model)
+		}
+		return argv, nil
 	case "opencode":
 		return []string{"opencode", "run", "--auto", req.Prompt}, nil
+	case "autopilot":
+		return []string{"autopilot", "story", "begin", req.Prompt}, nil
 	default:
 		return nil, errors.New("unknown engine")
 	}

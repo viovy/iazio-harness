@@ -19,6 +19,7 @@ import (
 	"github.com/viovy/iazio-harness/internal/prompt"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 	"github.com/viovy/iazio-harness/internal/spool"
+	"github.com/viovy/iazio-harness/internal/telemetry"
 )
 
 var (
@@ -28,6 +29,9 @@ var (
 )
 
 func main() {
+	flushTracer := telemetry.InitGlobalTracer("iazio-harness", "")
+	defer flushTracer()
+
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
@@ -38,6 +42,11 @@ func run(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: iazio-harness version|auth|run|story|prompt|codebase")
 	}
+	_, span := telemetry.StartSpan(context.Background(), "harness."+args[0],
+		telemetry.WithKind("INTERNAL"),
+		telemetry.WithTag("cli.command", args[0]),
+	)
+	defer span.End()
 	switch args[0] {
 	case "version":
 		fmt.Println(formatVersion())

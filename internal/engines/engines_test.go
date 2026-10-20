@@ -127,6 +127,24 @@ func TestArgvOrder(t *testing.T) {
 			want: []string{"opencode", "run", "--auto", "p"},
 			cwd:  "/repos/leaf-01",
 		},
+		{
+			name: "copilot",
+			req: ExecutionRequest{
+				Engine: "copilot", Prompt: "p", Kind: "execute",
+				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
+			},
+			want: []string{"copilot", "--prompt", "p"},
+			cwd:  "/repos/leaf-01",
+		},
+		{
+			name: "autopilot",
+			req: ExecutionRequest{
+				Engine: "autopilot", Prompt: "STORY-GOV-3576", Kind: "execute",
+				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
+			},
+			want: []string{"autopilot", "story", "begin", "STORY-GOV-3576"},
+			cwd:  "/repos/leaf-01",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
