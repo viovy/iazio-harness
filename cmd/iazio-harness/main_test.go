@@ -431,7 +431,9 @@ func TestPipedStdinHandlers(t *testing.T) {
 	defer func() { os.Stdin = origStdin }()
 
 	// 0. Successful codebase repos discovery
-	t.Setenv("IAZIO_FLEET_ROOT", "/Users/romeo/work/meta-repo-04")
+	tmpRoot := t.TempDir()
+	_ = os.WriteFile(filepath.Join(tmpRoot, ".gitmodules"), []byte("[submodule \"test-sub\"]\n\tpath = test-sub\n"), 0644)
+	t.Setenv("IAZIO_FLEET_ROOT", tmpRoot)
 	if err := runCodebaseRepos([]string{"--json"}); err != nil {
 		t.Errorf("unexpected error on runCodebaseRepos: %v", err)
 	}
