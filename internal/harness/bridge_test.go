@@ -62,7 +62,7 @@ func sampleSIREnvelope(stage, ckptID string, tokens int) *SIREnvelope {
 	return &SIREnvelope{
 		SchemaVersion: 1,
 		Status:        "SIR_BOUNDARY_HALT",
-		StoryID:       "STORY-IAZIO-0148",
+		StoryID:       "STORY-TEST-0148",
 		Checkpoint: SIRCheckpoint{
 			ID:              ckptID,
 			CompletedStages: []string{"lint", "build"},
@@ -136,7 +136,7 @@ func TestSIRCheckpointResume(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := bridge.ExecuteStory(ctx, "job-101", "STORY-IAZIO-0148", "Implement auth resilience")
+	err := bridge.ExecuteStory(ctx, "job-101", "STORY-TEST-0148", "Implement auth resilience")
 	if err != nil {
 		t.Fatalf("unexpected ExecuteStory error: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestHITLSuspendOnMaxRetries(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := bridge.ExecuteStory(ctx, "job-loop-breaker", "STORY-IAZIO-0148", "Fix bug")
+	err := bridge.ExecuteStory(ctx, "job-loop-breaker", "STORY-TEST-0148", "Fix bug")
 	if err == nil {
 		t.Fatalf("expected ErrHITLSuspended, got nil")
 	}
@@ -270,7 +270,7 @@ func TestContextBudgetExceeded(t *testing.T) {
 	exec := &mockExecutor{}
 	bridge := NewBridge(ap, exec)
 
-	err := bridge.ExecuteStory(context.Background(), "job-overflow", "STORY-IAZIO-0148", "Test")
+	err := bridge.ExecuteStory(context.Background(), "job-overflow", "STORY-TEST-0148", "Test")
 	if err == nil || !errors.Is(err, ErrContextBudgetExceeded) {
 		t.Fatalf("expected ErrContextBudgetExceeded, got: %v", err)
 	}
