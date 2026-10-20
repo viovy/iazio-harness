@@ -328,8 +328,8 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		defer wg.Done()
 		_, _ = io.Copy(stderrWriter, stderr)
 	}()
-	waitErr := cmd.Wait()
 	wg.Wait()
+	waitErr := cmd.Wait()
 	close(done)
 	if req.LogFile != "" && req.OnConversationID != nil {
 		scanLogFile()

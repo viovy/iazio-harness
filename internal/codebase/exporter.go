@@ -164,7 +164,7 @@ func Export(ctx context.Context, fleetRoot string, req ExportRequest) (*ExportRe
 	if cleanRepo == "" {
 		return nil, errors.New("repo_name is required")
 	}
-	if err := validateRelativeRepoPath(cleanRepo); err != nil && !isSuperprojectRoot(cleanRepo) {
+	if err := validateRelativeRepoPath(cleanRepo); err != nil && !IsSuperprojectRoot(cleanRepo) {
 		return nil, err
 	}
 
@@ -549,7 +549,7 @@ func resolveRepoDescription(dir, def string) string {
 }
 
 func resolveRepoDirectory(fleetRoot, repo string) (string, error) {
-	if isSuperprojectRoot(repo) {
+	if IsSuperprojectRoot(repo) {
 		return fleetRoot, nil
 	}
 
@@ -687,6 +687,3 @@ func validateRelativeRepoPath(p string) error {
 	return nil
 }
 
-func isSuperprojectRoot(repo string) bool {
-	return repo == "." || repo == ("viovy-m"+"eta-repo") || repo == ("m"+"eta-repo") || repo == "superproject"
-}
