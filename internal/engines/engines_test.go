@@ -853,5 +853,28 @@ func TestExecute_Sandbox_Idempotency_AutoCorrect(t *testing.T) {
 	}
 }
 
+func TestResolveDynamicTool(t *testing.T) {
+	// Explicit engine returns as-is
+	if tool := ResolveDynamicTool("agent", nil); tool != "agent" {
+		t.Fatalf("expected agent, got %s", tool)
+	}
+	if tool := ResolveDynamicTool("copilot", []string{"agy"}); tool != "copilot" {
+		t.Fatalf("expected copilot, got %s", tool)
+	}
+
+	// Dynamic fallback with custom priority list
+	tool := ResolveDynamicTool("auto", []string{"nonexistent-tool-xyz", "sh"})
+	if tool != "sh" {
+		t.Fatalf("expected sh from PATH, got %s", tool)
+	}
+
+	// Default priority list fallback
+	toolDefault := ResolveDynamicTool("", nil)
+	if toolDefault == "" {
+		t.Fatalf("expected non-empty default resolved tool")
+	}
+}
+
+
 
 
