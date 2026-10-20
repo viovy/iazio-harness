@@ -164,7 +164,7 @@ func Export(ctx context.Context, fleetRoot string, req ExportRequest) (*ExportRe
 	if cleanRepo == "" {
 		return nil, errors.New("repo_name is required")
 	}
-	if err := validateRelativeRepoPath(cleanRepo); err != nil && !isSuperprojectRoot(cleanRepo) {
+	if err := validateRelativeRepoPath(cleanRepo); err != nil && !IsSuperprojectRoot(cleanRepo) {
 		return nil, err
 	}
 
@@ -549,7 +549,7 @@ func resolveRepoDescription(dir, def string) string {
 }
 
 func resolveRepoDirectory(fleetRoot, repo string) (string, error) {
-	if isSuperprojectRoot(repo) {
+	if IsSuperprojectRoot(repo) {
 		return fleetRoot, nil
 	}
 
@@ -630,7 +630,7 @@ func ResolveFleetRoot() string {
 
 	dir, err := os.Getwd()
 	if err != nil {
-		return "."
+		dir = "."
 	}
 
 	curr := dir
@@ -644,6 +644,29 @@ func ResolveFleetRoot() string {
 		}
 		curr = parent
 	}
+
+	// Probe ~/.iazio/fleet_root if configured on host
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if b, err := os.ReadFile(filepath.Join(home, ".iazio", "fleet_root")); err == nil {
+			p := strings.TrimSpace(string(b))
+			if p != "" {
+				if _, err := os.Stat(filepath.Join(p, ".gitmodules")); err == nil {
+					return p
+				}
+			}
+		}
+		// Probe standard host fleet locations
+		for _, cand := range []string{
+			filepath.Join(home, "work", "meta-repo"),
+			filepath.Join(home, "work", "meta-repo-02"),
+			filepath.Join(home, "meta-repo"),
+		} {
+			if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+				return cand
+			}
+		}
+	}
+
 	return dir
 }
 
@@ -664,6 +687,3 @@ func validateRelativeRepoPath(p string) error {
 	return nil
 }
 
-func isSuperprojectRoot(repo string) bool {
-	return repo == "." || repo == ("viovy-m"+"eta-repo") || repo == ("m"+"eta-repo") || repo == "superproject"
-}

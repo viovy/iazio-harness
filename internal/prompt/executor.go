@@ -3,7 +3,6 @@
 package prompt
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -13,12 +12,14 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/autopilot"
+	"github.com/viovy/iazio-harness/internal/codebase"
 	"github.com/viovy/iazio-harness/internal/engines"
 )
 
 // PromptPayload represents the structured JSON input received from iazio-agent.
 type PromptPayload struct {
 	PromptID       string `json:"prompt_id"`
+	StoryID        string `json:"story_id,omitempty"`
 	Repo           string `json:"repo"`
 	Title          string `json:"title,omitempty"`
 	Prompt         string `json:"prompt"`
@@ -55,6 +56,10 @@ func (e *Executor) SetLockDir(dir string) {
 // Execute validates payload, resolves target submodule directory, acquires exclusive lock,
 // and invokes autopilot.PromptRunner.
 func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopilot.PromptResult, error) {
+	if strings.TrimSpace(payload.PromptID) == "" && strings.TrimSpace(payload.StoryID) != "" {
+		payload.PromptID = "prompt-" + strings.TrimSpace(payload.StoryID)
+	}
+
 	if err := validatePayload(payload); err != nil {
 		return nil, fmt.Errorf("invalid prompt payload: %w", err)
 	}
@@ -105,48 +110,7 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 
 // ResolveSubmodulePath resolves the submodule directory, validating against .gitmodules or superproject root.
 func (e *Executor) ResolveSubmodulePath(repo string) (string, error) {
-	cleanRepo := strings.TrimSpace(repo)
-	if err := validateRelativeRepoPath(cleanRepo); err != nil && !isSuperprojectRoot(cleanRepo) {
-		return "", err
-	}
-
-	fleetRoot := e.fleetRoot
-	if fleetRoot == "" {
-		fleetRoot = "."
-	}
-
-	if isSuperprojectRoot(cleanRepo) {
-		return filepath.Abs(fleetRoot)
-	}
-
-	targetDir := filepath.Join(fleetRoot, cleanRepo)
-	absTarget, err := filepath.Abs(targetDir)
-	if err != nil {
-		return "", err
-	}
-
-	// Validate target directory exists
-	info, err := os.Stat(absTarget)
-	if err != nil {
-		return "", fmt.Errorf("submodule directory does not exist: %s (%w)", absTarget, err)
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("submodule path is not a directory: %s", absTarget)
-	}
-
-	// Validate against .gitmodules if present
-	gitmodulesPath := filepath.Join(fleetRoot, ".gitmodules")
-	if _, err := os.Stat(gitmodulesPath); err == nil {
-		registered, err := isSubmoduleRegistered(gitmodulesPath, cleanRepo)
-		if err != nil {
-			return "", fmt.Errorf("failed to inspect .gitmodules: %w", err)
-		}
-		if !registered {
-			return "", fmt.Errorf("submodule %q is not registered in .gitmodules", cleanRepo)
-		}
-	}
-
-	return absTarget, nil
+	return codebase.ResolveSubmodulePath(e.fleetRoot, repo)
 }
 
 func (e *Executor) resolveLockPath(targetDir, repo string) string {
@@ -192,34 +156,18 @@ func ResolveGitDir(checkout string) string {
 
 // ResolveFleetRoot resolves the fleet superproject root from env, current working dir, or parent dirs.
 func ResolveFleetRoot() string {
-	if env := os.Getenv("IAZIO_FLEET_ROOT"); env != "" {
-		return env
-	}
-
-	dir, err := os.Getwd()
-	if err != nil {
-		return "."
-	}
-
-	curr := dir
-	for {
-		if _, err := os.Stat(filepath.Join(curr, ".gitmodules")); err == nil {
-			return curr
-		}
-		parent := filepath.Dir(curr)
-		if parent == curr {
-			break
-		}
-		curr = parent
-	}
-	return dir
+	return codebase.ResolveFleetRoot()
 }
 
 func validatePayload(p PromptPayload) error {
-	if strings.TrimSpace(p.PromptID) == "" {
+	promptID := strings.TrimSpace(p.PromptID)
+	if promptID == "" && strings.TrimSpace(p.StoryID) != "" {
+		promptID = strings.TrimSpace(p.StoryID)
+	}
+	if promptID == "" {
 		return errors.New("prompt_id is required")
 	}
-	if strings.ContainsAny(p.PromptID, `/\`) || strings.Contains(p.PromptID, "..") {
+	if strings.ContainsAny(promptID, `/\`) || strings.Contains(promptID, "..") {
 		return errors.New("invalid prompt_id: path traversal characters not permitted")
 	}
 	if strings.TrimSpace(p.Repo) == "" {
@@ -249,7 +197,7 @@ func validateRelativeRepoPath(p string) error {
 }
 
 func isSuperprojectRoot(repo string) bool {
-	return repo == "." || repo == ("viovy-m"+"eta-repo") || repo == ("m"+"eta-repo") || repo == "superproject"
+	return codebase.IsSuperprojectRoot(repo)
 }
 
 func sanitizeRepoName(repo string) string {
@@ -262,25 +210,5 @@ func sanitizeRepoName(repo string) string {
 }
 
 func isSubmoduleRegistered(gitmodulesPath, submodule string) (bool, error) {
-	f, err := os.Open(gitmodulesPath)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-
-	normSub := strings.TrimSpace(filepath.ToSlash(submodule))
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "path =") || strings.HasPrefix(line, "path=") {
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				val := strings.TrimSpace(parts[1])
-				if filepath.ToSlash(val) == normSub {
-					return true, nil
-				}
-			}
-		}
-	}
-	return false, scanner.Err()
+	return codebase.IsSubmoduleRegistered(gitmodulesPath, submodule)
 }

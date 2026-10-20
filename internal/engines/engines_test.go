@@ -496,7 +496,10 @@ func TestEarlyConversationIDStreaming(t *testing.T) {
 	select {
 	case <-doneCapture:
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for OnConversationID callback")
+		stream.mu.Lock()
+		events := append([]string(nil), stream.events...)
+		stream.mu.Unlock()
+		t.Fatalf("timed out waiting for OnConversationID callback, stream events: %v", events)
 	}
 
 	mu.Lock()

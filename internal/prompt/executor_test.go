@@ -235,6 +235,36 @@ func TestExecutor_Execute_ValidationErrors(t *testing.T) {
 	}
 }
 
+func TestExecutor_Execute_DerivesPromptIDFromStoryID(t *testing.T) {
+	fleetRoot, _, _ := setupTestFleet(t)
+	lockDir := t.TempDir()
+
+	var recordedOpts autopilot.RunPromptOptions
+	runner := &mockPromptRunner{
+		onRun: func(opts autopilot.RunPromptOptions) {
+			recordedOpts = opts
+		},
+	}
+
+	exec := NewExecutor(fleetRoot, runner)
+	exec.SetLockDir(lockDir)
+
+	res, err := exec.Execute(context.Background(), PromptPayload{
+		StoryID: "STORY-GOV-0001",
+		Repo:    "iazio-mcp",
+		Prompt:  "execute story",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected result, got nil")
+	}
+	if recordedOpts.PromptID != "prompt-STORY-GOV-0001" {
+		t.Fatalf("expected derived prompt ID 'prompt-STORY-GOV-0001', got %q", recordedOpts.PromptID)
+	}
+}
+
 func TestExecutor_LockContention_SameSubmodule_Serializes(t *testing.T) {
 	fleetRoot, _, _ := setupTestFleet(t)
 	lockDir := t.TempDir()

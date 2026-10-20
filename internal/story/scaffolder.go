@@ -3,15 +3,14 @@
 package story
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/viovy/iazio-harness/internal/autopilot"
+	"github.com/viovy/iazio-harness/internal/codebase"
 	"github.com/viovy/iazio-harness/internal/engines"
 )
 
@@ -98,96 +97,16 @@ func (s *Scaffolder) ScaffoldStory(ctx context.Context, payload StoryPayload) (*
 // ResolveSubmodulePath resolves the directory on disk for the given submodule name,
 // validating that it matches a registered submodule in .gitmodules or is the superproject root ".".
 func (s *Scaffolder) ResolveSubmodulePath(submodule string) (string, error) {
-	if err := validateRelativePath(submodule); err != nil && submodule != "." {
-		return "", err
-	}
-
-	fleetRoot := s.fleetRoot
-	if fleetRoot == "" {
-		fleetRoot = "."
-	}
-
-	if submodule == "." {
-		return filepath.Abs(fleetRoot)
-	}
-
-	targetDir := filepath.Join(fleetRoot, submodule)
-	absTarget, err := filepath.Abs(targetDir)
-	if err != nil {
-		return "", err
-	}
-
-	// Validate target directory exists
-	info, err := os.Stat(absTarget)
-	if err != nil {
-		return "", fmt.Errorf("submodule directory does not exist: %s (%w)", absTarget, err)
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("submodule path is not a directory: %s", absTarget)
-	}
-
-	// Validate in .gitmodules if present
-	gitmodulesPath := filepath.Join(fleetRoot, ".gitmodules")
-	if _, err := os.Stat(gitmodulesPath); err == nil {
-		registered, err := isSubmoduleInGitmodules(gitmodulesPath, submodule)
-		if err != nil {
-			return "", fmt.Errorf("failed to inspect .gitmodules: %w", err)
-		}
-		if !registered {
-			return "", fmt.Errorf("submodule %q is not registered in .gitmodules", submodule)
-		}
-	}
-
-	return absTarget, nil
+	return codebase.ResolveSubmodulePath(s.fleetRoot, submodule)
 }
 
 // ResolveFleetRoot resolves the fleet superproject root from env, current working dir, or parent dirs.
 func ResolveFleetRoot() string {
-	if env := os.Getenv("IAZIO_FLEET_ROOT"); env != "" {
-		return env
-	}
-
-	dir, err := os.Getwd()
-	if err != nil {
-		return "."
-	}
-
-	curr := dir
-	for {
-		if _, err := os.Stat(filepath.Join(curr, ".gitmodules")); err == nil {
-			return curr
-		}
-		parent := filepath.Dir(curr)
-		if parent == curr {
-			break
-		}
-		curr = parent
-	}
-	return dir
+	return codebase.ResolveFleetRoot()
 }
 
 func isSubmoduleInGitmodules(gitmodulesPath, submodule string) (bool, error) {
-	f, err := os.Open(gitmodulesPath)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-
-	normSub := strings.TrimSpace(filepath.ToSlash(submodule))
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "path =") || strings.HasPrefix(line, "path=") {
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				val := strings.TrimSpace(parts[1])
-				if filepath.ToSlash(val) == normSub {
-					return true, nil
-				}
-			}
-		}
-	}
-	return false, scanner.Err()
+	return codebase.IsSubmoduleRegistered(gitmodulesPath, submodule)
 }
 
 func validateRelativePath(p string) error {
