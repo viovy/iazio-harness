@@ -42,10 +42,17 @@ func run(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: iazio-harness version|auth|run|story|prompt|codebase")
 	}
-	_, span := telemetry.StartSpan(context.Background(), "harness."+args[0],
+	var spanOpts = []telemetry.SpanOption{
 		telemetry.WithKind("INTERNAL"),
 		telemetry.WithTag("cli.command", args[0]),
-	)
+	}
+	if tp := os.Getenv("TRACEPARENT"); tp != "" {
+		parts := strings.Split(tp, "-")
+		if len(parts) >= 3 && len(parts[1]) == 32 && len(parts[2]) == 16 {
+			spanOpts = append(spanOpts, telemetry.WithParentTrace(parts[1], parts[2]))
+		}
+	}
+	_, span := telemetry.StartSpan(context.Background(), "harness."+args[0], spanOpts...)
 	defer span.End()
 	switch args[0] {
 	case "version":
