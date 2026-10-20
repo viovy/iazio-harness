@@ -42,7 +42,7 @@ func TestHarnessZipkinExporterSendSpans(t *testing.T) {
 	defer ts.Close()
 
 	exp := NewZipkinExporter(ts.URL)
-	defer exp.Close()
+	defer func() { _ = exp.Close() }()
 
 	tracer := NewTracer("test-harness", exp)
 	_, span := tracer.StartSpan(context.Background(), "harness.execute", WithTag("repo", "iazio"))
