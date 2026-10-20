@@ -656,13 +656,15 @@ func ResolveFleetRoot() string {
 			}
 		}
 		// Probe standard host fleet locations
-		for _, cand := range []string{
-			filepath.Join(home, "work", "meta-repo"),
-			filepath.Join(home, "work", "meta-repo-02"),
-			filepath.Join(home, "meta-repo"),
-		} {
-			if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
-				return cand
+		workDir := filepath.Join(home, "work")
+		if entries, err := os.ReadDir(workDir); err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					cand := filepath.Join(workDir, e.Name())
+					if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+						return cand
+					}
+				}
 			}
 		}
 	}
