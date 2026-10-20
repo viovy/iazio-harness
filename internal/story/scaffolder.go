@@ -104,10 +104,23 @@ func (s *Scaffolder) ResolveSubmodulePath(submodule string) (string, error) {
 
 	fleetRoot := s.fleetRoot
 	if fleetRoot == "" {
-		fleetRoot = "."
+		fleetRoot = ResolveFleetRoot()
 	}
 
 	if submodule == "." {
+		if _, err := os.Stat(filepath.Join(fleetRoot, ".gitmodules")); err != nil {
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				for _, cand := range []string{
+					filepath.Join(home, "work", "meta-repo"),
+					filepath.Join(home, "work", "meta-repo-02"),
+					filepath.Join(home, "meta-repo"),
+				} {
+					if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+						return filepath.Abs(cand)
+					}
+				}
+			}
+		}
 		return filepath.Abs(fleetRoot)
 	}
 
@@ -119,11 +132,32 @@ func (s *Scaffolder) ResolveSubmodulePath(submodule string) (string, error) {
 
 	// Validate target directory exists
 	info, err := os.Stat(absTarget)
-	if err != nil {
-		return "", fmt.Errorf("submodule directory does not exist: %s (%w)", absTarget, err)
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("submodule path is not a directory: %s", absTarget)
+	if err != nil || !info.IsDir() {
+		// Fallback probe: check if candidate fleet roots contain this registered submodule
+		found := false
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			for _, cand := range []string{
+				filepath.Join(home, "work", "meta-repo"),
+				filepath.Join(home, "work", "meta-repo-02"),
+				filepath.Join(home, "meta-repo"),
+			} {
+				candDir := filepath.Join(cand, submodule)
+				if ci, err := os.Stat(candDir); err == nil && ci.IsDir() {
+					if registered, _ := isSubmoduleInGitmodules(filepath.Join(cand, ".gitmodules"), submodule); registered {
+						absTarget, _ = filepath.Abs(candDir)
+						fleetRoot = cand
+						found = true
+						break
+					}
+				}
+			}
+		}
+		if !found {
+			if err != nil {
+				return "", fmt.Errorf("submodule directory does not exist: %s (%w)", absTarget, err)
+			}
+			return "", fmt.Errorf("submodule path is not a directory: %s", absTarget)
+		}
 	}
 
 	// Validate in .gitmodules if present
@@ -149,7 +183,7 @@ func ResolveFleetRoot() string {
 
 	dir, err := os.Getwd()
 	if err != nil {
-		return "."
+		dir = "."
 	}
 
 	curr := dir
@@ -163,6 +197,29 @@ func ResolveFleetRoot() string {
 		}
 		curr = parent
 	}
+
+	// Probe ~/.iazio/fleet_root if configured on host
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if b, err := os.ReadFile(filepath.Join(home, ".iazio", "fleet_root")); err == nil {
+			p := strings.TrimSpace(string(b))
+			if p != "" {
+				if _, err := os.Stat(filepath.Join(p, ".gitmodules")); err == nil {
+					return p
+				}
+			}
+		}
+		// Probe standard host fleet locations
+		for _, cand := range []string{
+			filepath.Join(home, "work", "meta-repo"),
+			filepath.Join(home, "work", "meta-repo-02"),
+			filepath.Join(home, "meta-repo"),
+		} {
+			if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+				return cand
+			}
+		}
+	}
+
 	return dir
 }
 

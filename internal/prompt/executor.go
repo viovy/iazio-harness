@@ -19,6 +19,7 @@ import (
 // PromptPayload represents the structured JSON input received from iazio-agent.
 type PromptPayload struct {
 	PromptID       string `json:"prompt_id"`
+	StoryID        string `json:"story_id,omitempty"`
 	Repo           string `json:"repo"`
 	Title          string `json:"title,omitempty"`
 	Prompt         string `json:"prompt"`
@@ -55,6 +56,10 @@ func (e *Executor) SetLockDir(dir string) {
 // Execute validates payload, resolves target submodule directory, acquires exclusive lock,
 // and invokes autopilot.PromptRunner.
 func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopilot.PromptResult, error) {
+	if strings.TrimSpace(payload.PromptID) == "" && strings.TrimSpace(payload.StoryID) != "" {
+		payload.PromptID = "prompt-" + strings.TrimSpace(payload.StoryID)
+	}
+
 	if err := validatePayload(payload); err != nil {
 		return nil, fmt.Errorf("invalid prompt payload: %w", err)
 	}
@@ -112,10 +117,23 @@ func (e *Executor) ResolveSubmodulePath(repo string) (string, error) {
 
 	fleetRoot := e.fleetRoot
 	if fleetRoot == "" {
-		fleetRoot = "."
+		fleetRoot = ResolveFleetRoot()
 	}
 
 	if isSuperprojectRoot(cleanRepo) {
+		if _, err := os.Stat(filepath.Join(fleetRoot, ".gitmodules")); err != nil {
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				for _, cand := range []string{
+					filepath.Join(home, "work", "meta-repo"),
+					filepath.Join(home, "work", "meta-repo-02"),
+					filepath.Join(home, "meta-repo"),
+				} {
+					if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+						return filepath.Abs(cand)
+					}
+				}
+			}
+		}
 		return filepath.Abs(fleetRoot)
 	}
 
@@ -127,11 +145,32 @@ func (e *Executor) ResolveSubmodulePath(repo string) (string, error) {
 
 	// Validate target directory exists
 	info, err := os.Stat(absTarget)
-	if err != nil {
-		return "", fmt.Errorf("submodule directory does not exist: %s (%w)", absTarget, err)
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("submodule path is not a directory: %s", absTarget)
+	if err != nil || !info.IsDir() {
+		// Fallback probe: check if candidate fleet roots contain this registered submodule
+		found := false
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			for _, cand := range []string{
+				filepath.Join(home, "work", "meta-repo"),
+				filepath.Join(home, "work", "meta-repo-02"),
+				filepath.Join(home, "meta-repo"),
+			} {
+				candDir := filepath.Join(cand, cleanRepo)
+				if ci, err := os.Stat(candDir); err == nil && ci.IsDir() {
+					if registered, _ := isSubmoduleRegistered(filepath.Join(cand, ".gitmodules"), cleanRepo); registered {
+						absTarget, _ = filepath.Abs(candDir)
+						fleetRoot = cand
+						found = true
+						break
+					}
+				}
+			}
+		}
+		if !found {
+			if err != nil {
+				return "", fmt.Errorf("submodule directory does not exist: %s (%w)", absTarget, err)
+			}
+			return "", fmt.Errorf("submodule path is not a directory: %s", absTarget)
+		}
 	}
 
 	// Validate against .gitmodules if present
@@ -198,7 +237,7 @@ func ResolveFleetRoot() string {
 
 	dir, err := os.Getwd()
 	if err != nil {
-		return "."
+		dir = "."
 	}
 
 	curr := dir
@@ -212,14 +251,41 @@ func ResolveFleetRoot() string {
 		}
 		curr = parent
 	}
+
+	// Probe ~/.iazio/fleet_root if configured on host
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if b, err := os.ReadFile(filepath.Join(home, ".iazio", "fleet_root")); err == nil {
+			p := strings.TrimSpace(string(b))
+			if p != "" {
+				if _, err := os.Stat(filepath.Join(p, ".gitmodules")); err == nil {
+					return p
+				}
+			}
+		}
+		// Probe standard host fleet locations
+		for _, cand := range []string{
+			filepath.Join(home, "work", "meta-repo"),
+			filepath.Join(home, "work", "meta-repo-02"),
+			filepath.Join(home, "meta-repo"),
+		} {
+			if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+				return cand
+			}
+		}
+	}
+
 	return dir
 }
 
 func validatePayload(p PromptPayload) error {
-	if strings.TrimSpace(p.PromptID) == "" {
+	promptID := strings.TrimSpace(p.PromptID)
+	if promptID == "" && strings.TrimSpace(p.StoryID) != "" {
+		promptID = strings.TrimSpace(p.StoryID)
+	}
+	if promptID == "" {
 		return errors.New("prompt_id is required")
 	}
-	if strings.ContainsAny(p.PromptID, `/\`) || strings.Contains(p.PromptID, "..") {
+	if strings.ContainsAny(promptID, `/\`) || strings.Contains(promptID, "..") {
 		return errors.New("invalid prompt_id: path traversal characters not permitted")
 	}
 	if strings.TrimSpace(p.Repo) == "" {
