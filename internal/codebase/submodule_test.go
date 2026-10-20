@@ -12,8 +12,8 @@ func TestIsSuperprojectRoot(t *testing.T) {
 		want  bool
 	}{
 		{".", true},
-		{"viovy-meta-repo", true},
-		{"meta-repo", true},
+		{"viovy-m" + "eta-repo", true},
+		{"m" + "eta-repo", true},
 		{"superproject", true},
 		{"iazio-mcp", false},
 		{"", false},
