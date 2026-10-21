@@ -313,6 +313,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	execReq := engines.ExecutionRequest{
 		Engine:                     engineName,
 		Kind:                       job.Kind,
+		StoryID:                    sessionstore.ExtractStoryID(storyID),
 		Prompt:                     prepRes.Prompt,
 		WorktreePath:               worktree,
 		DocsHubPath:                docsHub,
