@@ -67,10 +67,25 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 		res.DiagnosticSummary += fmt.Sprintf("git status failed: %v\n", err)
 	}
 
+	// 1b. Check if branch is ahead of origin/main when upstream is unconfigured
+	if res.Ahead == 0 && res.Branch != "" && res.Branch != "main" && res.Branch != "master" {
+		revCmd := exec.CommandContext(ctx, "git", "-C", cleanPath, "rev-list", "--count", "origin/main..HEAD")
+		if revOut, err := revCmd.Output(); err == nil {
+			if count, err := strconv.Atoi(strings.TrimSpace(string(revOut))); err == nil && count > 0 {
+				res.Ahead = count
+			}
+		}
+	}
+
 	// 2. Git Submodules
 	subCmd := exec.CommandContext(ctx, "git", "-C", cleanPath, "submodule", "status", "--recursive")
 	if subOut, err := subCmd.CombinedOutput(); err == nil {
-		parseSubmoduleStatus(string(subOut), res)
+		parseSubmoduleStatus(ctx, cleanPath, string(subOut), res)
+	}
+
+	// Evaluate overall cleanliness: working tree, submodules, and unpushed branch commits
+	if len(res.ModifiedFiles) > 0 || len(res.UntrackedFiles) > 0 || !res.SubmodulesClean || len(res.DirtySubmodules) > 0 || res.Ahead > 0 {
+		res.IsClean = false
 	}
 
 	// 3. ASE State & Autopilot locks
@@ -125,19 +140,36 @@ func parseGitPorcelainV2(out string, res *RepoFleetStatusResult) {
 	}
 }
 
-func parseSubmoduleStatus(out string, res *RepoFleetStatusResult) {
+func parseSubmoduleStatus(ctx context.Context, cleanPath string, out string, res *RepoFleetStatusResult) {
 	lines := strings.Split(out, "\n")
+	seen := make(map[string]bool)
 	for _, l := range lines {
 		l = strings.TrimSpace(l)
 		if l == "" {
 			continue
 		}
-		// Prefix '+' indicates commit does not match index; '-' not initialized; 'U' merge conflict
-		if strings.HasPrefix(l, "+") || strings.HasPrefix(l, "-") || strings.HasPrefix(l, "U") {
-			res.SubmodulesClean = false
-			parts := strings.Fields(l)
-			if len(parts) >= 2 {
-				res.DirtySubmodules = append(res.DirtySubmodules, parts[1])
+		parts := strings.Fields(l)
+		if len(parts) >= 2 {
+			subPath := parts[1]
+			// Prefix '+' indicates commit does not match index; '-' not initialized; 'U' merge conflict
+			if strings.HasPrefix(l, "+") || strings.HasPrefix(l, "-") || strings.HasPrefix(l, "U") {
+				res.SubmodulesClean = false
+				if !seen[subPath] {
+					res.DirtySubmodules = append(res.DirtySubmodules, subPath)
+					seen[subPath] = true
+				}
+			}
+			// Deep check: inspect the submodule worktree itself for uncommitted files
+			fullSubPath := filepath.Join(cleanPath, subPath)
+			if stat, err := os.Stat(fullSubPath); err == nil && stat.IsDir() {
+				subStatusCmd := exec.CommandContext(ctx, "git", "-C", fullSubPath, "status", "--porcelain")
+				if subOut, err := subStatusCmd.Output(); err == nil && len(strings.TrimSpace(string(subOut))) > 0 {
+					res.SubmodulesClean = false
+					if !seen[subPath] {
+						res.DirtySubmodules = append(res.DirtySubmodules, subPath+" (uncommitted changes)")
+						seen[subPath] = true
+					}
+				}
 			}
 		}
 	}
