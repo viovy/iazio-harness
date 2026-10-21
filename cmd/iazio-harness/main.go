@@ -79,6 +79,8 @@ func run(args []string) error {
 		return runCodebaseCommand(args[1:])
 	case "status", "fleet-status", "inspect":
 		return runFleetStatusCommand(args[1:])
+	case "heal-ase":
+		return runHealASECommand(args[1:])
 	default:
 		return fmt.Errorf("unknown command")
 	}
@@ -613,5 +615,31 @@ func runFleetStatusCommand(args []string) error {
 		return enc.Encode(res)
 	}
 	fmt.Print(res.DiagnosticSummary)
+	return nil
+}
+
+func runHealASECommand(args []string) error {
+	repoPath := "."
+	for i := 0; i < len(args); i++ {
+		switch {
+		case (args[i] == "--repo" || args[i] == "--worktree-path") && i+1 < len(args):
+			i++
+			repoPath = args[i]
+		case strings.HasPrefix(args[i], "--repo="):
+			repoPath = strings.TrimPrefix(args[i], "--repo=")
+		case strings.HasPrefix(args[i], "--worktree-path="):
+			repoPath = strings.TrimPrefix(args[i], "--worktree-path=")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := diagnostics.ReapOrphanedProcesses(ctx, repoPath); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: reap orphaned processes: %v\n", err)
+	}
+	if err := diagnostics.ResetASELocks(repoPath); err != nil {
+		return fmt.Errorf("reset ase locks: %w", err)
+	}
+	fmt.Printf("Successfully healed ASE state and reaped orphaned processes for %s\n", repoPath)
 	return nil
 }

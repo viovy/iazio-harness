@@ -4,8 +4,11 @@ package story
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -167,4 +170,165 @@ func EnsureStoriesIndexBootstrap(storiesDir string) error {
 		return fmt.Errorf("rename temp index to %s: %w", indexPath, err)
 	}
 	return nil
+}
+
+// MaterializeStoryFile writes a story markdown file to docs/stories/<file> and ensures docs/stories/ exists.
+func MaterializeStoryFile(repoRoot, storyID, filename, content string) error {
+	if strings.TrimSpace(storyID) == "" {
+		return errors.New("storyID cannot be empty")
+	}
+	storiesDir := filepath.Join(repoRoot, "docs", "stories")
+	if err := EnsureStoriesIndexBootstrap(storiesDir); err != nil {
+		return err
+	}
+	targetFile := filename
+	if targetFile == "" {
+		targetFile = storyID + ".md"
+	}
+	filePath := filepath.Join(storiesDir, targetFile)
+	if strings.TrimSpace(content) != "" {
+		tmpPath := filePath + fmt.Sprintf(".tmp-%d", time.Now().UnixNano())
+		if err := os.WriteFile(tmpPath, []byte(content), 0o644); err != nil {
+			return fmt.Errorf("write story temp file %s: %w", tmpPath, err)
+		}
+		if err := os.Rename(tmpPath, filePath); err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("rename story file to %s: %w", filePath, err)
+		}
+	}
+	return nil
+}
+
+const storyFileExt = ".story.md"
+
+type remoteStoryDetail struct {
+	ID      string `json:"id"`
+	Title   string `json:"title"`
+	Status  string `json:"status"`
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+func storyExistsOnDisk(repoRoot, storyID string) bool {
+	storiesDir := filepath.Join(repoRoot, "docs", "stories")
+	candidates := []string{
+		filepath.Join(storiesDir, storyID+storyFileExt),
+		filepath.Join(storiesDir, storyID+".md"),
+		filepath.Join(storiesDir, strings.ToLower(storyID)+storyFileExt),
+		filepath.Join(storiesDir, strings.ToLower(storyID)+".md"),
+	}
+	fleetRoot := ResolveFleetRoot()
+	if fleetRoot != "" && fleetRoot != repoRoot {
+		fleetStories := filepath.Join(fleetRoot, "docs", "stories")
+		candidates = append(candidates,
+			filepath.Join(fleetStories, storyID+storyFileExt),
+			filepath.Join(fleetStories, storyID+".md"),
+			filepath.Join(fleetStories, strings.ToLower(storyID)+storyFileExt),
+			filepath.Join(fleetStories, strings.ToLower(storyID)+".md"),
+		)
+	}
+	for _, c := range candidates {
+		if fi, err := os.Stat(c); err == nil && !fi.IsDir() && fi.Size() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func getHarnessAPIURL() string {
+	apiURL := os.Getenv("IAZIO_HARNESS_API_URL")
+	if apiURL == "" {
+		apiURL = os.Getenv("IAZIO_API_URL")
+	}
+	if apiURL == "" {
+		apiURL = "http://127.0.0.1:8080"
+	}
+	return strings.TrimRight(apiURL, "/")
+}
+
+func fetchStoryDetail(ctx context.Context, storyID string) (remoteStoryDetail, error) {
+	reqURL := fmt.Sprintf("%s/api/v1/stories/%s", getHarnessAPIURL(), url.PathEscape(storyID))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return remoteStoryDetail{}, err
+	}
+	token := os.Getenv("IAZIO_HARNESS_TOKEN")
+	if token == "" {
+		token = os.Getenv("IAZIO_TOKEN")
+	}
+	if token != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return remoteStoryDetail{}, fmt.Errorf("fetch story %s from %s: %w", storyID, reqURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return remoteStoryDetail{}, fmt.Errorf("fetch story %s: status %d", storyID, resp.StatusCode)
+	}
+
+	var detail remoteStoryDetail
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		return remoteStoryDetail{}, fmt.Errorf("decode story detail: %w", err)
+	}
+	if detail.Content == "" {
+		detail.Content = fmt.Sprintf("# %s: %s\n\nStatus: %s\n", detail.ID, detail.Title, detail.Status)
+	}
+	return detail, nil
+}
+
+// MaterializePendingStories verifies whether the story markdown file exists on disk.
+// If missing, it fetches the story detail from the control plane API (lazy materialization)
+// and writes docs/stories/<file> and ensures docs/stories/index.yml contains the entry.
+func MaterializePendingStories(ctx context.Context, repoRoot, storyID string) error {
+	storyID = strings.TrimSpace(storyID)
+	if storyID == "" {
+		return nil
+	}
+	if repoRoot == "" {
+		repoRoot = ResolveFleetRoot()
+	}
+
+	if storyExistsOnDisk(repoRoot, storyID) {
+		return nil
+	}
+
+	detail, err := fetchStoryDetail(ctx, storyID)
+	if err != nil {
+		return err
+	}
+
+	targetName := filepath.Base(detail.Path)
+	if targetName == "." || targetName == "" {
+		targetName = fmt.Sprintf("%s%s", strings.ToLower(storyID), storyFileExt)
+	}
+
+	if err := MaterializeStoryFile(repoRoot, storyID, targetName, detail.Content); err != nil {
+		return err
+	}
+
+	storiesDir := filepath.Join(repoRoot, "docs", "stories")
+	ensureStoryInIndex(storiesDir, storyID, detail.Title, filepath.Join("docs", "stories", targetName))
+	return nil
+}
+
+func ensureStoryInIndex(storiesDir, storyID, title, relativePath string) {
+	indexPath := filepath.Join(storiesDir, "index.yml")
+	content, err := os.ReadFile(indexPath)
+	if err != nil {
+		return
+	}
+	if strings.Contains(string(content), storyID) {
+		return
+	}
+	entry := fmt.Sprintf("\n  - id: %s\n    title: %q\n    status: pending\n    file: %s\n", storyID, title, relativePath)
+	_ = os.WriteFile(indexPath, append(content, []byte(entry)...), 0o644)
+}
+
+func init() {
+	engines.PreFlightHook = MaterializePendingStories
 }

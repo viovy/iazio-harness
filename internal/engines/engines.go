@@ -38,6 +38,9 @@ type EventStream interface {
 	AppendRaw(stream string, p []byte) error
 }
 
+// PreFlightHook is executed prior to child execution if set.
+var PreFlightHook func(ctx context.Context, workDir, storyID string) error
+
 // ExecutionRequest is one IDE CLI invocation.
 type ExecutionRequest struct {
 	Engine                     string
@@ -220,11 +223,27 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		workDir = sb.SandboxPath
 	}
 	cmd.Dir = workDir
+	if PreFlightHook != nil && req.StoryID != "" && workDir != "" {
+		if pfErr := PreFlightHook(ctx, workDir, req.StoryID); pfErr != nil {
+			if stream != nil {
+				_ = stream.AppendRaw("stderr", []byte(fmt.Sprintf("[iazio-harness] Warning: pre-flight story materialization failed: %v\n", pfErr)))
+			}
+		}
+	}
 	base := req.BaseEnv
 	if req.BaseEnv == nil {
 		base = os.Environ()
 	}
 	cmd.Env = ChildEnv(base, req.ScheduleEnv, req.DocsHubPath)
+	cmd.Env = append(cmd.Env,
+		EnvManagedBy+"=harness",
+	)
+	if req.JobID != "" {
+		cmd.Env = append(cmd.Env, EnvJobID+"="+req.JobID)
+	}
+	if req.StoryID != "" {
+		cmd.Env = append(cmd.Env, EnvStoryID+"="+req.StoryID)
+	}
 	setProcGroup(cmd)
 	stdin, err := os.Open(os.DevNull)
 	if err != nil {
@@ -332,6 +351,8 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	wg.Wait()
 	waitErr := cmd.Wait()
 	close(done)
+	// Ensure no background child or grandchild MCP servers outlive the parent process group
+	killProcessGroup(cmd)
 	if req.LogFile != "" && req.OnConversationID != nil {
 		scanLogFile()
 	}
@@ -365,7 +386,7 @@ func watchCancel(ctx context.Context, cmd *exec.Cmd, done <-chan struct{}) {
 		stopProcessGroup(cmd)
 		select {
 		case <-done:
-		case <-time.After(2 * time.Second):
+		case <-time.After(5 * time.Second):
 			killProcessGroup(cmd)
 		}
 	case <-done:

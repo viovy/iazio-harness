@@ -14,6 +14,9 @@ const (
 	EnvSSHBatchMode      = "SSH_BATCHMODE"
 	EnvSSHAskPass        = "SSH_ASKPASS"
 	EnvDocsHubPath       = "IAZIO_DOCS_HUB_PATH"
+	EnvManagedBy         = "IAZIO_MANAGED_BY"
+	EnvJobID             = "IAZIO_JOB_ID"
+	EnvStoryID           = "IAZIO_STORY_ID"
 )
 
 // ChildEnv merges the base environment, then schedule values, then forced keys.
