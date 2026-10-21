@@ -67,13 +67,6 @@ func (s *Scaffolder) ScaffoldStory(ctx context.Context, payload StoryPayload) (*
 		return nil, fmt.Errorf("resolve submodule path: %w", err)
 	}
 
-	// Acquire exclusive flock for the checkout so parallel runs never race on autopilot next-id or index.yml
-	lock, err := engines.Hold(targetDir, s.lockDir)
-	if err != nil {
-		return nil, fmt.Errorf("WORKSPACE_LOCKED: failed to acquire exclusive checkout lock for %s: %w", targetDir, err)
-	}
-	defer func() { _ = lock.Release() }()
-
 	workingDir := targetDir
 	storiesDir := filepath.Join(targetDir, "docs", "stories")
 
@@ -88,6 +81,14 @@ func (s *Scaffolder) ScaffoldStory(ctx context.Context, payload StoryPayload) (*
 			}
 		}
 	}
+
+	// Acquire exclusive flock with context-aware try-lock (2s timeout) on the active workingDir
+	// so parallel operations targeting the central or submodule index serialize cleanly.
+	lock, err := engines.HoldWithTimeout(ctx, workingDir, s.lockDir, 2*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("WORKSPACE_LOCKED: failed to acquire exclusive checkout lock for %s: %w", workingDir, err)
+	}
+	defer func() { _ = lock.Release() }()
 
 	// Ensure docs/stories and index.yml bootstrap
 	if err := EnsureStoriesIndexBootstrap(storiesDir); err != nil {
