@@ -19,7 +19,10 @@ import (
 )
 
 // KindStoryRefinement selects the docs hub as the child working directory and lock target.
-const KindStoryRefinement = "story_refinement"
+const (
+	KindStoryRefinement = "story_refinement"
+	flagStory           = "--story"
+)
 
 // ToolRunner is the seam that starts one IDE CLI and streams its output.
 type ToolRunner interface {
@@ -596,20 +599,20 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		if req.Kind == "story_begin" {
 			argv := []string{"autopilot", "story", "begin"}
 			if req.StoryID != "" {
-				argv = append(argv, "--story", req.StoryID)
+				argv = append(argv, flagStory, req.StoryID)
 			}
 			return argv, nil
 		}
 		if req.Kind == "story_execution" || req.Kind == "story_run" || (req.Kind == "" && req.StoryID != "") {
 			argv := []string{"autopilot", "story", "run"}
 			if req.StoryID != "" {
-				argv = append(argv, "--story", req.StoryID)
+				argv = append(argv, flagStory, req.StoryID)
 			}
 			return argv, nil
 		}
 		argv := []string{"autopilot", "prompt", "run"}
 		if req.StoryID != "" {
-			argv = append(argv, "--story", req.StoryID)
+			argv = append(argv, flagStory, req.StoryID)
 		}
 		if req.Prompt != "" {
 			argv = append(argv, req.Prompt)

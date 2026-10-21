@@ -22,6 +22,7 @@ const (
 	MaxFileSizeBytes = 512 * 1024
 	// BinaryProbeBytes is the number of bytes inspected for null bytes to detect binary content.
 	BinaryProbeBytes = 8000
+	gitmodulesFile   = ".gitmodules"
 )
 
 // RepoInfo describes a fleet submodule or superproject repository.
@@ -102,7 +103,7 @@ func DiscoverRepos(ctx context.Context, fleetRoot string) (*ReposResult, error) 
 	})
 
 	// 2. Submodules from .gitmodules
-	gitmodulesPath := filepath.Join(absFleetRoot, ".gitmodules")
+	gitmodulesPath := filepath.Join(absFleetRoot, gitmodulesFile)
 	if _, err := os.Stat(gitmodulesPath); err == nil {
 		entries, err := parseGitmodules(gitmodulesPath)
 		if err != nil {
@@ -559,7 +560,7 @@ func resolveRepoDirectory(fleetRoot, repo string) (string, error) {
 	}
 
 	// Try lookup in .gitmodules
-	gitmodulesPath := filepath.Join(fleetRoot, ".gitmodules")
+	gitmodulesPath := filepath.Join(fleetRoot, gitmodulesFile)
 	if entries, err := parseGitmodules(gitmodulesPath); err == nil {
 		for _, e := range entries {
 			if e.Name == repo || e.Path == repo {
@@ -622,20 +623,28 @@ func runGitCmdRaw(ctx context.Context, dir string, args ...string) ([]byte, erro
 	return stdout.Bytes(), nil
 }
 
+// findGitmodulesRoot walks upward from startDir seeking the first directory containing .gitmodules.
+func findGitmodulesRoot(startDir string) string {
+	curr := startDir
+	for {
+		if _, err := os.Stat(filepath.Join(curr, gitmodulesFile)); err == nil {
+			return curr
+		}
+		parent := filepath.Dir(curr)
+		if parent == curr {
+			break
+		}
+		curr = parent
+	}
+	return ""
+}
+
 // ResolveFleetRoot locates the fleet superproject root from env, cwd, or parent dirs.
 func ResolveFleetRoot() string {
 	if env := os.Getenv("IAZIO_FLEET_ROOT"); env != "" {
 		if fi, err := os.Stat(env); err == nil && fi.IsDir() {
-			curr := env
-			for {
-				if _, err := os.Stat(filepath.Join(curr, ".gitmodules")); err == nil {
-					return curr
-				}
-				parent := filepath.Dir(curr)
-				if parent == curr {
-					break
-				}
-				curr = parent
+			if root := findGitmodulesRoot(env); root != "" {
+				return root
 			}
 		}
 		return env
@@ -645,17 +654,8 @@ func ResolveFleetRoot() string {
 	if err != nil {
 		dir = "."
 	}
-
-	curr := dir
-	for {
-		if _, err := os.Stat(filepath.Join(curr, ".gitmodules")); err == nil {
-			return curr
-		}
-		parent := filepath.Dir(curr)
-		if parent == curr {
-			break
-		}
-		curr = parent
+	if root := findGitmodulesRoot(dir); root != "" {
+		return root
 	}
 
 	// Probe ~/.iazio/fleet_root if configured on host
@@ -663,7 +663,7 @@ func ResolveFleetRoot() string {
 		if b, err := os.ReadFile(filepath.Join(home, ".iazio", "fleet_root")); err == nil {
 			p := strings.TrimSpace(string(b))
 			if p != "" {
-				if _, err := os.Stat(filepath.Join(p, ".gitmodules")); err == nil {
+				if _, err := os.Stat(filepath.Join(p, gitmodulesFile)); err == nil {
 					return p
 				}
 			}
@@ -674,7 +674,7 @@ func ResolveFleetRoot() string {
 			for _, e := range entries {
 				if e.IsDir() {
 					cand := filepath.Join(workDir, e.Name())
-					if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+					if _, err := os.Stat(filepath.Join(cand, gitmodulesFile)); err == nil {
 						return cand
 					}
 				}
