@@ -199,43 +199,43 @@ func MaterializeStoryFile(repoRoot, storyID, filename, content string) error {
 	return nil
 }
 
-// MaterializePendingStories verifies whether the story markdown file exists on disk.
-// If missing, it fetches the story detail from the control plane API (lazy materialization)
-// and writes docs/stories/<file> and ensures docs/stories/index.yml contains the entry.
-func MaterializePendingStories(ctx context.Context, repoRoot, storyID string) error {
-	storyID = strings.TrimSpace(storyID)
-	if storyID == "" {
-		return nil
-	}
-	if repoRoot == "" {
-		repoRoot = ResolveFleetRoot()
-	}
+const storyFileExt = ".story.md"
 
+type remoteStoryDetail struct {
+	ID      string `json:"id"`
+	Title   string `json:"title"`
+	Status  string `json:"status"`
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+func storyExistsOnDisk(repoRoot, storyID string) bool {
 	storiesDir := filepath.Join(repoRoot, "docs", "stories")
 	candidates := []string{
-		filepath.Join(storiesDir, storyID+".story.md"),
+		filepath.Join(storiesDir, storyID+storyFileExt),
 		filepath.Join(storiesDir, storyID+".md"),
-		filepath.Join(storiesDir, strings.ToLower(storyID)+".story.md"),
+		filepath.Join(storiesDir, strings.ToLower(storyID)+storyFileExt),
 		filepath.Join(storiesDir, strings.ToLower(storyID)+".md"),
 	}
 	fleetRoot := ResolveFleetRoot()
 	if fleetRoot != "" && fleetRoot != repoRoot {
 		fleetStories := filepath.Join(fleetRoot, "docs", "stories")
 		candidates = append(candidates,
-			filepath.Join(fleetStories, storyID+".story.md"),
+			filepath.Join(fleetStories, storyID+storyFileExt),
 			filepath.Join(fleetStories, storyID+".md"),
-			filepath.Join(fleetStories, strings.ToLower(storyID)+".story.md"),
+			filepath.Join(fleetStories, strings.ToLower(storyID)+storyFileExt),
 			filepath.Join(fleetStories, strings.ToLower(storyID)+".md"),
 		)
 	}
-
 	for _, c := range candidates {
 		if fi, err := os.Stat(c); err == nil && !fi.IsDir() && fi.Size() > 0 {
-			// Story file already materialized
-			return nil
+			return true
 		}
 	}
+	return false
+}
 
+func getHarnessAPIURL() string {
 	apiURL := os.Getenv("IAZIO_HARNESS_API_URL")
 	if apiURL == "" {
 		apiURL = os.Getenv("IAZIO_API_URL")
@@ -243,12 +243,14 @@ func MaterializePendingStories(ctx context.Context, repoRoot, storyID string) er
 	if apiURL == "" {
 		apiURL = "http://127.0.0.1:8080"
 	}
-	apiURL = strings.TrimRight(apiURL, "/")
+	return strings.TrimRight(apiURL, "/")
+}
 
-	reqURL := fmt.Sprintf("%s/api/v1/stories/%s", apiURL, url.PathEscape(storyID))
+func fetchStoryDetail(ctx context.Context, storyID string) (remoteStoryDetail, error) {
+	reqURL := fmt.Sprintf("%s/api/v1/stories/%s", getHarnessAPIURL(), url.PathEscape(storyID))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return err
+		return remoteStoryDetail{}, err
 	}
 	token := os.Getenv("IAZIO_HARNESS_TOKEN")
 	if token == "" {
@@ -261,38 +263,55 @@ func MaterializePendingStories(ctx context.Context, repoRoot, storyID string) er
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("fetch story %s from %s: %w", storyID, reqURL, err)
+		return remoteStoryDetail{}, fmt.Errorf("fetch story %s from %s: %w", storyID, reqURL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("fetch story %s: status %d", storyID, resp.StatusCode)
+		return remoteStoryDetail{}, fmt.Errorf("fetch story %s: status %d", storyID, resp.StatusCode)
 	}
 
-	var detail struct {
-		ID      string `json:"id"`
-		Title   string `json:"title"`
-		Status  string `json:"status"`
-		Path    string `json:"path"`
-		Content string `json:"content"`
-	}
+	var detail remoteStoryDetail
 	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
-		return fmt.Errorf("decode story detail: %w", err)
+		return remoteStoryDetail{}, fmt.Errorf("decode story detail: %w", err)
 	}
-
 	if detail.Content == "" {
 		detail.Content = fmt.Sprintf("# %s: %s\n\nStatus: %s\n", detail.ID, detail.Title, detail.Status)
+	}
+	return detail, nil
+}
+
+// MaterializePendingStories verifies whether the story markdown file exists on disk.
+// If missing, it fetches the story detail from the control plane API (lazy materialization)
+// and writes docs/stories/<file> and ensures docs/stories/index.yml contains the entry.
+func MaterializePendingStories(ctx context.Context, repoRoot, storyID string) error {
+	storyID = strings.TrimSpace(storyID)
+	if storyID == "" {
+		return nil
+	}
+	if repoRoot == "" {
+		repoRoot = ResolveFleetRoot()
+	}
+
+	if storyExistsOnDisk(repoRoot, storyID) {
+		return nil
+	}
+
+	detail, err := fetchStoryDetail(ctx, storyID)
+	if err != nil {
+		return err
 	}
 
 	targetName := filepath.Base(detail.Path)
 	if targetName == "." || targetName == "" {
-		targetName = fmt.Sprintf("%s.story.md", strings.ToLower(storyID))
+		targetName = fmt.Sprintf("%s%s", strings.ToLower(storyID), storyFileExt)
 	}
 
 	if err := MaterializeStoryFile(repoRoot, storyID, targetName, detail.Content); err != nil {
 		return err
 	}
 
+	storiesDir := filepath.Join(repoRoot, "docs", "stories")
 	ensureStoryInIndex(storiesDir, storyID, detail.Title, filepath.Join("docs", "stories", targetName))
 	return nil
 }
