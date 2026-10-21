@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -76,6 +77,8 @@ func run(args []string) error {
 		return runPromptCommand(args[1:])
 	case "codebase":
 		return runCodebaseCommand(args[1:])
+	case "status", "fleet-status", "inspect":
+		return runFleetStatusCommand(args[1:])
 	default:
 		return fmt.Errorf("unknown command")
 	}
@@ -581,4 +584,33 @@ func resolveExecutionOptions(job controlplane.JobDetail, promptBody string) (mod
 		}
 	}
 	return
+}
+
+func runFleetStatusCommand(args []string) error {
+	repoPath := "."
+	var jsonOutput bool
+	for i := 0; i < len(args); i++ {
+		switch {
+		case (args[i] == "--repo" || args[i] == "--worktree-path") && i+1 < len(args):
+			i++
+			repoPath = args[i]
+		case strings.HasPrefix(args[i], "--repo="):
+			repoPath = strings.TrimPrefix(args[i], "--repo=")
+		case strings.HasPrefix(args[i], "--worktree-path="):
+			repoPath = strings.TrimPrefix(args[i], "--worktree-path=")
+		case args[i] == "--json":
+			jsonOutput = true
+		}
+	}
+	res, err := diagnostics.InspectRepoFleetStatus(context.Background(), repoPath)
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(res)
+	}
+	fmt.Print(res.DiagnosticSummary)
+	return nil
 }
