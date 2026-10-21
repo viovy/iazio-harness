@@ -168,7 +168,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	defer lock.Release()
 
 	storyID := job.StoryID
-	if strings.TrimSpace(storyID) == "" {
+	if strings.TrimSpace(storyID) == "" || strings.EqualFold(storyID, "STORY-RESUME-INPLACE") || strings.EqualFold(storyID, "resume complete current ase flow") {
 		dCtx := sessionstore.DefaultResolver().DetectDirtyWorktreeContext(worktree)
 		if dCtx.StoryID != "" {
 			storyID = dCtx.StoryID
@@ -278,7 +278,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	if job.Kind == "resume" {
 		resolver := sessionstore.DefaultResolver()
 		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
-		if job.StoryID == "" && dCtx.StoryID != "" {
+		if (job.StoryID == "" || strings.EqualFold(job.StoryID, "STORY-RESUME-INPLACE") || strings.EqualFold(job.StoryID, "resume complete current ase flow")) && dCtx.StoryID != "" {
 			job.StoryID = dCtx.StoryID
 		}
 		if resumeConvID == "" {
