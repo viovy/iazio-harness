@@ -481,7 +481,7 @@ func TestExecutor_IntelligentWorkingDirResolutionAndTraceID(t *testing.T) {
 	// 1. Submodule lacks docs/stories, targetAgent is autopilot -> WorkingDir should resolve to fleetRoot
 	payload := PromptPayload{
 		PromptID:       "prompt-1",
-		StoryID:        "STORY-IAZIO-0006",
+		StoryID:        "STORY-TEST-0006",
 		Repo:           "iazio-mcp",
 		Title:          "Execute story",
 		Prompt:         "Execute story flow",
