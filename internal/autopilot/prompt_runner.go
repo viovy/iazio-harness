@@ -127,14 +127,6 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 	_ = tmpFile.Close()
 
-	// 2. Prepare autopilot command invocation
-	args := []string{"prompt", "run", "--file", tmpPath}
-	if targetAgent != "" {
-		args = append(args, "--target-agent", targetAgent)
-	}
-	if opts.Title != "" {
-		args = append(args, "--title", opts.Title)
-	}
 	storyID := strings.TrimSpace(opts.StoryID)
 	if storyID == "" {
 		if m := storyIDRegex.FindStringSubmatch(opts.Title); len(m) > 1 {
@@ -146,8 +138,24 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			storyID = m[1]
 		}
 	}
-	if storyID != "" {
-		args = append(args, "--story", storyID)
+
+	// 2. Prepare autopilot command invocation:
+	// If the prompt targets story execution via autopilot, route directly to the standard
+	// built-in `autopilot story run --story <ID>`, eliminating exit 99 across older host runtimes.
+	var args []string
+	if storyID != "" && (targetAgent == "autopilot" || targetAgent == "" || targetAgent == "auto") {
+		args = []string{"story", "run", "--story", storyID}
+	} else {
+		args = []string{"prompt", "run", "--file", tmpPath}
+		if targetAgent != "" {
+			args = append(args, "--target-agent", targetAgent)
+		}
+		if opts.Title != "" {
+			args = append(args, "--title", opts.Title)
+		}
+		if storyID != "" {
+			args = append(args, "--story", storyID)
+		}
 	}
 
 	execCtx, cancel := context.WithTimeout(ctx, timeout)

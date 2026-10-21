@@ -600,6 +600,13 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 			}
 			return argv, nil
 		}
+		if req.Kind == "story_execution" || req.Kind == "story_run" || (req.Kind == "" && req.StoryID != "") {
+			argv := []string{"autopilot", "story", "run"}
+			if req.StoryID != "" {
+				argv = append(argv, "--story", req.StoryID)
+			}
+			return argv, nil
+		}
 		argv := []string{"autopilot", "prompt", "run"}
 		if req.StoryID != "" {
 			argv = append(argv, "--story", req.StoryID)

@@ -625,6 +625,19 @@ func runGitCmdRaw(ctx context.Context, dir string, args ...string) ([]byte, erro
 // ResolveFleetRoot locates the fleet superproject root from env, cwd, or parent dirs.
 func ResolveFleetRoot() string {
 	if env := os.Getenv("IAZIO_FLEET_ROOT"); env != "" {
+		if fi, err := os.Stat(env); err == nil && fi.IsDir() {
+			curr := env
+			for {
+				if _, err := os.Stat(filepath.Join(curr, ".gitmodules")); err == nil {
+					return curr
+				}
+				parent := filepath.Dir(curr)
+				if parent == curr {
+					break
+				}
+				curr = parent
+			}
+		}
 		return env
 	}
 

@@ -34,7 +34,7 @@ func TestAutopilotHelperProcess(t *testing.T) {
 	}
 
 	cmd := args[0]
-	if cmd == "prompt" && len(args) >= 2 && args[1] == "run" {
+	if (cmd == "prompt" || cmd == "story") && len(args) >= 2 && args[1] == "run" {
 		var promptFile string
 		var storyArg string
 		for i := 2; i < len(args); i++ {
