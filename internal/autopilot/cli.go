@@ -120,6 +120,7 @@ func (c *CLIClient) CreateStory(ctx context.Context, opts CreateStoryOptions) (*
 	if mErr == nil {
 		cmdJSON := exec.CommandContext(ctx, c.AutopilotBinary, "story-create", "--json")
 		cmdJSON.Dir = workingDir
+		cmdJSON.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "AUTOPILOT_NON_INTERACTIVE=1")
 		cmdJSON.Stdin = bytes.NewReader(payloadBytes)
 		var outBuf, errBuf bytes.Buffer
 		cmdJSON.Stdout = &outBuf
@@ -157,6 +158,7 @@ func (c *CLIClient) CreateStory(ctx context.Context, opts CreateStoryOptions) (*
 
 	cmd := exec.CommandContext(ctx, c.AutopilotBinary, args...)
 	cmd.Dir = workingDir
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "AUTOPILOT_NON_INTERACTIVE=1")
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -214,6 +216,7 @@ func (c *CLIClient) ValidateIndex(ctx context.Context, workingDir string) error 
 	if workingDir != "" {
 		cmd.Dir = workingDir
 	}
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "AUTOPILOT_NON_INTERACTIVE=1")
 
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf

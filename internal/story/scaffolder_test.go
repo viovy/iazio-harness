@@ -185,7 +185,7 @@ func TestScaffolder_ConcurrentAccessSerializes(t *testing.T) {
 	scaffolder := NewScaffolder(fleetRoot, mockAP)
 	scaffolder.SetLockDir(lockDir)
 
-	// Since Hold is non-blocking, two simultaneous calls will have one succeed and one fail with lock held
+	// With HoldWithTimeout (2s retry window), two concurrent calls taking 20ms each will serialize and both succeed
 	var wg sync.WaitGroup
 	results := make([]error, 2)
 	for i := 0; i < 2; i++ {
@@ -202,18 +202,72 @@ func TestScaffolder_ConcurrentAccessSerializes(t *testing.T) {
 	}
 	wg.Wait()
 
-	successCount := 0
-	lockErrCount := 0
-	for _, r := range results {
-		if r == nil {
-			successCount++
-		} else if strings.Contains(r.Error(), "exclusive checkout lock") {
-			lockErrCount++
+	for i, r := range results {
+		if r != nil {
+			t.Errorf("expected call %d to succeed sequentially, got: %v", i, r)
 		}
 	}
+	if len(callOrder) != 2 {
+		t.Errorf("expected 2 calls, got %d", len(callOrder))
+	}
 
-	if successCount != 1 || lockErrCount != 1 {
-		t.Errorf("expected 1 success and 1 lock contention error, got %d successes and %d lock errors (%v)", successCount, lockErrCount, results)
+	// Now test that a context that cancels before the lock is released returns WORKSPACE_LOCKED
+	targetDir, _ := scaffolder.ResolveSubmodulePath("iazio-mcp")
+	lk, err := engines.Hold(targetDir, lockDir)
+	if err != nil {
+		t.Fatalf("failed to hold test lock: %v", err)
+	}
+	defer func() { _ = lk.Release() }()
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, errTimeout := scaffolder.ScaffoldStory(shortCtx, StoryPayload{
+		Submodule: "iazio-mcp",
+		Title:     "Blocked",
+	})
+	if errTimeout == nil || !strings.Contains(errTimeout.Error(), "WORKSPACE_LOCKED") {
+		t.Errorf("expected WORKSPACE_LOCKED on timeout, got %v", errTimeout)
+	}
+}
+
+func TestScaffolder_CentralizedFleetBacklog(t *testing.T) {
+	fleetRoot, _ := setupTestFleet(t)
+	// Create docs/stories in fleetRoot, but leave iazio-mcp without docs/stories
+	fleetStories := filepath.Join(fleetRoot, "docs", "stories")
+	if err := os.MkdirAll(fleetStories, 0755); err != nil {
+		t.Fatalf("failed to create fleetStories: %v", err)
+	}
+
+	var capturedOpts autopilot.CreateStoryOptions
+	mockAP := &mockAutopilot{
+		createStoryFunc: func(ctx context.Context, opts autopilot.CreateStoryOptions) (*autopilot.StoryResult, error) {
+			capturedOpts = opts
+			return &autopilot.StoryResult{
+				StoryID:      "STORY-CENTRAL-001",
+				Submodule:    opts.Submodule,
+				StoryPath:    "docs/stories/central.md",
+				IndexUpdated: true,
+			}, nil
+		},
+	}
+
+	scaffolder := NewScaffolder(fleetRoot, mockAP)
+	res, err := scaffolder.ScaffoldStory(context.Background(), StoryPayload{
+		Submodule: "iazio-mcp",
+		Title:     "Centralized Story",
+	})
+	if err != nil {
+		t.Fatalf("ScaffoldStory failed: %v", err)
+	}
+	if res.StoryID != "STORY-CENTRAL-001" {
+		t.Errorf("expected STORY-CENTRAL-001, got %s", res.StoryID)
+	}
+	if capturedOpts.WorkingDir != fleetRoot {
+		t.Errorf("expected WorkingDir to redirect to fleetRoot (%s), got %s", fleetRoot, capturedOpts.WorkingDir)
+	}
+	if capturedOpts.StoriesDir != fleetStories {
+		t.Errorf("expected StoriesDir to be %s, got %s", fleetStories, capturedOpts.StoriesDir)
 	}
 }
 
@@ -255,6 +309,20 @@ func TestResolveFleetRoot_And_Validations(t *testing.T) {
 	sc := NewScaffolder("", nil)
 	if sc == nil {
 		t.Error("expected non-nil scaffolder")
+	}
+
+	// 5. EnsureStoriesIndexBootstrap
+	testStoriesDir := filepath.Join(t.TempDir(), "docs", "stories")
+	if err := EnsureStoriesIndexBootstrap(testStoriesDir); err != nil {
+		t.Fatalf("EnsureStoriesIndexBootstrap failed: %v", err)
+	}
+	idxBytes, err := os.ReadFile(filepath.Join(testStoriesDir, "index.yml"))
+	if err != nil || !strings.Contains(string(idxBytes), "stories: []") {
+		t.Fatalf("expected valid bootstrapped index.yml, got %s (err: %v)", string(idxBytes), err)
+	}
+	// Calling again should be idempotent
+	if err := EnsureStoriesIndexBootstrap(testStoriesDir); err != nil {
+		t.Fatalf("idempotent EnsureStoriesIndexBootstrap failed: %v", err)
 	}
 }
 

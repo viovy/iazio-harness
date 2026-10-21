@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/viovy/iazio-harness/internal/autopilot"
 	"github.com/viovy/iazio-harness/internal/codebase"
@@ -65,14 +67,34 @@ func (s *Scaffolder) ScaffoldStory(ctx context.Context, payload StoryPayload) (*
 		return nil, fmt.Errorf("resolve submodule path: %w", err)
 	}
 
-	// Acquire exclusive flock for the checkout so parallel runs never race on autopilot next-id or index.yml
-	lock, err := engines.Hold(targetDir, s.lockDir)
+	workingDir := targetDir
+	storiesDir := filepath.Join(targetDir, "docs", "stories")
+
+	// Intelligent story hub resolution: if submodule does not have its own docs/stories
+	// and fleet root does have docs/stories, target the centralized fleet backlog
+	if submodule != "." && submodule != "" {
+		if fi, err := os.Stat(storiesDir); err != nil || !fi.IsDir() {
+			fleetStories := filepath.Join(s.fleetRoot, "docs", "stories")
+			if fFi, fErr := os.Stat(fleetStories); fErr == nil && fFi.IsDir() {
+				workingDir = s.fleetRoot
+				storiesDir = fleetStories
+			}
+		}
+	}
+
+	// Acquire exclusive flock with context-aware try-lock (2s timeout) on the active workingDir
+	// so parallel operations targeting the central or submodule index serialize cleanly.
+	lock, err := engines.HoldWithTimeout(ctx, workingDir, s.lockDir, 2*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("failed to acquire exclusive checkout lock for %s: %w", targetDir, err)
+		return nil, fmt.Errorf("WORKSPACE_LOCKED: failed to acquire exclusive checkout lock for %s: %w", workingDir, err)
 	}
 	defer func() { _ = lock.Release() }()
 
-	storiesDir := filepath.Join(targetDir, "docs", "stories")
+	// Ensure docs/stories and index.yml bootstrap
+	if err := EnsureStoriesIndexBootstrap(storiesDir); err != nil {
+		return nil, fmt.Errorf("failed to bootstrap stories index: %w", err)
+	}
+
 	opts := autopilot.CreateStoryOptions{
 		Submodule:            submodule,
 		Title:                payload.Title,
@@ -82,7 +104,7 @@ func (s *Scaffolder) ScaffoldStory(ctx context.Context, payload StoryPayload) (*
 		TargetFiles:          payload.TargetFiles,
 		DependsOn:            payload.DependsOn,
 		VerificationCommands: payload.VerificationCommands,
-		WorkingDir:           targetDir,
+		WorkingDir:           workingDir,
 		StoriesDir:           storiesDir,
 	}
 
@@ -122,6 +144,27 @@ func validateRelativePath(p string) error {
 	}
 	if len(clean) >= 2 && clean[1] == ':' && ((clean[0] >= 'a' && clean[0] <= 'z') || (clean[0] >= 'A' && clean[0] <= 'Z')) {
 		return fmt.Errorf("volume prefixes not permitted: %q", p)
+	}
+	return nil
+}
+
+// EnsureStoriesIndexBootstrap guarantees docs/stories and index.yml exist atomically.
+func EnsureStoriesIndexBootstrap(storiesDir string) error {
+	if err := os.MkdirAll(storiesDir, 0o755); err != nil {
+		return fmt.Errorf("create stories dir %s: %w", storiesDir, err)
+	}
+	indexPath := filepath.Join(storiesDir, "index.yml")
+	if _, err := os.Stat(indexPath); err == nil {
+		return nil
+	}
+	tmpPath := filepath.Join(storiesDir, fmt.Sprintf(".tmp-index-%d.yml", time.Now().UnixNano()))
+	initialContent := []byte("version: \"1.0\"\nstories: []\n")
+	if err := os.WriteFile(tmpPath, initialContent, 0o644); err != nil {
+		return fmt.Errorf("write temp index %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, indexPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename temp index to %s: %w", indexPath, err)
 	}
 	return nil
 }
