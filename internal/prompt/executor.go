@@ -96,6 +96,7 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 	// 3. Delegate execution to autopilot
 	opts := autopilot.RunPromptOptions{
 		PromptID:    payload.PromptID,
+		StoryID:     payload.StoryID,
 		Repo:        payload.Repo,
 		Title:       payload.Title,
 		Prompt:      payload.Prompt,

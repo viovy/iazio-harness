@@ -462,4 +462,3 @@ func TestExecutor_ResolveFleetRootAndLockPath(t *testing.T) {
 		t.Errorf("expected default prompt lock in %s", lp2)
 	}
 }
-

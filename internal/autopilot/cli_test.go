@@ -271,5 +271,3 @@ func TestNewCLIClientDefaults(t *testing.T) {
 		t.Errorf("expected autopilot, got %s", c2.AutopilotBinary)
 	}
 }
-
-

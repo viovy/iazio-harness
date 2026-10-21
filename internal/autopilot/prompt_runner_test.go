@@ -36,9 +36,13 @@ func TestAutopilotHelperProcess(t *testing.T) {
 	cmd := args[0]
 	if cmd == "prompt" && len(args) >= 2 && args[1] == "run" {
 		var promptFile string
+		var storyArg string
 		for i := 2; i < len(args); i++ {
 			if args[i] == "--file" && i+1 < len(args) {
 				promptFile = args[i+1]
+			}
+			if args[i] == "--story" && i+1 < len(args) {
+				storyArg = args[i+1]
 			}
 		}
 
@@ -66,7 +70,7 @@ func TestAutopilotHelperProcess(t *testing.T) {
 
 		// Test output with secret token to test redaction
 		pwd, _ := os.Getwd()
-		fmt.Printf("Executed in %s: ghp_SECRET_GITHUB_TOKEN_1234567890abcdef OK\n", filepath.Base(pwd))
+		fmt.Printf("Executed in %s: ghp_SECRET_GITHUB_TOKEN_1234567890abcdef OK story=%s\n", filepath.Base(pwd), storyArg)
 		return
 	}
 
@@ -239,3 +243,42 @@ func TestNewPromptRunnerDefaults(t *testing.T) {
 	}
 }
 
+func TestCLIPromptRunner_StoryDetection(t *testing.T) {
+	fakeBin := makeFakeAutopilot(t)
+	repoDir := initTestGitRepo(t)
+
+	runner := NewPromptRunner(fakeBin)
+
+	// Case 1: StoryID explicitly in opts
+	opts1 := RunPromptOptions{
+		PromptID:   "test-prompt-explicit",
+		StoryID:    "STORY-EXPLICIT-111",
+		Repo:       "test-submodule",
+		Prompt:     "Execute task",
+		WorkingDir: repoDir,
+		Timeout:    5 * time.Second,
+	}
+	res1, err := runner.RunPrompt(context.Background(), opts1)
+	if err != nil {
+		t.Fatalf("unexpected RunPrompt error: %v", err)
+	}
+	if !strings.Contains(res1.Summary, "story=STORY-EXPLICIT-111") {
+		t.Fatalf("expected story=STORY-EXPLICIT-111 in summary, got: %s", res1.Summary)
+	}
+
+	// Case 2: StoryID detected in prompt content
+	opts2 := RunPromptOptions{
+		PromptID:   "test-prompt-detected",
+		Repo:       "test-submodule",
+		Prompt:     "# Execute Story STORY-DETECTED-222\nPlease implement ACs",
+		WorkingDir: repoDir,
+		Timeout:    5 * time.Second,
+	}
+	res2, err := runner.RunPrompt(context.Background(), opts2)
+	if err != nil {
+		t.Fatalf("unexpected RunPrompt error: %v", err)
+	}
+	if !strings.Contains(res2.Summary, "story=STORY-DETECTED-222") {
+		t.Fatalf("expected story=STORY-DETECTED-222 in summary, got: %s", res2.Summary)
+	}
+}
