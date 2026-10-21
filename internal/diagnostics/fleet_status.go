@@ -287,6 +287,8 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 		res.ToolLiveness = "KILLED"
 		res.ASEState = "ORPHANED"
 		res.ExecutionProvenance = "COORDINATED_HARNESS_FAILED"
+	} else if res.ASEState == "FAILED_DIRTY" || !res.IsClean {
+		res.ToolLiveness = "TERMINATED"
 	}
 }
 
@@ -320,6 +322,8 @@ func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult)
 		res.ToolLiveness = "KILLED"
 		res.ASEState = "ORPHANED"
 		res.ExecutionProvenance = "COORDINATED_HARNESS_FAILED"
+	} else if res.ASEState == "FAILED_DIRTY" || !res.IsClean {
+		res.ToolLiveness = "TERMINATED"
 	}
 }
 
