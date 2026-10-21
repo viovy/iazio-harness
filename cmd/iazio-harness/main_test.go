@@ -433,6 +433,7 @@ func TestPipedStdinHandlers(t *testing.T) {
 	// 0. Successful codebase repos discovery
 	tmpRoot := t.TempDir()
 	_ = os.WriteFile(filepath.Join(tmpRoot, ".gitmodules"), []byte("[submodule \"test-sub\"]\n\tpath = test-sub\n"), 0644)
+	_ = os.MkdirAll(filepath.Join(tmpRoot, "test-sub"), 0755)
 	t.Setenv("IAZIO_FLEET_ROOT", tmpRoot)
 	if err := runCodebaseRepos([]string{"--json"}); err != nil {
 		t.Errorf("unexpected error on runCodebaseRepos: %v", err)
@@ -511,7 +512,7 @@ func TestPipedStdinHandlers(t *testing.T) {
 	storyData, _ := json.Marshal(map[string]any{
 		"story_id":  "STORY-GOV-9999",
 		"title":     "Test Auto Story",
-		"submodule": "iazio-harness",
+		"submodule": "test-sub",
 	})
 	_, _ = wSGood.Write(storyData)
 	_ = wSGood.Close()

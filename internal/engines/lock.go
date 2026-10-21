@@ -15,6 +15,37 @@ import (
 // Callers must not exec the IDE CLI.
 var ErrLockHeld = errors.New("checkout lock held")
 
+// ErrWorkspaceLocked is returned when a workspace lock could not be acquired within the timeout.
+var ErrWorkspaceLocked = errors.New("WORKSPACE_LOCKED: workspace lock is currently held by another operation")
+
+// HoldWithTimeout attempts to acquire an exclusive lock on checkout, retrying until acquired, timeout expires, or ctx is canceled.
+func HoldWithTimeout(ctx context.Context, checkout, lockDir string, timeout time.Duration) (*Lock, error) {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		lock, err := Hold(checkout, lockDir)
+		if err == nil {
+			return lock, nil
+		}
+		if !errors.Is(err, ErrLockHeld) {
+			return nil, fmt.Errorf("lock error for %s: %w", checkout, err)
+		}
+
+		select {
+		case <-ctxWithTimeout.Done():
+			return nil, fmt.Errorf("%w (checkout %s, waited %v)", ErrWorkspaceLocked, checkout, timeout)
+		case <-ticker.C:
+		}
+	}
+}
+
 // Lock is an exclusive hold on one checkout for the process lifetime of the job.
 type Lock struct {
 	f    *os.File

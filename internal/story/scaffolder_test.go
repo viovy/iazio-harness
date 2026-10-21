@@ -256,5 +256,19 @@ func TestResolveFleetRoot_And_Validations(t *testing.T) {
 	if sc == nil {
 		t.Error("expected non-nil scaffolder")
 	}
+
+	// 5. EnsureStoriesIndexBootstrap
+	testStoriesDir := filepath.Join(t.TempDir(), "docs", "stories")
+	if err := EnsureStoriesIndexBootstrap(testStoriesDir); err != nil {
+		t.Fatalf("EnsureStoriesIndexBootstrap failed: %v", err)
+	}
+	idxBytes, err := os.ReadFile(filepath.Join(testStoriesDir, "index.yml"))
+	if err != nil || !strings.Contains(string(idxBytes), "stories: []") {
+		t.Fatalf("expected valid bootstrapped index.yml, got %s (err: %v)", string(idxBytes), err)
+	}
+	// Calling again should be idempotent
+	if err := EnsureStoriesIndexBootstrap(testStoriesDir); err != nil {
+		t.Fatalf("idempotent EnsureStoriesIndexBootstrap failed: %v", err)
+	}
 }
 

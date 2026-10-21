@@ -707,6 +707,19 @@ func TestEnginesExtraCoverage(t *testing.T) {
 		t.Errorf("expected error on canceled context in HoldPath")
 	}
 
+	// Test HoldWithTimeout success
+	checkoutDir := t.TempDir()
+	lkTimeout, err := HoldWithTimeout(context.Background(), checkoutDir, "", 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("HoldWithTimeout failed: %v", err)
+	}
+	// While held, second hold should time out with WORKSPACE_LOCKED
+	_, errLocked := HoldWithTimeout(context.Background(), checkoutDir, "", 50*time.Millisecond)
+	if errLocked == nil || !strings.Contains(errLocked.Error(), "WORKSPACE_LOCKED") {
+		t.Fatalf("expected WORKSPACE_LOCKED error, got %v", errLocked)
+	}
+	_ = lkTimeout.Release()
+
 	// 5. Process group hooks
 	PostStartProcessGroup(nil)
 	StopProcessGroup(nil)
