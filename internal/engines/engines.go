@@ -38,6 +38,9 @@ type EventStream interface {
 	AppendRaw(stream string, p []byte) error
 }
 
+// PreFlightHook is executed prior to child execution if set.
+var PreFlightHook func(ctx context.Context, workDir, storyID string) error
+
 // ExecutionRequest is one IDE CLI invocation.
 type ExecutionRequest struct {
 	Engine                     string
@@ -220,6 +223,13 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		workDir = sb.SandboxPath
 	}
 	cmd.Dir = workDir
+	if PreFlightHook != nil && req.StoryID != "" && workDir != "" {
+		if pfErr := PreFlightHook(ctx, workDir, req.StoryID); pfErr != nil {
+			if stream != nil {
+				_ = stream.AppendRaw("stderr", []byte(fmt.Sprintf("[iazio-harness] Warning: pre-flight story materialization failed: %v\n", pfErr)))
+			}
+		}
+	}
 	base := req.BaseEnv
 	if req.BaseEnv == nil {
 		base = os.Environ()

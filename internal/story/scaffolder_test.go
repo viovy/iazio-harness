@@ -2,6 +2,8 @@ package story
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -323,6 +325,76 @@ func TestResolveFleetRoot_And_Validations(t *testing.T) {
 	// Calling again should be idempotent
 	if err := EnsureStoriesIndexBootstrap(testStoriesDir); err != nil {
 		t.Fatalf("idempotent EnsureStoriesIndexBootstrap failed: %v", err)
+	}
+}
+
+func TestMaterializePendingStories(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Empty story ID is a no-op
+	if err := MaterializePendingStories(context.Background(), tmpDir, ""); err != nil {
+		t.Fatalf("expected nil for empty storyID, got %v", err)
+	}
+
+	// 2. Mock control plane HTTP server
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/stories/STORY-REMOTE-001" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"id": "STORY-REMOTE-001",
+				"title": "Remote Materialized Story",
+				"status": "pending",
+				"path": "docs/stories/story-remote-001.story.md",
+				"content": "# STORY-REMOTE-001: Remote Materialized Story\n\nContent materialized from API."
+			}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer mockServer.Close()
+
+	t.Setenv("IAZIO_HARNESS_API_URL", mockServer.URL)
+
+	// Pre-condition: story does not exist on disk
+	storyFile := filepath.Join(tmpDir, "docs", "stories", "story-remote-001.story.md")
+	if _, err := os.Stat(storyFile); err == nil {
+		t.Fatalf("expected %s not to exist yet", storyFile)
+	}
+
+	// Materialize
+	if err := MaterializePendingStories(context.Background(), tmpDir, "STORY-REMOTE-001"); err != nil {
+		t.Fatalf("MaterializePendingStories failed: %v", err)
+	}
+
+	// Verify file was written
+	content, err := os.ReadFile(storyFile)
+	if err != nil {
+		t.Fatalf("failed to read materialized story file: %v", err)
+	}
+	if !strings.Contains(string(content), "Content materialized from API") {
+		t.Errorf("expected story content from API, got %s", string(content))
+	}
+
+	// Verify index.yml was updated
+	indexFile := filepath.Join(tmpDir, "docs", "stories", "index.yml")
+	idxBytes, err := os.ReadFile(indexFile)
+	if err != nil {
+		t.Fatalf("failed to read index.yml: %v", err)
+	}
+	if !strings.Contains(string(idxBytes), "STORY-REMOTE-001") {
+		t.Errorf("expected index.yml to contain STORY-REMOTE-001, got: %s", string(idxBytes))
+	}
+
+	// Calling again should detect existing file and not fail even if API server is closed
+	mockServer.Close()
+	if err := MaterializePendingStories(context.Background(), tmpDir, "STORY-REMOTE-001"); err != nil {
+		t.Fatalf("idempotent MaterializePendingStories failed: %v", err)
+	}
+
+	// Verify engines.PreFlightHook is wired
+	if engines.PreFlightHook == nil {
+		t.Error("expected engines.PreFlightHook to be wired")
 	}
 }
 
