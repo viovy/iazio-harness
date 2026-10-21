@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -492,10 +491,8 @@ func ReapOrphanedProcesses(ctx context.Context, repoPath string) error {
 		}
 
 		if ppid == 1 || !isPIDAlive(ppid) {
-			_ = syscall.Kill(pid, syscall.SIGTERM)
-			time.Sleep(50 * time.Millisecond)
-			if isPIDAlive(pid) {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
+			if proc, err := os.FindProcess(pid); err == nil {
+				_ = proc.Kill()
 			}
 		}
 	}
