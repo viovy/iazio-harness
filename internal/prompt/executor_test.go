@@ -462,3 +462,83 @@ func TestExecutor_ResolveFleetRootAndLockPath(t *testing.T) {
 		t.Errorf("expected default prompt lock in %s", lp2)
 	}
 }
+
+func TestExecutor_IntelligentWorkingDirResolutionAndTraceID(t *testing.T) {
+	fleetRoot, mcpDir, _ := setupTestFleet(t)
+
+	// Create fleet stories directory
+	fleetStories := filepath.Join(fleetRoot, "docs", "stories")
+	if err := os.MkdirAll(fleetStories, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &mockPromptRunner{}
+	exec := NewExecutor(fleetRoot, runner)
+	exec.SetLockDir(t.TempDir())
+
+	ctx := context.Background()
+
+	// 1. Submodule lacks docs/stories, targetAgent is autopilot -> WorkingDir should resolve to fleetRoot
+	payload := PromptPayload{
+		PromptID:       "prompt-1",
+		StoryID:        "STORY-IAZIO-0006",
+		Repo:           "iazio-mcp",
+		Title:          "Execute story",
+		Prompt:         "Execute story flow",
+		TargetAgent:    "autopilot",
+		TraceID:        "trace-zipkin-999",
+		TimeoutSeconds: 30,
+	}
+
+	res, err := exec.Execute(ctx, payload)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != "completed" {
+		t.Fatalf("expected completed status, got %s", res.Status)
+	}
+
+	runner.mu.Lock()
+	lastOpts := runner.lastOpts
+	runner.mu.Unlock()
+
+	if lastOpts.WorkingDir != fleetRoot {
+		t.Errorf("expected WorkingDir to resolve to fleetRoot %s, got %s", fleetRoot, lastOpts.WorkingDir)
+	}
+	if lastOpts.TraceID != "trace-zipkin-999" {
+		t.Errorf("expected TraceID %q, got %q", "trace-zipkin-999", lastOpts.TraceID)
+	}
+
+	// 2. Submodule HAS docs/stories -> WorkingDir stays at submodule mcpDir
+	subStories := filepath.Join(mcpDir, "docs", "stories")
+	if err := os.MkdirAll(subStories, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	payload2 := PromptPayload{
+		PromptID:       "prompt-2",
+		StoryID:        "STORY-LOCAL-001",
+		Repo:           "iazio-mcp",
+		Title:          "Local story",
+		Prompt:         "Local flow",
+		TargetAgent:    "autopilot",
+		TraceID:        "trace-local-111",
+		TimeoutSeconds: 30,
+	}
+
+	_, err = exec.Execute(ctx, payload2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	runner.mu.Lock()
+	lastOpts2 := runner.lastOpts
+	runner.mu.Unlock()
+
+	if lastOpts2.WorkingDir != mcpDir {
+		t.Errorf("expected WorkingDir to remain mcpDir %s, got %s", mcpDir, lastOpts2.WorkingDir)
+	}
+	if lastOpts2.TraceID != "trace-local-111" {
+		t.Errorf("expected TraceID %q, got %q", "trace-local-111", lastOpts2.TraceID)
+	}
+}

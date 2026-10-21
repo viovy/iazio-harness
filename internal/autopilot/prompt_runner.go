@@ -33,6 +33,7 @@ type RunPromptOptions struct {
 	Prompt      string        `json:"prompt"`
 	TargetAgent string        `json:"target_agent,omitempty"`
 	WorkingDir  string        `json:"working_dir"`
+	TraceID     string        `json:"trace_id,omitempty"`
 	Timeout     time.Duration `json:"timeout,omitempty"`
 	GracePeriod time.Duration `json:"grace_period,omitempty"`
 }
@@ -155,6 +156,25 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 
 	cmd := exec.Command(r.AutopilotBinary, args...)
 	cmd.Dir = opts.WorkingDir
+
+	// Propagate Zipkin/W3C trace continuity into autopilot process
+	cmd.Env = os.Environ()
+	traceID := opts.TraceID
+	if traceID == "" {
+		traceID = os.Getenv("TRACE_ID")
+	}
+	if traceID == "" {
+		traceID = os.Getenv("ZIPKIN_TRACE_ID")
+	}
+	if traceID != "" {
+		cmd.Env = append(cmd.Env,
+			"ZIPKIN_TRACE_ID="+traceID,
+			"TRACE_ID="+traceID,
+			fmt.Sprintf("TRACEPARENT=00-%s-%s-01", traceID, opts.PromptID),
+		)
+	} else if tp := os.Getenv("TRACEPARENT"); tp != "" {
+		cmd.Env = append(cmd.Env, "TRACEPARENT="+tp)
+	}
 
 	// Dual delivery: also pipe prompt bytes to Stdin for mock or stdin-reading executors
 	cmd.Stdin = bytes.NewReader([]byte(opts.Prompt))

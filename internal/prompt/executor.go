@@ -25,6 +25,7 @@ type PromptPayload struct {
 	Prompt         string `json:"prompt"`
 	TargetAgent    string `json:"target_agent,omitempty"`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	TraceID        string `json:"trace_id,omitempty"`
 }
 
 // Executor coordinates submodule resolution, workspace file locking, and execution delegation.
@@ -94,6 +95,20 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 	}()
 
 	// 3. Delegate execution to autopilot
+	workingDir := targetDir
+	if payload.TargetAgent == "autopilot" || strings.TrimSpace(payload.StoryID) != "" {
+		// Intelligent story hub resolution: if target submodule lacks its own docs/stories
+		// and fleetRoot has docs/stories, target fleetRoot so autopilot can find the centralized
+		// backlog story and root Makefile (execute-story-flow, validate-local-fleet).
+		subStories := filepath.Join(targetDir, "docs", "stories")
+		if fi, err := os.Stat(subStories); err != nil || !fi.IsDir() {
+			fleetStories := filepath.Join(e.fleetRoot, "docs", "stories")
+			if fFi, fErr := os.Stat(fleetStories); fErr == nil && fFi.IsDir() {
+				workingDir = e.fleetRoot
+			}
+		}
+	}
+
 	opts := autopilot.RunPromptOptions{
 		PromptID:    payload.PromptID,
 		StoryID:     payload.StoryID,
@@ -101,7 +116,8 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 		Title:       payload.Title,
 		Prompt:      payload.Prompt,
 		TargetAgent: payload.TargetAgent,
-		WorkingDir:  targetDir,
+		WorkingDir:  workingDir,
+		TraceID:     payload.TraceID,
 		Timeout:     timeout,
 	}
 
