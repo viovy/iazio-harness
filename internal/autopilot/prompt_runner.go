@@ -9,12 +9,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/redact"
 )
+
+var storyIDRegex = regexp.MustCompile(`\b(STORY-[A-Za-z0-9_-]+)\b`)
 
 const (
 	defaultPromptTimeout = 900 * time.Second
@@ -24,6 +27,7 @@ const (
 // RunPromptOptions specifies parameters for executing a prompt via autopilot.
 type RunPromptOptions struct {
 	PromptID    string        `json:"prompt_id"`
+	StoryID     string        `json:"story_id,omitempty"`
 	Repo        string        `json:"repo"`
 	Title       string        `json:"title,omitempty"`
 	Prompt      string        `json:"prompt"`
@@ -130,6 +134,20 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 	if opts.Title != "" {
 		args = append(args, "--title", opts.Title)
+	}
+	storyID := strings.TrimSpace(opts.StoryID)
+	if storyID == "" {
+		if m := storyIDRegex.FindStringSubmatch(opts.Title); len(m) > 1 {
+			storyID = m[1]
+		}
+	}
+	if storyID == "" {
+		if m := storyIDRegex.FindStringSubmatch(opts.Prompt); len(m) > 1 {
+			storyID = m[1]
+		}
+	}
+	if storyID != "" {
+		args = append(args, "--story", storyID)
 	}
 
 	execCtx, cancel := context.WithTimeout(ctx, timeout)

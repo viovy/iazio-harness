@@ -100,8 +100,8 @@ func TestPromptValuesLookupAndSafeJobID(t *testing.T) {
 
 	// Prepare edge cases
 	_, err := Prepare(Input{
-		JobID: "job-refine-err",
-		Kind:  KindStoryRefinement,
+		JobID:    "job-refine-err",
+		Kind:     KindStoryRefinement,
 		SpoolDir: "", // empty
 	})
 	if err == nil {
@@ -129,5 +129,3 @@ func TestPromptValuesLookupAndSafeJobID(t *testing.T) {
 		t.Errorf("expected default fallback story ID, got %v, res=%+v", err, nonResumeRes)
 	}
 }
-
-

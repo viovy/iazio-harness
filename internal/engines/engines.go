@@ -42,6 +42,7 @@ type EventStream interface {
 type ExecutionRequest struct {
 	Engine                     string
 	Kind                       string
+	StoryID                    string
 	Prompt                     string
 	WorktreePath               string
 	DocsHubPath                string
@@ -592,7 +593,21 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 	case "opencode":
 		return []string{"opencode", "run", "--auto", req.Prompt}, nil
 	case "autopilot":
-		return []string{"autopilot", "story", "begin", req.Prompt}, nil
+		if req.Kind == "story_begin" {
+			argv := []string{"autopilot", "story", "begin"}
+			if req.StoryID != "" {
+				argv = append(argv, "--story", req.StoryID)
+			}
+			return argv, nil
+		}
+		argv := []string{"autopilot", "prompt", "run"}
+		if req.StoryID != "" {
+			argv = append(argv, "--story", req.StoryID)
+		}
+		if req.Prompt != "" {
+			argv = append(argv, req.Prompt)
+		}
+		return argv, nil
 	default:
 		return nil, errors.New("unknown engine")
 	}
