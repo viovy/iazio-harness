@@ -168,3 +168,30 @@ func EnsureStoriesIndexBootstrap(storiesDir string) error {
 	}
 	return nil
 }
+
+// MaterializeStoryFile writes a story markdown file to docs/stories/<file> and ensures docs/stories/ exists.
+func MaterializeStoryFile(repoRoot, storyID, filename, content string) error {
+	if strings.TrimSpace(storyID) == "" {
+		return errors.New("storyID cannot be empty")
+	}
+	storiesDir := filepath.Join(repoRoot, "docs", "stories")
+	if err := EnsureStoriesIndexBootstrap(storiesDir); err != nil {
+		return err
+	}
+	targetFile := filename
+	if targetFile == "" {
+		targetFile = storyID + ".md"
+	}
+	filePath := filepath.Join(storiesDir, targetFile)
+	if strings.TrimSpace(content) != "" {
+		tmpPath := filePath + fmt.Sprintf(".tmp-%d", time.Now().UnixNano())
+		if err := os.WriteFile(tmpPath, []byte(content), 0o644); err != nil {
+			return fmt.Errorf("write story temp file %s: %w", tmpPath, err)
+		}
+		if err := os.Rename(tmpPath, filePath); err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("rename story file to %s: %w", filePath, err)
+		}
+	}
+	return nil
+}

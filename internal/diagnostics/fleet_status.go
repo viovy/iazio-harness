@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -26,6 +27,9 @@ type RepoFleetStatusResult struct {
 	UntrackedFiles       []string `json:"untracked_files"`
 	SubmodulesClean      bool     `json:"submodules_clean"`
 	DirtySubmodules      []string `json:"dirty_submodules"`
+	WorktreeState        string   `json:"worktree_state"` // CLEAN, CLEAN_SUBMODULE_DRIFT, DIRTY_UNTRACKED_ONLY, DIRTY_MODIFIED
+	SubmoduleDrift       []string `json:"submodule_drift,omitempty"`
+	OrphanedProcesses    []string `json:"orphaned_processes,omitempty"`
 	ASEState             string   `json:"ase_state"` // IDLE, RUNNING, SUSPENDED_HITL, FAILED_DIRTY, ORPHANED
 	ActiveStoryID        string   `json:"active_story_id,omitempty"`
 	CurrentPhase         string   `json:"current_phase,omitempty"`
@@ -51,6 +55,7 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 		RepoPath:            cleanPath,
 		IsClean:             true,
 		SubmodulesClean:     true,
+		WorktreeState:       "CLEAN",
 		ASEState:            "IDLE",
 		ToolLiveness:        "NONE",
 		ExecutionProvenance: "NONE",
@@ -83,10 +88,26 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 		parseSubmoduleStatus(ctx, cleanPath, string(subOut), res)
 	}
 
-	// Evaluate overall cleanliness: working tree, submodules, and unpushed branch commits
-	if len(res.ModifiedFiles) > 0 || len(res.UntrackedFiles) > 0 || !res.SubmodulesClean || len(res.DirtySubmodules) > 0 || res.Ahead > 0 {
+	// Classify overall cleanliness and worktree state
+	hasModifiedFiles := len(res.ModifiedFiles) > 0
+	hasUntrackedFiles := len(res.UntrackedFiles) > 0
+	hasDirtySubmodules := len(res.DirtySubmodules) > 0
+	hasSubmoduleDrift := len(res.SubmoduleDrift) > 0
+
+	if hasModifiedFiles || hasDirtySubmodules {
+		res.WorktreeState = "DIRTY_MODIFIED"
 		res.IsClean = false
+	} else if hasUntrackedFiles {
+		res.WorktreeState = "DIRTY_UNTRACKED_ONLY"
+		res.IsClean = false
+	} else if hasSubmoduleDrift {
+		res.WorktreeState = "CLEAN_SUBMODULE_DRIFT"
+		res.IsClean = true
+	} else {
+		res.WorktreeState = "CLEAN"
+		res.IsClean = true
 	}
+	res.SubmodulesClean = (len(res.DirtySubmodules) == 0)
 
 	// 3. ASE State & Autopilot locks
 	parseASEState(cleanPath, res)
@@ -123,8 +144,23 @@ func parseGitPorcelainV2(out string, res *RepoFleetStatusResult) {
 				}
 			}
 		} else if strings.HasPrefix(l, "1 ") || strings.HasPrefix(l, "2 ") || strings.HasPrefix(l, "u ") {
-			res.IsClean = false
 			parts := strings.Fields(l)
+			// Check if this line is a submodule gitlink:
+			// Porcelain v2 format for changes: 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
+			if len(parts) >= 9 && strings.HasPrefix(parts[2], "S") {
+				subCode := parts[2]
+				subPath := parts[len(parts)-1]
+				hasModified := len(subCode) > 2 && subCode[2] == 'M'
+				hasUntracked := len(subCode) > 3 && subCode[3] == 'U'
+				hasCommitDrift := len(subCode) > 1 && subCode[1] == 'C'
+				if hasModified || hasUntracked {
+					res.DirtySubmodules = append(res.DirtySubmodules, subPath+" (uncommitted changes)")
+				} else if hasCommitDrift {
+					res.SubmoduleDrift = append(res.SubmoduleDrift, subPath)
+				}
+				continue
+			}
+			res.IsClean = false
 			if len(parts) > 8 {
 				res.ModifiedFiles = append(res.ModifiedFiles, parts[len(parts)-1])
 			} else if len(parts) > 1 {
@@ -142,7 +178,8 @@ func parseGitPorcelainV2(out string, res *RepoFleetStatusResult) {
 
 func parseSubmoduleStatus(ctx context.Context, cleanPath string, out string, res *RepoFleetStatusResult) {
 	lines := strings.Split(out, "\n")
-	seen := make(map[string]bool)
+	seenDirty := make(map[string]bool)
+	seenDrift := make(map[string]bool)
 	for _, l := range lines {
 		l = strings.TrimSpace(l)
 		if l == "" {
@@ -151,24 +188,31 @@ func parseSubmoduleStatus(ctx context.Context, cleanPath string, out string, res
 		parts := strings.Fields(l)
 		if len(parts) >= 2 {
 			subPath := parts[1]
-			// Prefix '+' indicates commit does not match index; '-' not initialized; 'U' merge conflict
-			if strings.HasPrefix(l, "+") || strings.HasPrefix(l, "-") || strings.HasPrefix(l, "U") {
-				res.SubmodulesClean = false
-				if !seen[subPath] {
-					res.DirtySubmodules = append(res.DirtySubmodules, subPath)
-					seen[subPath] = true
-				}
-			}
-			// Deep check: inspect the submodule worktree itself for uncommitted files
 			fullSubPath := filepath.Join(cleanPath, subPath)
+			hasUncommitted := false
+
+			// Deep check: inspect the submodule worktree itself for uncommitted files
 			if stat, err := os.Stat(fullSubPath); err == nil && stat.IsDir() {
 				subStatusCmd := exec.CommandContext(ctx, "git", "-C", fullSubPath, "status", "--porcelain")
 				if subOut, err := subStatusCmd.Output(); err == nil && len(strings.TrimSpace(string(subOut))) > 0 {
-					res.SubmodulesClean = false
-					if !seen[subPath] {
-						res.DirtySubmodules = append(res.DirtySubmodules, subPath+" (uncommitted changes)")
-						seen[subPath] = true
-					}
+					hasUncommitted = true
+				}
+			}
+
+			if hasUncommitted {
+				if !seenDirty[subPath] {
+					res.DirtySubmodules = append(res.DirtySubmodules, subPath+" (uncommitted changes)")
+					seenDirty[subPath] = true
+				}
+			} else if strings.HasPrefix(l, "+") {
+				if !seenDrift[subPath] {
+					res.SubmoduleDrift = append(res.SubmoduleDrift, subPath)
+					seenDrift[subPath] = true
+				}
+			} else if strings.HasPrefix(l, "-") || strings.HasPrefix(l, "U") {
+				if !seenDirty[subPath] {
+					res.DirtySubmodules = append(res.DirtySubmodules, subPath)
+					seenDirty[subPath] = true
 				}
 			}
 		}
@@ -210,13 +254,17 @@ func parseASEState(repoPath string, res *RepoFleetStatusResult) {
 		if res.ASEState == "IDLE" {
 			res.ASEState = "RUNNING"
 		}
-	} else if !res.IsClean && res.ASEState == "IDLE" {
+	} else if res.WorktreeState == "DIRTY_MODIFIED" && res.ASEState == "IDLE" {
 		res.ASEState = "FAILED_DIRTY"
 	}
 }
 
 var knownAgentBinaries = []string{
 	"agy", "antigravity", "opencode", "cursor", "claude", "autopilot", "iazio-harness",
+}
+
+var auxiliaryChildBinaries = []string{
+	"iazio-mcp", "node", "gopls", "rust-analyzer", "tsserver", "pyright", "python",
 }
 
 func isAgentTool(cmd string) (string, bool) {
@@ -227,6 +275,24 @@ func isAgentTool(cmd string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func isAuxiliaryTool(cmd string) (string, bool) {
+	lower := strings.ToLower(filepath.Base(cmd))
+	for _, tool := range auxiliaryChildBinaries {
+		if strings.Contains(lower, tool) {
+			return tool, true
+		}
+	}
+	return "", false
+}
+
+func isPIDAlive(pid int) bool {
+	if pid <= 1 {
+		return false
+	}
+	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+	return err == nil
 }
 
 func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
@@ -273,54 +339,71 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 			continue
 		}
 
+		// Primary agent tool detection
 		toolName, match := isAgentTool(cmdArgs[0])
 		if !match && len(cmdArgs) > 1 {
 			toolName, match = isAgentTool(cmdArgs[1])
 		}
-		if !match {
-			continue
-		}
+		if match && res.AgentTool == "" {
+			res.AgentTool = toolName
+			res.AgentPID = pid
+			res.ToolLiveness = "LIVE"
 
-		res.AgentTool = toolName
-		res.AgentPID = pid
-		res.ToolLiveness = "LIVE"
-
-		// Extract conversation ID from cmdArgs if present
-		for i := 0; i < len(cmdArgs)-1; i++ {
-			if cmdArgs[i] == "--conversation" || cmdArgs[i] == "-c" || strings.HasPrefix(cmdArgs[i], "--conversation=") {
-				if strings.HasPrefix(cmdArgs[i], "--conversation=") {
-					res.ActiveConversationID = strings.TrimPrefix(cmdArgs[i], "--conversation=")
-				} else {
-					res.ActiveConversationID = cmdArgs[i+1]
+			// Extract conversation ID from cmdArgs if present
+			for i := 0; i < len(cmdArgs)-1; i++ {
+				if cmdArgs[i] == "--conversation" || cmdArgs[i] == "-c" || strings.HasPrefix(cmdArgs[i], "--conversation=") {
+					if strings.HasPrefix(cmdArgs[i], "--conversation=") {
+						res.ActiveConversationID = strings.TrimPrefix(cmdArgs[i], "--conversation=")
+					} else {
+						res.ActiveConversationID = cmdArgs[i+1]
+					}
+					break
 				}
-				break
+			}
+
+			// Read environ for execution provenance
+			environBytes, _ := os.ReadFile(filepath.Join("/proc", name, "environ"))
+			environStr := string(environBytes)
+			if strings.Contains(environStr, "IAZIO_MANAGED_BY=harness") ||
+				strings.Contains(environStr, "IAZIO_HARNESS_JOB_ID") ||
+				strings.Contains(environStr, "IAZIO_AGENT_MANAGED=1") {
+				res.ExecutionProvenance = "COORDINATED_HARNESS"
+			} else if strings.Contains(environStr, "SSH_CLIENT") ||
+				strings.Contains(environStr, "SSH_TTY") ||
+				strings.Contains(environStr, "TMUX") ||
+				strings.Contains(environStr, "TERM_PROGRAM") {
+				res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+			} else {
+				res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
 			}
 		}
 
-		// Read environ for execution provenance
-		environBytes, _ := os.ReadFile(filepath.Join("/proc", name, "environ"))
-		environStr := string(environBytes)
-		if strings.Contains(environStr, "IAZIO_HARNESS_JOB_ID") ||
-			strings.Contains(environStr, "IAZIO_AGENT_MANAGED=1") {
-			res.ExecutionProvenance = "COORDINATED_HARNESS"
-		} else if strings.Contains(environStr, "SSH_CLIENT") ||
-			strings.Contains(environStr, "SSH_TTY") ||
-			strings.Contains(environStr, "TMUX") ||
-			strings.Contains(environStr, "TERM_PROGRAM") {
-			res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
-		} else {
-			res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+		// Detect orphaned auxiliary processes (e.g. iazio-mcp stdio helper whose parent exited)
+		if auxName, isAux := isAuxiliaryTool(cmdArgs[0]); isAux {
+			statBytes, _ := os.ReadFile(filepath.Join("/proc", name, "stat"))
+			statFields := strings.Fields(string(statBytes))
+			ppid := 0
+			if len(statFields) > 3 {
+				ppid, _ = strconv.Atoi(statFields[3])
+			}
+			if ppid == 1 || !isPIDAlive(ppid) {
+				res.OrphanedProcesses = append(res.OrphanedProcesses, fmt.Sprintf("%s (PID %d, PPID %d)", auxName, pid, ppid))
+			}
 		}
-		return
 	}
 
-	// No running agent PID found
-	if res.LockDetails != "" {
-		res.ToolLiveness = "KILLED"
-		res.ASEState = "ORPHANED"
-		res.ExecutionProvenance = "COORDINATED_HARNESS_FAILED"
-	} else if res.ASEState == "FAILED_DIRTY" || !res.IsClean {
-		res.ToolLiveness = "TERMINATED"
+	// If no running agent tool PID was found
+	if res.AgentTool == "" {
+		if res.LockDetails != "" {
+			res.ToolLiveness = "KILLED"
+			res.ASEState = "ORPHANED"
+			res.ExecutionProvenance = "COORDINATED_HARNESS_FAILED"
+		} else if res.WorktreeState == "DIRTY_MODIFIED" && res.ASEState == "IDLE" {
+			res.ASEState = "FAILED_DIRTY"
+			res.ToolLiveness = "TERMINATED"
+		} else if !res.IsClean {
+			res.ToolLiveness = "TERMINATED"
+		}
 	}
 }
 
@@ -359,6 +442,94 @@ func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult)
 	}
 }
 
+// ReapOrphanedProcesses terminates any orphaned child/helper processes whose cwd is inside repoPath.
+func ReapOrphanedProcesses(ctx context.Context, repoPath string) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	cleanPath := filepath.Clean(repoPath)
+	procDir, err := os.Open("/proc")
+	if err != nil {
+		return err
+	}
+	defer procDir.Close()
+
+	entries, err := procDir.Readdirnames(-1)
+	if err != nil {
+		return err
+	}
+
+	for _, name := range entries {
+		pid, err := strconv.Atoi(name)
+		if err != nil || pid <= 1 {
+			continue
+		}
+		cwdPath := filepath.Join("/proc", name, "cwd")
+		targetCwd, err := os.Readlink(cwdPath)
+		if err != nil {
+			continue
+		}
+		if !strings.HasPrefix(filepath.Clean(targetCwd), cleanPath) {
+			continue
+		}
+
+		cmdlineBytes, _ := os.ReadFile(filepath.Join("/proc", name, "cmdline"))
+		cmdArgs := strings.Split(string(cmdlineBytes), "\x00")
+		if len(cmdArgs) == 0 || cmdArgs[0] == "" {
+			continue
+		}
+
+		_, isAux := isAuxiliaryTool(cmdArgs[0])
+		if !isAux {
+			continue
+		}
+
+		statBytes, _ := os.ReadFile(filepath.Join("/proc", name, "stat"))
+		statFields := strings.Fields(string(statBytes))
+		ppid := 0
+		if len(statFields) > 3 {
+			ppid, _ = strconv.Atoi(statFields[3])
+		}
+
+		if ppid == 1 || !isPIDAlive(ppid) {
+			_ = syscall.Kill(pid, syscall.SIGTERM)
+			time.Sleep(50 * time.Millisecond)
+			if isPIDAlive(pid) {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	}
+	return nil
+}
+
+// ResetASELocks removes stale lock files and resets .autopilot/state.json to IDLE.
+func ResetASELocks(repoPath string) error {
+	cleanPath := filepath.Clean(repoPath)
+	locks := []string{
+		filepath.Join(cleanPath, ".autopilot", "lock"),
+		filepath.Join(cleanPath, ".ase", "active.lock"),
+		filepath.Join(cleanPath, ".index.yml.lock"),
+	}
+	for _, l := range locks {
+		_ = os.Remove(l)
+	}
+
+	stateFile := filepath.Join(cleanPath, ".autopilot", "state.json")
+	if b, err := os.ReadFile(stateFile); err == nil {
+		var s map[string]any
+		if json.Unmarshal(b, &s) == nil {
+			s["state"] = "IDLE"
+			s["lock"] = nil
+			s["active_job_id"] = ""
+			s["updated_at"] = time.Now().UTC().Format(time.RFC3339)
+			if updated, errM := json.MarshalIndent(s, "", "  "); errM == nil {
+				_ = os.WriteFile(stateFile, updated, 0o644)
+			}
+		}
+	}
+	return nil
+}
+
 func buildDiagnosticSummary(res *RepoFleetStatusResult) {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Repository: %s\n", res.RepoPath))
@@ -369,10 +540,18 @@ func buildDiagnosticSummary(res *RepoFleetStatusResult) {
 	sb.WriteString("\n")
 
 	if res.IsClean {
-		sb.WriteString("Working Tree: CLEAN\n")
+		if res.WorktreeState == "CLEAN_SUBMODULE_DRIFT" {
+			sb.WriteString("Working Tree: CLEAN (SUBMODULE SHA DRIFT)\n")
+		} else {
+			sb.WriteString("Working Tree: CLEAN\n")
+		}
 	} else {
-		sb.WriteString(fmt.Sprintf("Working Tree: DIRTY (%d modified, %d untracked)\n",
-			len(res.ModifiedFiles), len(res.UntrackedFiles)))
+		sb.WriteString(fmt.Sprintf("Working Tree: %s (%d modified, %d untracked)\n",
+			res.WorktreeState, len(res.ModifiedFiles), len(res.UntrackedFiles)))
+	}
+
+	if len(res.SubmoduleDrift) > 0 {
+		sb.WriteString(fmt.Sprintf("Submodule Drift: %s\n", strings.Join(res.SubmoduleDrift, ", ")))
 	}
 
 	if res.SubmodulesClean {
@@ -390,6 +569,10 @@ func buildDiagnosticSummary(res *RepoFleetStatusResult) {
 
 	if res.LockDetails != "" {
 		sb.WriteString(fmt.Sprintf("Active Locks: %s\n", res.LockDetails))
+	}
+
+	if len(res.OrphanedProcesses) > 0 {
+		sb.WriteString(fmt.Sprintf("Orphaned Helper Processes: %s\n", strings.Join(res.OrphanedProcesses, ", ")))
 	}
 
 	if res.AgentTool != "" {

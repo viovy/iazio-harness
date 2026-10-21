@@ -92,4 +92,41 @@ func TestInspectRepoFleetStatus_DirtyAndLocked(t *testing.T) {
 	if res.LockDetails == "" {
 		t.Errorf("expected lock details, got empty")
 	}
+
+	// Test ResetASELocks
+	if err := ResetASELocks(tmpDir); err != nil {
+		t.Fatalf("ResetASELocks failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, ".autopilot", "lock")); !os.IsNotExist(err) {
+		t.Errorf("expected lock to be removed")
+	}
+}
+
+func TestSubmoduleDriftClassification(t *testing.T) {
+	// Porcelain v2 output with clean submodule commit drift (SC..)
+	driftOut := `# branch.oid 1111111111111111111111111111111111111111
+# branch.head main
+1 .M SC.. 160000 160000 160000 2222222222222222222222222222222222222222 3333333333333333333333333333333333333333 iazio-mcp
+`
+	res := &RepoFleetStatusResult{IsClean: true}
+	parseGitPorcelainV2(driftOut, res)
+
+	if len(res.SubmoduleDrift) != 1 || res.SubmoduleDrift[0] != "iazio-mcp" {
+		t.Errorf("expected submodule drift for iazio-mcp, got %v", res.SubmoduleDrift)
+	}
+	if len(res.DirtySubmodules) != 0 {
+		t.Errorf("expected no dirty submodules, got %v", res.DirtySubmodules)
+	}
+
+	// Porcelain v2 output with dirty submodule content (S.M.)
+	dirtyOut := `# branch.oid 1111111111111111111111111111111111111111
+# branch.head main
+1 .M S.M. 160000 160000 160000 2222222222222222222222222222222222222222 3333333333333333333333333333333333333333 iazio-web
+`
+	resDirty := &RepoFleetStatusResult{IsClean: true}
+	parseGitPorcelainV2(dirtyOut, resDirty)
+
+	if len(resDirty.DirtySubmodules) != 1 || !strings.Contains(resDirty.DirtySubmodules[0], "iazio-web") {
+		t.Errorf("expected dirty submodule for iazio-web, got %v", resDirty.DirtySubmodules)
+	}
 }
