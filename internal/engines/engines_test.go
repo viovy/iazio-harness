@@ -147,6 +147,16 @@ func TestArgvOrder(t *testing.T) {
 			cwd:  "/repos/leaf-01",
 		},
 		{
+			name: "autopilot-story-execution",
+			req: ExecutionRequest{
+				Engine: "autopilot", Kind: "story_execution",
+				StoryID: "STORY-GOV-3576",
+				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
+			},
+			want: []string{"autopilot", "story", "run", "--story", "STORY-GOV-3576"},
+			cwd:  "/repos/leaf-01",
+		},
+		{
 			name: "autopilot-story-begin",
 			req: ExecutionRequest{
 				Engine: "autopilot", Kind: "story_begin",
