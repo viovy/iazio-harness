@@ -545,6 +545,12 @@ func buildDiagnosticSummary(res *RepoFleetStatusResult) {
 	} else {
 		sb.WriteString(fmt.Sprintf("Working Tree: %s (%d modified, %d untracked)\n",
 			res.WorktreeState, len(res.ModifiedFiles), len(res.UntrackedFiles)))
+		for _, f := range res.ModifiedFiles {
+			sb.WriteString(fmt.Sprintf("  M  %s\n", f))
+		}
+		for _, f := range res.UntrackedFiles {
+			sb.WriteString(fmt.Sprintf("  ?? %s\n", f))
+		}
 	}
 
 	if len(res.SubmoduleDrift) > 0 {

@@ -125,7 +125,7 @@ func TestPromptValuesLookupAndSafeJobID(t *testing.T) {
 		JobID: "job-fallback-non-resume",
 		Body:  "implement {{.StoryID}}",
 	})
-	if err != nil || !strings.Contains(nonResumeRes.Prompt, "resume complete current ase flow") {
+	if err != nil || !strings.Contains(nonResumeRes.Prompt, "STORY-RESUME-INPLACE") {
 		t.Errorf("expected default fallback story ID, got %v, res=%+v", err, nonResumeRes)
 	}
 }

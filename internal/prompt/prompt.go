@@ -80,7 +80,7 @@ func Prepare(in Input) (Result, error) {
 		if in.Kind == "resume" {
 			values.StoryID = "STORY-RESUME-INPLACE"
 		} else {
-			values.StoryID = "resume complete current ase flow"
+			values.StoryID = "STORY-RESUME-INPLACE"
 		}
 	}
 	var transcriptPath string

@@ -178,7 +178,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		if job.Kind == "resume" {
 			storyID = "STORY-RESUME-INPLACE"
 		} else {
-			storyID = "resume complete current ase flow"
+			storyID = "STORY-RESUME-INPLACE"
 		}
 	}
 
