@@ -92,6 +92,12 @@ func TestInspectRepoFleetStatus_DirtyAndLocked(t *testing.T) {
 	if res.LockDetails == "" {
 		t.Errorf("expected lock details, got empty")
 	}
+	if !strings.Contains(res.DiagnosticSummary, "  M  file.txt") {
+		t.Errorf("summary missing modified file: %s", res.DiagnosticSummary)
+	}
+	if !strings.Contains(res.DiagnosticSummary, "  ?? untracked.go") {
+		t.Errorf("summary missing untracked file: %s", res.DiagnosticSummary)
+	}
 
 	// Test ResetASELocks
 	if err := ResetASELocks(tmpDir); err != nil {
