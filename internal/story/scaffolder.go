@@ -72,7 +72,7 @@ func (s *Scaffolder) ScaffoldStory(ctx context.Context, payload StoryPayload) (*
 
 	// Intelligent story hub resolution: if submodule does not have its own docs/stories
 	// and fleet root does have docs/stories, target the centralized fleet backlog
-	if submodule != "." && submodule != "meta-repo" {
+	if submodule != "." && submodule != "" {
 		if fi, err := os.Stat(storiesDir); err != nil || !fi.IsDir() {
 			fleetStories := filepath.Join(s.fleetRoot, "docs", "stories")
 			if fFi, fErr := os.Stat(fleetStories); fErr == nil && fFi.IsDir() {
