@@ -19,6 +19,8 @@ import (
 
 var ErrNoSessionFound = errors.New("no matching session found")
 
+const storyPrefix = "STORY-"
+
 var (
 	storyIDRegex       = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]+)\b`)
 	prefixStoryRegex   = regexp.MustCompile(`(?i)\b([a-z0-9]{2,10})-([0-9]{3,5})\b`)
@@ -30,8 +32,8 @@ var (
 func ExtractStoryID(s string) string {
 	if m := frontmatterIDRegex.FindStringSubmatch(s); len(m) > 1 {
 		val := strings.TrimSpace(m[1])
-		if !strings.HasPrefix(strings.ToUpper(val), "STORY-") {
-			val = "STORY-" + strings.ToUpper(val)
+		if !strings.HasPrefix(strings.ToUpper(val), storyPrefix) {
+			val = storyPrefix + strings.ToUpper(val)
 		}
 		return strings.ToUpper(val)
 	}
@@ -39,7 +41,7 @@ func ExtractStoryID(s string) string {
 		return strings.ToUpper(m[1])
 	}
 	if m := prefixStoryRegex.FindStringSubmatch(s); len(m) > 2 {
-		return "STORY-" + strings.ToUpper(m[1]) + "-" + m[2]
+		return storyPrefix + strings.ToUpper(m[1]) + "-" + m[2]
 	}
 	return ""
 }

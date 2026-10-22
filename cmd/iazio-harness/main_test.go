@@ -600,4 +600,10 @@ func TestWriteErrorHelpers(t *testing.T) {
 	_ = run([]string{"story"})
 	_ = run([]string{"prompt"})
 	_ = run([]string{"codebase"})
+
+	tmpFleet := t.TempDir()
+	_ = run([]string{"fleet-status", "--repo=" + tmpFleet, "--json"})
+	_ = run([]string{"fleet-status", "--worktree-path", tmpFleet})
+	_ = run([]string{"heal-ase", "--repo=" + tmpFleet})
+	_ = run([]string{"heal-ase", "--worktree-path", tmpFleet})
 }

@@ -23,6 +23,8 @@ import (
 	"github.com/viovy/iazio-harness/internal/telemetry"
 )
 
+const fallbackResumeStoryID = "STORY-RESUME-INPLACE"
+
 var (
 	version = "0.1.0-dev"
 	commit  = "unknown"
@@ -168,18 +170,14 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	defer lock.Release()
 
 	storyID := job.StoryID
-	if strings.TrimSpace(storyID) == "" || strings.EqualFold(storyID, "STORY-RESUME-INPLACE") || strings.EqualFold(storyID, "resume complete current ase flow") {
+	if strings.TrimSpace(storyID) == "" || strings.EqualFold(storyID, fallbackResumeStoryID) || strings.EqualFold(storyID, "resume complete current ase flow") {
 		dCtx := sessionstore.DefaultResolver().DetectDirtyWorktreeContext(worktree)
 		if dCtx.StoryID != "" {
 			storyID = dCtx.StoryID
 		}
 	}
 	if strings.TrimSpace(storyID) == "" {
-		if job.Kind == "resume" {
-			storyID = "STORY-RESUME-INPLACE"
-		} else {
-			storyID = "STORY-RESUME-INPLACE"
-		}
+		storyID = fallbackResumeStoryID
 	}
 
 	prepRes, err := prompt.Prepare(prompt.Input{
@@ -278,7 +276,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	if job.Kind == "resume" {
 		resolver := sessionstore.DefaultResolver()
 		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
-		if (job.StoryID == "" || strings.EqualFold(job.StoryID, "STORY-RESUME-INPLACE") || strings.EqualFold(job.StoryID, "resume complete current ase flow")) && dCtx.StoryID != "" {
+		if (job.StoryID == "" || strings.EqualFold(job.StoryID, fallbackResumeStoryID) || strings.EqualFold(job.StoryID, "resume complete current ase flow")) && dCtx.StoryID != "" {
 			job.StoryID = dCtx.StoryID
 		}
 		if resumeConvID == "" {
