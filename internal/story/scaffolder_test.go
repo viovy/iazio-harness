@@ -405,8 +405,11 @@ func TestMaterializeLiveStory(t *testing.T) {
 	if os.Getenv("TEST_LIVE_MATERIALIZE") != "1" {
 		t.Skip("skipping live materialize test")
 	}
-	repoRoot := "/home/romeo/work/meta-repo"
-	err := MaterializePendingStories(context.Background(), repoRoot, "STORY-IAZIO_MCP-84089")
+	repoRoot := os.Getenv("LIVE_REPO_ROOT")
+	if repoRoot == "" {
+		t.Skip("skipping live materialize test without LIVE_REPO_ROOT")
+	}
+	err := MaterializePendingStories(context.Background(), repoRoot, "STORY-MCP-84089")
 	if err != nil {
 		t.Fatalf("MaterializePendingStories live failed: %v", err)
 	}

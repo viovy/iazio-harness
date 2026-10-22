@@ -640,6 +640,66 @@ func TestLogFileConversationIDPostExit(t *testing.T) {
 	}
 }
 
+func TestCliLogFallback_And_ConversationDBSensing(t *testing.T) {
+	shPath, sysPath := testShCommand(t)
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	agyLogDir := filepath.Join(dir, ".gemini", "antigravity-cli")
+	_ = os.MkdirAll(agyLogDir, 0o755)
+	cliLogFile := filepath.Join(agyLogDir, "cli.log")
+	uuid := "a9876543-21fe-dcba-9876-543210fedcba"
+
+	script := filepath.Join(dir, "run_agy_log.sh")
+	body := "#!/bin/sh\nsleep 0.05\necho 'Created conversation " + uuid + "' > \"" + filepath.ToSlash(cliLogFile) + "\"\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var capturedID string
+	var mu sync.Mutex
+	doneCapture := make(chan struct{})
+
+	stream := &testCaptureStream{}
+	eng := CLI{}
+	res, err := eng.Execute(context.Background(), ExecutionRequest{
+		Kind:         "execute",
+		WorktreePath: dir,
+		DocsHubPath:  dir,
+		Engine:       "agy",
+		Argv:         []string{shPath, script},
+		BaseEnv:      []string{"PATH=" + sysPath, "HOME=" + dir},
+		OnConversationID: func(cid string) {
+			mu.Lock()
+			capturedID = cid
+			mu.Unlock()
+			select {
+			case <-doneCapture:
+			default:
+				close(doneCapture)
+			}
+		},
+	}, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("exit code %d", res.ExitCode)
+	}
+
+	select {
+	case <-doneCapture:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for cli.log OnConversationID callback")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if capturedID != uuid {
+		t.Fatalf("expected %q, got %q", uuid, capturedID)
+	}
+}
+
 func TestHold_FallbackToGitDir(t *testing.T) {
 	work := t.TempDir()
 	gitDir := filepath.Join(work, ".git")

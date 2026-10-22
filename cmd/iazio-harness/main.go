@@ -18,9 +18,11 @@ import (
 	"github.com/viovy/iazio-harness/internal/diagnostics"
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/prompt"
+	"github.com/viovy/iazio-harness/internal/repolock"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 	"github.com/viovy/iazio-harness/internal/spool"
 	"github.com/viovy/iazio-harness/internal/telemetry"
+	"syscall"
 )
 
 const fallbackResumeStoryID = "STORY-RESUME-INPLACE"
@@ -245,6 +247,37 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 			log.Printf("[harness] Auto-discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
 		}
 	}
+	lockHandle, lockErr := repolock.Acquire(worktree, repolock.LockInfo{
+		JobID:          job.ID,
+		ScheduleID:     job.ScheduleID,
+		PID:            os.Getpid(),
+		Engine:         engineName,
+		ConversationID: resumeConvID,
+		StoryID:        job.StoryID,
+		Prompt:         job.Prompt,
+		Status:         "RUNNING",
+	}, func(pid int) bool {
+		if pid <= 0 {
+			return false
+		}
+		p, err := os.FindProcess(pid)
+		if err != nil {
+			return false
+		}
+		return p.Signal(syscall.Signal(0)) == nil
+	})
+	if lockErr != nil {
+		_ = sp.AppendRaw("stderr", []byte(fmt.Sprintf("[iazio-harness] Repository lock failure: %v\n", lockErr)))
+		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
+		return fmt.Errorf("repolock: %w", lockErr)
+	}
+	defer lockHandle.Release()
+
+	if resumeConvID == "" && lockHandle.Info().ConversationID != "" {
+		resumeConvID = lockHandle.Info().ConversationID
+		log.Printf("[harness] Adopted prior conversation %s from repo lock for %s", resumeConvID, worktree)
+	}
+
 	if resumeConvID != "" {
 		_ = controlplane.PostConversation(context.Background(), api, token, jobID, resumeConvID)
 	}
@@ -335,6 +368,17 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		ResumeConversationID:       resumeConvID,
 		OnPID: func(pid int) {
 			activePID = pid
+			_ = lockHandle.Update(repolock.LockInfo{
+				JobID:          job.ID,
+				ScheduleID:     job.ScheduleID,
+				PID:            os.Getpid(),
+				HarnessPID:     pid,
+				Engine:         engineName,
+				ConversationID: activeConvID,
+				StoryID:        job.StoryID,
+				Prompt:         job.Prompt,
+				Status:         "RUNNING",
+			})
 			_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
 				JobID:          job.ID,
 				ScheduleID:     job.ScheduleID,
@@ -349,6 +393,17 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		OnConversationID: func(cid string) {
 			if cid != "" {
 				activeConvID = cid
+				_ = lockHandle.Update(repolock.LockInfo{
+					JobID:          job.ID,
+					ScheduleID:     job.ScheduleID,
+					PID:            os.Getpid(),
+					HarnessPID:     activePID,
+					Engine:         engineName,
+					ConversationID: cid,
+					StoryID:        job.StoryID,
+					Prompt:         job.Prompt,
+					Status:         "RUNNING",
+				})
 				_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
 					JobID:          job.ID,
 					ScheduleID:     job.ScheduleID,
@@ -363,12 +418,12 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 				go func(c string) {
 					defer convWg.Done()
 					var err error
-					for attempt := 1; attempt <= 3; attempt++ {
+					for attempt := 1; attempt <= 10; attempt++ {
 						err = controlplane.PostConversation(context.Background(), api, token, jobID, c)
 						if err == nil {
 							return
 						}
-						time.Sleep(100 * time.Millisecond)
+						time.Sleep(time.Duration(attempt*100) * time.Millisecond)
 					}
 					if err != nil {
 						log.Printf("warning: failed to post conversation ID %s for job %s: %v", c, jobID, err)

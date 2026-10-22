@@ -289,6 +289,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentOut, mu: &convMu}
 	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentErr, mu: &convMu}
 
+	startTime := time.Now().Add(-2 * time.Second)
 	var logOffset int64
 	scanLogFile := func() {
 		convMu.Lock()
@@ -296,40 +297,82 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		if scanned {
 			return
 		}
-		f, err := os.Open(req.LogFile)
-		if err != nil {
-			return
+		if req.LogFile != "" {
+			f, err := os.Open(req.LogFile)
+			if err == nil {
+				defer f.Close()
+				fi, errS := f.Stat()
+				if errS == nil && fi.Size() > 0 {
+					if fi.Size() < logOffset {
+						logOffset = 0
+					}
+					readFrom := logOffset
+					if readFrom > 256 {
+						readFrom -= 256
+					} else {
+						readFrom = 0
+					}
+					if _, errSeek := f.Seek(readFrom, io.SeekStart); errSeek == nil {
+						data, errR := io.ReadAll(f)
+						if errR == nil && len(data) > 0 {
+							logOffset = fi.Size()
+							if cid := extractConversationIDFromText(string(data)); cid != "" {
+								scanned = true
+								req.OnConversationID(cid)
+								return
+							}
+						}
+					}
+				}
+			}
 		}
-		defer f.Close()
-		fi, err := f.Stat()
-		if err != nil || fi.Size() == 0 {
-			return
-		}
-		if fi.Size() < logOffset {
-			logOffset = 0
-		}
-		readFrom := logOffset
-		if readFrom > 256 {
-			readFrom -= 256
-		} else {
-			readFrom = 0
-		}
-		if _, err := f.Seek(readFrom, io.SeekStart); err != nil {
-			return
-		}
-		data, err := io.ReadAll(f)
-		if err == nil && len(data) > 0 {
-			logOffset = fi.Size()
-			if cid := extractConversationIDFromText(string(data)); cid != "" {
-				scanned = true
-				req.OnConversationID(cid)
+
+		// Also scan default ~/.gemini/antigravity-cli/cli.log as eager fallback
+		if home, errH := os.UserHomeDir(); errH == nil && home != "" {
+			cliLog := filepath.Join(home, ".gemini", "antigravity-cli", "cli.log")
+			if fi, errStat := os.Stat(cliLog); errStat == nil && fi.Size() > 0 {
+				if fCli, errO := os.Open(cliLog); errO == nil {
+					defer fCli.Close()
+					var seekPos int64
+					if fi.Size() > 16384 {
+						seekPos = fi.Size() - 16384
+					}
+					_, _ = fCli.Seek(seekPos, io.SeekStart)
+					dataCli, _ := io.ReadAll(fCli)
+					if len(dataCli) > 0 {
+						if cid := extractConversationIDFromText(string(dataCli)); cid != "" {
+							scanned = true
+							req.OnConversationID(cid)
+							return
+						}
+					}
+				}
+			}
+
+			// Also inspect newly created conversation DBs in ~/.gemini/antigravity-cli/conversations/
+			convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+			if entries, errD := os.ReadDir(convDir); errD == nil {
+				for _, entry := range entries {
+					if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".db") {
+						continue
+					}
+					info, errI := entry.Info()
+					if errI == nil && info.ModTime().After(startTime) {
+						cid := strings.TrimSuffix(entry.Name(), ".db")
+						if len(cid) >= 32 {
+							scanned = true
+							req.OnConversationID(cid)
+							return
+						}
+					}
+				}
 			}
 		}
 	}
 
-	if req.LogFile != "" && req.OnConversationID != nil {
+	if (req.LogFile != "" || req.Engine == "agy") && req.OnConversationID != nil {
 		go func() {
-			ticker := time.NewTicker(250 * time.Millisecond)
+			ticker := time.NewTicker(50 * time.Millisecond)
 			defer ticker.Stop()
 			for {
 				select {
