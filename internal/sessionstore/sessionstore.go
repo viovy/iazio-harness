@@ -19,19 +19,29 @@ import (
 
 var ErrNoSessionFound = errors.New("no matching session found")
 
+const storyPrefix = "STORY-"
+
 var (
-	storyIDRegex = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+-[0-9]+)\b`)
-	prefixStoryRegex = regexp.MustCompile(`(?i)\b([a-z0-9]{2,10})-([0-9]{3,5})\b`)
-	uuidRegex    = regexp.MustCompile(`(?i)\b([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b`)
+	storyIDRegex       = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]+)\b`)
+	prefixStoryRegex   = regexp.MustCompile(`(?i)\b([a-z0-9]{2,10})-([0-9]{3,5})\b`)
+	uuidRegex          = regexp.MustCompile(`(?i)\b([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b`)
+	frontmatterIDRegex = regexp.MustCompile(`(?im)^id:\s*["']?([A-Za-z0-9_-]+)["']?`)
 )
 
-// ExtractStoryID finds the canonical story ID (e.g. STORY-APP-0098) in a string or filename.
+// ExtractStoryID finds the canonical story ID (e.g. STORY-APP-0098) in a string, filename, or frontmatter.
 func ExtractStoryID(s string) string {
+	if m := frontmatterIDRegex.FindStringSubmatch(s); len(m) > 1 {
+		val := strings.TrimSpace(m[1])
+		if !strings.HasPrefix(strings.ToUpper(val), storyPrefix) {
+			val = storyPrefix + strings.ToUpper(val)
+		}
+		return strings.ToUpper(val)
+	}
 	if m := storyIDRegex.FindStringSubmatch(s); len(m) > 1 {
 		return strings.ToUpper(m[1])
 	}
 	if m := prefixStoryRegex.FindStringSubmatch(s); len(m) > 2 {
-		return "STORY-" + strings.ToUpper(m[1]) + "-" + m[2]
+		return storyPrefix + strings.ToUpper(m[1]) + "-" + m[2]
 	}
 	return ""
 }
@@ -164,6 +174,13 @@ func (r *Resolver) DetectDirtyWorktreeContext(worktree string) DirtyContext {
 				if sid := ExtractStoryID(filepath.Base(rel)); sid != "" {
 					ctx.StoryID = sid
 					break
+				}
+				fullPath := filepath.Join(worktree, rel)
+				if b, err := os.ReadFile(fullPath); err == nil {
+					if sid := ExtractStoryID(string(b)); sid != "" {
+						ctx.StoryID = sid
+						break
+					}
 				}
 			}
 		}

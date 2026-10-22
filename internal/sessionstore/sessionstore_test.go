@@ -233,6 +233,15 @@ conversation_id: "conv-dirty-1234"
 	if !ctx.IsDirty || ctx.StoryID != "STORY-APP-0099" {
 		t.Errorf("expected STORY-APP-0099 from dirty story file, got %+v", ctx)
 	}
+
+	// 6. Dirty story file where filename has no story ID, but frontmatter does
+	_ = os.Remove(filepath.Join(storyDir, "2026-10-20-app-0099-feature.story.md"))
+	timestampStory := "---\nid: STORY-GOV-POINTERS-20261021-134604\ntitle: Governance Pointers\n---\n# Story\n"
+	_ = os.WriteFile(filepath.Join(storyDir, "2026-10-21-governance-pointers-20261021-134604.story.md"), []byte(timestampStory), 0o644)
+	ctx = resolver.DetectDirtyWorktreeContext(gitDir)
+	if !ctx.IsDirty || ctx.StoryID != "STORY-GOV-POINTERS-20261021-134604" {
+		t.Errorf("expected STORY-GOV-POINTERS-20261021-134604 from frontmatter, got %+v", ctx)
+	}
 }
 
 func TestScanBrainSessionsByStory(t *testing.T) {

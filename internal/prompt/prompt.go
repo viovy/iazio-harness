@@ -77,11 +77,7 @@ func Prepare(in Input) (Result, error) {
 	}
 	values := in.Values
 	if strings.TrimSpace(values.StoryID) == "" {
-		if in.Kind == "resume" {
-			values.StoryID = "STORY-RESUME-INPLACE"
-		} else {
-			values.StoryID = "resume complete current ase flow"
-		}
+		values.StoryID = "STORY-RESUME-INPLACE"
 	}
 	var transcriptPath string
 	if in.Kind == KindStoryRefinement {

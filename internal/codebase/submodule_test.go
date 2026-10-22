@@ -86,3 +86,13 @@ func TestSubmoduleRegistrationAndResolution(t *testing.T) {
 		t.Fatal("expected error for unregistered submodule, got nil")
 	}
 }
+
+
+func TestCandidateFleetRoots(t *testing.T) {
+	t.Setenv("IAZIO_FLEET_ROOT", "/tmp/fleet-1")
+	t.Setenv("FLEET_ROOT", "/tmp/fleet-2")
+	roots := CandidateFleetRoots()
+	if len(roots) < 2 {
+		t.Errorf("expected at least 2 candidates, got %v", roots)
+	}
+}

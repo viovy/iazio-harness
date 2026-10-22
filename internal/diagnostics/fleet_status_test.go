@@ -92,6 +92,12 @@ func TestInspectRepoFleetStatus_DirtyAndLocked(t *testing.T) {
 	if res.LockDetails == "" {
 		t.Errorf("expected lock details, got empty")
 	}
+	if !strings.Contains(res.DiagnosticSummary, "  M  file.txt") {
+		t.Errorf("summary missing modified file: %s", res.DiagnosticSummary)
+	}
+	if !strings.Contains(res.DiagnosticSummary, "  ?? untracked.go") {
+		t.Errorf("summary missing untracked file: %s", res.DiagnosticSummary)
+	}
 
 	// Test ResetASELocks
 	if err := ResetASELocks(tmpDir); err != nil {
@@ -128,5 +134,63 @@ func TestSubmoduleDriftClassification(t *testing.T) {
 
 	if len(resDirty.DirtySubmodules) != 1 || !strings.Contains(resDirty.DirtySubmodules[0], "iazio-web") {
 		t.Errorf("expected dirty submodule for iazio-web, got %v", resDirty.DirtySubmodules)
+	}
+}
+
+
+func TestToolIdentificationAndLiveness(t *testing.T) {
+	if tool, ok := isAgentTool("/usr/local/bin/autopilot"); !ok || tool != "autopilot" {
+		t.Errorf("expected autopilot, got %s (%v)", tool, ok)
+	}
+	if _, ok := isAgentTool("/usr/bin/bash"); ok {
+		t.Errorf("expected false for bash")
+	}
+
+	if tool, ok := isAuxiliaryTool("/usr/bin/node"); !ok || tool != "node" {
+		t.Errorf("expected node, got %s (%v)", tool, ok)
+	}
+	if _, ok := isAuxiliaryTool("/usr/bin/unknown-tool"); ok {
+		t.Errorf("expected false for unknown-tool")
+	}
+
+	if isPIDAlive(-1) {
+		t.Errorf("expected PID -1 not alive")
+	}
+	if isPIDAlive(0) {
+		t.Errorf("expected PID 0 not alive")
+	}
+	if isPIDAlive(1) {
+		t.Errorf("expected PID 1 not alive per guard")
+	}
+	if !isPIDAlive(os.Getpid()) {
+		t.Errorf("expected current PID to be alive")
+	}
+
+	tmpDir := t.TempDir()
+	if err := ReapOrphanedProcesses(context.Background(), tmpDir); err != nil {
+		t.Errorf("ReapOrphanedProcesses failed: %v", err)
+	}
+}
+
+func TestParseSubmoduleStatusAndASE(t *testing.T) {
+	tmpDir := t.TempDir()
+	res := &RepoFleetStatusResult{IsClean: true}
+	subOut := " 1111111111111111111111111111111111111111 sub1 (heads/main)\n+2222222222222222222222222222222222222222 sub2 (v1.0)\n"
+	parseSubmoduleStatus(context.Background(), tmpDir, subOut, res)
+
+	apDir := filepath.Join(tmpDir, ".autopilot")
+	os.MkdirAll(apDir, 0755)
+	os.WriteFile(filepath.Join(apDir, "state.json"), []byte(`{"state":"RUNNING","active_job_id":"job-123","lock":{"pid":99999999}}`), 0644)
+	parseASEState(tmpDir, res)
+	if res.ASEState == "" {
+		t.Errorf("expected non-empty ASEState")
+	}
+
+	if err := ResetASELocks(tmpDir); err != nil {
+		t.Errorf("ResetASELocks failed: %v", err)
+	}
+	parseASEState(tmpDir, res)
+	if res.ASEState != "IDLE" {
+		t.Errorf("expected IDLE after reset, got %s", res.ASEState)
 	}
 }
