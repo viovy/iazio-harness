@@ -17,6 +17,8 @@ func TestSaveAndReadCheckpoint(t *testing.T) {
 		Engine:         "agy",
 		WorktreePath:   tempWorktree,
 		ConversationID: "conv-abc-789",
+		StoryID:        "STORY-TEST-001",
+		StepIndex:      2,
 		StartedAt:      time.Now().UTC().Format(time.RFC3339),
 		Status:         "RUNNING",
 		PID:            4242,
@@ -36,6 +38,12 @@ func TestSaveAndReadCheckpoint(t *testing.T) {
 	}
 	if loaded.ConversationID != state.ConversationID {
 		t.Errorf("expected ConversationID %s, got %s", state.ConversationID, loaded.ConversationID)
+	}
+	if loaded.StoryID != state.StoryID {
+		t.Errorf("expected StoryID %s, got %s", state.StoryID, loaded.StoryID)
+	}
+	if loaded.StepIndex != state.StepIndex {
+		t.Errorf("expected StepIndex %d, got %d", state.StepIndex, loaded.StepIndex)
 	}
 	if loaded.PID != 4242 {
 		t.Errorf("expected PID 4242, got %d", loaded.PID)

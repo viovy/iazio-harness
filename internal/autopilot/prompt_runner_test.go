@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/engines"
 )
 
 // TestAutopilotHelperProcess acts as a mock autopilot subprocess for unit tests.
@@ -280,5 +282,49 @@ func TestCLIPromptRunner_StoryDetection(t *testing.T) {
 	}
 	if !strings.Contains(res2.Summary, "story=STORY-DETECTED-222") {
 		t.Fatalf("expected story=STORY-DETECTED-222 in summary, got: %s", res2.Summary)
+	}
+}
+
+func TestCLIPromptRunner_PreFlightHookMaterialization(t *testing.T) {
+	fakeBin := makeFakeAutopilot(t)
+	repoDir := initTestGitRepo(t)
+
+	var hookInvoked bool
+	var hookStoryID string
+	var hookWorkDir string
+	origHook := engines.PreFlightHook
+	defer func() { engines.PreFlightHook = origHook }()
+
+	engines.PreFlightHook = func(ctx context.Context, workDir, storyID string) error {
+		hookInvoked = true
+		hookStoryID = storyID
+		hookWorkDir = workDir
+		return nil
+	}
+
+	runner := NewPromptRunner(fakeBin)
+	opts := RunPromptOptions{
+		PromptID:   "test-prompt-hook",
+		StoryID:    "STORY-HOOK-333",
+		Repo:       "test-submodule",
+		Prompt:     "Execute task for STORY-HOOK-333",
+		WorkingDir: repoDir,
+		Timeout:    5 * time.Second,
+	}
+	res, err := runner.RunPrompt(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("unexpected RunPrompt error: %v", err)
+	}
+	if !hookInvoked {
+		t.Fatal("expected PreFlightHook to be invoked for story execution")
+	}
+	if hookStoryID != "STORY-HOOK-333" {
+		t.Fatalf("expected hookStoryID STORY-HOOK-333, got %s", hookStoryID)
+	}
+	if hookWorkDir != repoDir {
+		t.Fatalf("expected hookWorkDir %s, got %s", repoDir, hookWorkDir)
+	}
+	if res.Status != "completed" {
+		t.Fatalf("expected completed status, got %s", res.Status)
 	}
 }

@@ -60,6 +60,7 @@ type ExecutionRequest struct {
 	LogFile                    string
 	ResumeConversationID       string
 	OnConversationID           func(string)
+	OnPID                      func(int)
 	// Argv, when non-empty, replaces BuildArgv. Tests use it to run a local program.
 	Argv []string
 	// BaseEnv, when non-nil, replaces the inherited environment before schedule and forced keys.
@@ -107,6 +108,7 @@ func (c CLI) HealthCheck() error {
 			candidates := []string{
 				filepath.Join(home, ".local", "bin", c.Name()),
 				filepath.Join(home, ".iazio", "bin", c.Name()),
+				filepath.Join(home, ".gemini", "antigravity-cli", "bin", c.Name()),
 			}
 			for _, cand := range candidates {
 				if fi, errS := os.Stat(cand); errS == nil && !fi.IsDir() {
@@ -198,6 +200,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		candidates := []string{
 			filepath.Join(home, ".local", "bin", bin),
 			filepath.Join(home, ".iazio", "bin", bin),
+			filepath.Join(home, ".gemini", "antigravity-cli", "bin", bin),
 		}
 		for _, cand := range candidates {
 			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
@@ -269,8 +272,13 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		return ExecutionResult{}, err
 	}
 	postStartProcessGroup(cmd)
-	if cmd.Process != nil && stream != nil {
-		_ = stream.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Spawned engine process %s with PID %d\n", filepath.Base(bin), cmd.Process.Pid)))
+	if cmd.Process != nil {
+		if stream != nil {
+			_ = stream.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Spawned engine process %s with PID %d\n", filepath.Base(bin), cmd.Process.Pid)))
+		}
+		if req.OnPID != nil {
+			req.OnPID(cmd.Process.Pid)
+		}
 	}
 	done := make(chan struct{})
 	go watchCancel(ctx, cmd, done)
@@ -281,6 +289,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentOut, mu: &convMu}
 	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentErr, mu: &convMu}
 
+	startTime := time.Now().Add(-2 * time.Second)
 	var logOffset int64
 	scanLogFile := func() {
 		convMu.Lock()
@@ -288,40 +297,82 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		if scanned {
 			return
 		}
-		f, err := os.Open(req.LogFile)
-		if err != nil {
-			return
+		if req.LogFile != "" {
+			f, err := os.Open(req.LogFile)
+			if err == nil {
+				defer f.Close()
+				fi, errS := f.Stat()
+				if errS == nil && fi.Size() > 0 {
+					if fi.Size() < logOffset {
+						logOffset = 0
+					}
+					readFrom := logOffset
+					if readFrom > 256 {
+						readFrom -= 256
+					} else {
+						readFrom = 0
+					}
+					if _, errSeek := f.Seek(readFrom, io.SeekStart); errSeek == nil {
+						data, errR := io.ReadAll(f)
+						if errR == nil && len(data) > 0 {
+							logOffset = fi.Size()
+							if cid := extractConversationIDFromText(string(data)); cid != "" {
+								scanned = true
+								req.OnConversationID(cid)
+								return
+							}
+						}
+					}
+				}
+			}
 		}
-		defer f.Close()
-		fi, err := f.Stat()
-		if err != nil || fi.Size() == 0 {
-			return
-		}
-		if fi.Size() < logOffset {
-			logOffset = 0
-		}
-		readFrom := logOffset
-		if readFrom > 256 {
-			readFrom -= 256
-		} else {
-			readFrom = 0
-		}
-		if _, err := f.Seek(readFrom, io.SeekStart); err != nil {
-			return
-		}
-		data, err := io.ReadAll(f)
-		if err == nil && len(data) > 0 {
-			logOffset = fi.Size()
-			if cid := extractConversationIDFromText(string(data)); cid != "" {
-				scanned = true
-				req.OnConversationID(cid)
+
+		// Also scan default ~/.gemini/antigravity-cli/cli.log as eager fallback
+		if home, errH := os.UserHomeDir(); errH == nil && home != "" {
+			cliLog := filepath.Join(home, ".gemini", "antigravity-cli", "cli.log")
+			if fi, errStat := os.Stat(cliLog); errStat == nil && fi.Size() > 0 {
+				if fCli, errO := os.Open(cliLog); errO == nil {
+					defer fCli.Close()
+					var seekPos int64
+					if fi.Size() > 16384 {
+						seekPos = fi.Size() - 16384
+					}
+					_, _ = fCli.Seek(seekPos, io.SeekStart)
+					dataCli, _ := io.ReadAll(fCli)
+					if len(dataCli) > 0 {
+						if cid := extractConversationIDFromText(string(dataCli)); cid != "" {
+							scanned = true
+							req.OnConversationID(cid)
+							return
+						}
+					}
+				}
+			}
+
+			// Also inspect newly created conversation DBs in ~/.gemini/antigravity-cli/conversations/
+			convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+			if entries, errD := os.ReadDir(convDir); errD == nil {
+				for _, entry := range entries {
+					if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".db") {
+						continue
+					}
+					info, errI := entry.Info()
+					if errI == nil && info.ModTime().After(startTime) {
+						cid := strings.TrimSuffix(entry.Name(), ".db")
+						if len(cid) >= 32 {
+							scanned = true
+							req.OnConversationID(cid)
+							return
+						}
+					}
+				}
 			}
 		}
 	}
 
-	if req.LogFile != "" && req.OnConversationID != nil {
+	if (req.LogFile != "" || req.Engine == "agy") && req.OnConversationID != nil {
 		go func() {
-			ticker := time.NewTicker(250 * time.Millisecond)
+			ticker := time.NewTicker(50 * time.Millisecond)
 			defer ticker.Stop()
 			for {
 				select {
@@ -553,6 +604,7 @@ func ResolveDynamicTool(engine string, priorityList []string) string {
 			candidates := []string{
 				filepath.Join(home, ".local", "bin", tool),
 				filepath.Join(home, ".iazio", "bin", tool),
+				filepath.Join(home, ".gemini", "antigravity-cli", "bin", tool),
 			}
 			for _, cand := range candidates {
 				if fi, errS := os.Stat(cand); errS == nil && !fi.IsDir() {
@@ -593,7 +645,17 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		if model == "" {
 			model = "gemini-3.8-flash-high"
 		}
-		argv := []string{"agy", "--print", req.Prompt, "--print-timeout", timeout, "--model", model}
+		prompt := req.Prompt
+		if req.ResumeConversationID != "" && (prompt == "" || strings.EqualFold(strings.TrimSpace(prompt), "resume") || req.Kind == "resume") {
+			prompt = "resume"
+		}
+		bin := "agy"
+		if _, err := exec.LookPath(bin); err != nil {
+			if _, errG := exec.LookPath("gemini"); errG == nil {
+				bin = "gemini"
+			}
+		}
+		argv := []string{bin, "--print", prompt, "--print-timeout", timeout, "--model", model}
 		if req.ResumeConversationID != "" {
 			argv = append(argv, "--conversation", req.ResumeConversationID)
 		}

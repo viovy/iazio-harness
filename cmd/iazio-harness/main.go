@@ -18,9 +18,11 @@ import (
 	"github.com/viovy/iazio-harness/internal/diagnostics"
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/prompt"
+	"github.com/viovy/iazio-harness/internal/repolock"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 	"github.com/viovy/iazio-harness/internal/spool"
 	"github.com/viovy/iazio-harness/internal/telemetry"
+	"syscall"
 )
 
 const fallbackResumeStoryID = "STORY-RESUME-INPLACE"
@@ -89,7 +91,7 @@ func run(args []string) error {
 }
 
 func runJob(args []string) error {
-	var api, jobID, worktree, docsHub, chunk string
+	var api, jobID, worktree, docsHub, chunk, kind, resumeConv string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--api-url":
@@ -117,6 +119,16 @@ func runJob(args []string) error {
 			if i < len(args) {
 				chunk = args[i]
 			}
+		case "--kind":
+			i++
+			if i < len(args) {
+				kind = args[i]
+			}
+		case "--resume-conversation", "--conversation":
+			i++
+			if i < len(args) {
+				resumeConv = args[i]
+			}
 		}
 	}
 	if api == "" {
@@ -138,16 +150,29 @@ func runJob(args []string) error {
 	if chunk != "" {
 		return controlplane.PostChunk(context.Background(), api, "", jobID, "stdout", chunk)
 	}
-	return executeJob(context.Background(), api, jobID, worktree, docsHub)
+	return executeJob(context.Background(), api, jobID, worktree, docsHub, kind, resumeConv)
 }
 
-func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error {
+func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
+	var kindOverride, resumeConvOverride string
+	if len(overrides) > 0 {
+		kindOverride = overrides[0]
+	}
+	if len(overrides) > 1 {
+		resumeConvOverride = overrides[1]
+	}
 	token, _ := auth.Bearer(ctx)
 	job, err := controlplane.GetJob(ctx, api, token, jobID)
 	if err != nil {
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: get job %s: %v\n", jobID, err))
 		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
 		return fmt.Errorf("get job: %w", err)
+	}
+	if kindOverride != "" {
+		job.Kind = kindOverride
+	}
+	if resumeConvOverride != "" {
+		job.ResumeConversationID = resumeConvOverride
 	}
 	if worktree == "" {
 		worktree = job.WorktreePath
@@ -212,15 +237,92 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		engineName = "agy"
 	}
 
+	resumeConvID := job.ResumeConversationID
+	if resumeConvID == "" && job.EnvVars != nil {
+		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
+	}
+	if job.Kind == "resume" {
+		resolver := sessionstore.DefaultResolver()
+		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
+		if (job.StoryID == "" || strings.EqualFold(job.StoryID, fallbackResumeStoryID) || strings.EqualFold(job.StoryID, "resume complete current ase flow")) && dCtx.StoryID != "" {
+			job.StoryID = dCtx.StoryID
+		}
+		if resumeConvID == "" {
+			if dCtx.ConversationID != "" {
+				resumeConvID = dCtx.ConversationID
+				log.Printf("[harness] Discovered prior conversation %s from dirty context (review: %s, verdict: %s)", resumeConvID, dCtx.ReviewFile, dCtx.Verdict)
+			} else if job.StoryID != "" {
+				if sess, err := resolver.ResolveForStory(worktree, job.StoryID); err == nil && sess != nil {
+					resumeConvID = sess.ConversationID
+				}
+			} else {
+				if sess, err := resolver.ResolveLatest(worktree); err == nil && sess != nil {
+					resumeConvID = sess.ConversationID
+				}
+			}
+		}
+		if resumeConvID != "" {
+			lowConv := strings.ToLower(resumeConvID)
+			if !strings.HasPrefix(lowConv, "cursor-") && engineName == "agent" {
+				engineName = "agy"
+				log.Printf("[harness] Auto-corrected engine from agent to agy for session %s", resumeConvID)
+			}
+			log.Printf("[harness] Auto-discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
+		}
+	}
+	lockHandle, lockErr := repolock.Acquire(worktree, repolock.LockInfo{
+		JobID:          job.ID,
+		ScheduleID:     job.ScheduleID,
+		PID:            os.Getpid(),
+		Engine:         engineName,
+		ConversationID: resumeConvID,
+		StoryID:        job.StoryID,
+		Prompt:         job.Prompt,
+		Status:         "RUNNING",
+	}, func(pid int) bool {
+		if pid <= 0 {
+			return false
+		}
+		p, err := os.FindProcess(pid)
+		if err != nil {
+			return false
+		}
+		return p.Signal(syscall.Signal(0)) == nil
+	})
+	if lockErr != nil {
+		_ = sp.AppendRaw("stderr", []byte(fmt.Sprintf("[iazio-harness] Repository lock failure: %v\n", lockErr)))
+		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
+		return fmt.Errorf("repolock: %w", lockErr)
+	}
+	defer lockHandle.Release()
+
+	if resumeConvID == "" && lockHandle.Info().ConversationID != "" && (job.Kind == "resume" || (job.StoryID != "" && lockHandle.Info().StoryID == job.StoryID && lockHandle.Info().Status != "COMPLETED")) {
+		resumeConvID = lockHandle.Info().ConversationID
+		log.Printf("[harness] Adopted prior conversation %s from repo lock for %s", resumeConvID, worktree)
+	}
+
+	if resumeConvID != "" {
+		_ = controlplane.PostConversation(context.Background(), api, token, jobID, resumeConvID)
+	}
+
+	var activePID int
+	activeConvID := resumeConvID
+
 	// Immediately post startup diagnostic chunk so UI never sits on blank "Waiting for output..."
 	_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Initializing execution for job %s on %s (engine: %s, kind: %s)\n", jobID, worktree, engineName, job.Kind)))
+	if resumeConvID != "" {
+		_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Resuming execution: conversation %s (story: %s, engine: %s)\n", resumeConvID, job.StoryID, engineName)))
+	}
 	_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
-		JobID:        job.ID,
-		ScheduleID:   job.ScheduleID,
-		Engine:       engineName,
-		WorktreePath: worktree,
-		StartedAt:    time.Now().UTC().Format(time.RFC3339),
-		Status:       "RUNNING",
+		JobID:          job.ID,
+		ScheduleID:     job.ScheduleID,
+		Engine:         engineName,
+		WorktreePath:   worktree,
+		ConversationID: activeConvID,
+		StoryID:        job.StoryID,
+		StepIndex:      0,
+		StartedAt:      time.Now().UTC().Format(time.RFC3339),
+		Status:         "RUNNING",
 	})
 
 	flushCtx, stopFlush := context.WithCancel(ctx)
@@ -269,47 +371,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	if job.MaxExecutionDurationSeconds > 0 {
 		printTimeout = fmt.Sprintf("%ds", job.MaxExecutionDurationSeconds)
 	}
-	resumeConvID := job.ResumeConversationID
-	if resumeConvID == "" && job.EnvVars != nil {
-		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
-	}
-	if job.Kind == "resume" {
-		resolver := sessionstore.DefaultResolver()
-		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
-		if (job.StoryID == "" || strings.EqualFold(job.StoryID, fallbackResumeStoryID) || strings.EqualFold(job.StoryID, "resume complete current ase flow")) && dCtx.StoryID != "" {
-			job.StoryID = dCtx.StoryID
-		}
-		if resumeConvID == "" {
-			if dCtx.ConversationID != "" {
-				resumeConvID = dCtx.ConversationID
-				log.Printf("[harness] Discovered prior conversation %s from dirty context (review: %s, verdict: %s)", resumeConvID, dCtx.ReviewFile, dCtx.Verdict)
-			} else if job.StoryID != "" {
-				if sess, err := resolver.ResolveForStory(worktree, job.StoryID); err == nil && sess != nil {
-					resumeConvID = sess.ConversationID
-				}
-			} else {
-				if sess, err := resolver.ResolveLatest(worktree); err == nil && sess != nil {
-					resumeConvID = sess.ConversationID
-				}
-			}
-		}
-		if resumeConvID != "" {
-			lowConv := strings.ToLower(resumeConvID)
-			if !strings.HasPrefix(lowConv, "cursor-") && engineName == "agent" {
-				engineName = "agy"
-				log.Printf("[harness] Auto-corrected engine from agent to agy for session %s", resumeConvID)
-			}
-			log.Printf("[harness] Auto-discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
-			_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Resuming execution: auto-discovered conversation %s (story: %s, engine: %s)\n", resumeConvID, job.StoryID, engineName)))
-		}
-	}
-	if resumeConvID != "" {
-		_ = controlplane.PostConversation(context.Background(), api, token, jobID, resumeConvID)
-	}
 	modelName, agentName, disableSlashCommands := resolveExecutionOptions(job, prepRes.Prompt)
 	runner := engines.CLI{Engine: engineName}
 
 	var convWg sync.WaitGroup
+
 	execReq := engines.ExecutionRequest{
 		Engine:                     engineName,
 		Kind:                       job.Kind,
@@ -325,14 +391,55 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		ScheduleEnv:                job.EnvVars,
 		LogFile:                    filepath.Join(spool.DefaultDir(), jobID+".engine.log"),
 		ResumeConversationID:       resumeConvID,
+		OnPID: func(pid int) {
+			activePID = pid
+			_ = lockHandle.Update(repolock.LockInfo{
+				JobID:          job.ID,
+				ScheduleID:     job.ScheduleID,
+				PID:            os.Getpid(),
+				HarnessPID:     pid,
+				Engine:         engineName,
+				ConversationID: activeConvID,
+				StoryID:        job.StoryID,
+				Prompt:         job.Prompt,
+				Status:         "RUNNING",
+			})
+			_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
+				JobID:          job.ID,
+				ScheduleID:     job.ScheduleID,
+				Engine:         engineName,
+				WorktreePath:   worktree,
+				ConversationID: activeConvID,
+				StoryID:        job.StoryID,
+				StepIndex:      1,
+				PID:            pid,
+				StartedAt:      time.Now().UTC().Format(time.RFC3339),
+				Status:         "RUNNING",
+			})
+		},
 		OnConversationID: func(cid string) {
 			if cid != "" {
+				activeConvID = cid
+				_ = lockHandle.Update(repolock.LockInfo{
+					JobID:          job.ID,
+					ScheduleID:     job.ScheduleID,
+					PID:            os.Getpid(),
+					HarnessPID:     activePID,
+					Engine:         engineName,
+					ConversationID: cid,
+					StoryID:        job.StoryID,
+					Prompt:         job.Prompt,
+					Status:         "RUNNING",
+				})
 				_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
 					JobID:          job.ID,
 					ScheduleID:     job.ScheduleID,
 					Engine:         engineName,
 					WorktreePath:   worktree,
 					ConversationID: cid,
+					StoryID:        job.StoryID,
+					StepIndex:      2,
+					PID:            activePID,
 					StartedAt:      time.Now().UTC().Format(time.RFC3339),
 					Status:         "RUNNING",
 				})
@@ -340,12 +447,12 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 				go func(c string) {
 					defer convWg.Done()
 					var err error
-					for attempt := 1; attempt <= 3; attempt++ {
+					for attempt := 1; attempt <= 10; attempt++ {
 						err = controlplane.PostConversation(context.Background(), api, token, jobID, c)
 						if err == nil {
 							return
 						}
-						time.Sleep(100 * time.Millisecond)
+						time.Sleep(time.Duration(attempt*100) * time.Millisecond)
 					}
 					if err != nil {
 						log.Printf("warning: failed to post conversation ID %s for job %s: %v", c, jobID, err)
@@ -486,7 +593,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		ScheduleID:     job.ScheduleID,
 		Engine:         engineName,
 		WorktreePath:   worktree,
-		ConversationID: resumeConvID,
+		ConversationID: activeConvID,
+		StoryID:        job.StoryID,
+		StepIndex:      3,
 		StartedAt:      time.Now().UTC().Format(time.RFC3339),
 		Status:         finalStatus,
 		ExitCode:       execRes.ExitCode,

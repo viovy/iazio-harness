@@ -385,6 +385,9 @@ func TestMaterializePendingStories(t *testing.T) {
 	if !strings.Contains(string(idxBytes), "STORY-REMOTE-001") {
 		t.Errorf("expected index.yml to contain STORY-REMOTE-001, got: %s", string(idxBytes))
 	}
+	if !strings.Contains(string(idxBytes), "path: docs/stories/story-remote-001.story.md") {
+		t.Errorf("expected index.yml to contain path: docs/stories/..., got: %s", string(idxBytes))
+	}
 
 	// Calling again should detect existing file and not fail even if API server is closed
 	mockServer.Close()
@@ -395,6 +398,20 @@ func TestMaterializePendingStories(t *testing.T) {
 	// Verify engines.PreFlightHook is wired
 	if engines.PreFlightHook == nil {
 		t.Error("expected engines.PreFlightHook to be wired")
+	}
+}
+
+func TestMaterializeLiveStory(t *testing.T) {
+	if os.Getenv("TEST_LIVE_MATERIALIZE") != "1" {
+		t.Skip("skipping live materialize test")
+	}
+	repoRoot := os.Getenv("LIVE_REPO_ROOT")
+	if repoRoot == "" {
+		t.Skip("skipping live materialize test without LIVE_REPO_ROOT")
+	}
+	err := MaterializePendingStories(context.Background(), repoRoot, "STORY-MCP-84089")
+	if err != nil {
+		t.Fatalf("MaterializePendingStories live failed: %v", err)
 	}
 }
 
