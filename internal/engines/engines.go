@@ -60,6 +60,7 @@ type ExecutionRequest struct {
 	LogFile                    string
 	ResumeConversationID       string
 	OnConversationID           func(string)
+	OnPID                      func(int)
 	// Argv, when non-empty, replaces BuildArgv. Tests use it to run a local program.
 	Argv []string
 	// BaseEnv, when non-nil, replaces the inherited environment before schedule and forced keys.
@@ -107,6 +108,7 @@ func (c CLI) HealthCheck() error {
 			candidates := []string{
 				filepath.Join(home, ".local", "bin", c.Name()),
 				filepath.Join(home, ".iazio", "bin", c.Name()),
+				filepath.Join(home, ".gemini", "antigravity-cli", "bin", c.Name()),
 			}
 			for _, cand := range candidates {
 				if fi, errS := os.Stat(cand); errS == nil && !fi.IsDir() {
@@ -198,6 +200,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		candidates := []string{
 			filepath.Join(home, ".local", "bin", bin),
 			filepath.Join(home, ".iazio", "bin", bin),
+			filepath.Join(home, ".gemini", "antigravity-cli", "bin", bin),
 		}
 		for _, cand := range candidates {
 			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
@@ -269,8 +272,13 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		return ExecutionResult{}, err
 	}
 	postStartProcessGroup(cmd)
-	if cmd.Process != nil && stream != nil {
-		_ = stream.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Spawned engine process %s with PID %d\n", filepath.Base(bin), cmd.Process.Pid)))
+	if cmd.Process != nil {
+		if stream != nil {
+			_ = stream.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Spawned engine process %s with PID %d\n", filepath.Base(bin), cmd.Process.Pid)))
+		}
+		if req.OnPID != nil {
+			req.OnPID(cmd.Process.Pid)
+		}
 	}
 	done := make(chan struct{})
 	go watchCancel(ctx, cmd, done)
@@ -553,6 +561,7 @@ func ResolveDynamicTool(engine string, priorityList []string) string {
 			candidates := []string{
 				filepath.Join(home, ".local", "bin", tool),
 				filepath.Join(home, ".iazio", "bin", tool),
+				filepath.Join(home, ".gemini", "antigravity-cli", "bin", tool),
 			}
 			for _, cand := range candidates {
 				if fi, errS := os.Stat(cand); errS == nil && !fi.IsDir() {
@@ -593,7 +602,17 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		if model == "" {
 			model = "gemini-3.8-flash-high"
 		}
-		argv := []string{"agy", "--print", req.Prompt, "--print-timeout", timeout, "--model", model}
+		prompt := req.Prompt
+		if req.ResumeConversationID != "" && (prompt == "" || strings.EqualFold(strings.TrimSpace(prompt), "resume") || req.Kind == "resume") {
+			prompt = "resume"
+		}
+		bin := "agy"
+		if _, err := exec.LookPath(bin); err != nil {
+			if _, errG := exec.LookPath("gemini"); errG == nil {
+				bin = "gemini"
+			}
+		}
+		argv := []string{bin, "--print", prompt, "--print-timeout", timeout, "--model", model}
 		if req.ResumeConversationID != "" {
 			argv = append(argv, "--conversation", req.ResumeConversationID)
 		}

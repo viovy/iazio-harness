@@ -212,15 +212,59 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		engineName = "agy"
 	}
 
+	resumeConvID := job.ResumeConversationID
+	if resumeConvID == "" && job.EnvVars != nil {
+		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
+	}
+	if job.Kind == "resume" {
+		resolver := sessionstore.DefaultResolver()
+		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
+		if (job.StoryID == "" || strings.EqualFold(job.StoryID, fallbackResumeStoryID) || strings.EqualFold(job.StoryID, "resume complete current ase flow")) && dCtx.StoryID != "" {
+			job.StoryID = dCtx.StoryID
+		}
+		if resumeConvID == "" {
+			if dCtx.ConversationID != "" {
+				resumeConvID = dCtx.ConversationID
+				log.Printf("[harness] Discovered prior conversation %s from dirty context (review: %s, verdict: %s)", resumeConvID, dCtx.ReviewFile, dCtx.Verdict)
+			} else if job.StoryID != "" {
+				if sess, err := resolver.ResolveForStory(worktree, job.StoryID); err == nil && sess != nil {
+					resumeConvID = sess.ConversationID
+				}
+			} else {
+				if sess, err := resolver.ResolveLatest(worktree); err == nil && sess != nil {
+					resumeConvID = sess.ConversationID
+				}
+			}
+		}
+		if resumeConvID != "" {
+			lowConv := strings.ToLower(resumeConvID)
+			if !strings.HasPrefix(lowConv, "cursor-") && engineName == "agent" {
+				engineName = "agy"
+				log.Printf("[harness] Auto-corrected engine from agent to agy for session %s", resumeConvID)
+			}
+			log.Printf("[harness] Auto-discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
+		}
+	}
+	if resumeConvID != "" {
+		_ = controlplane.PostConversation(context.Background(), api, token, jobID, resumeConvID)
+	}
+
+	var activePID int
+	activeConvID := resumeConvID
+
 	// Immediately post startup diagnostic chunk so UI never sits on blank "Waiting for output..."
 	_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Initializing execution for job %s on %s (engine: %s, kind: %s)\n", jobID, worktree, engineName, job.Kind)))
+	if resumeConvID != "" {
+		_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Resuming execution: conversation %s (story: %s, engine: %s)\n", resumeConvID, job.StoryID, engineName)))
+	}
 	_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
-		JobID:        job.ID,
-		ScheduleID:   job.ScheduleID,
-		Engine:       engineName,
-		WorktreePath: worktree,
-		StartedAt:    time.Now().UTC().Format(time.RFC3339),
-		Status:       "RUNNING",
+		JobID:          job.ID,
+		ScheduleID:     job.ScheduleID,
+		Engine:         engineName,
+		WorktreePath:   worktree,
+		ConversationID: activeConvID,
+		StartedAt:      time.Now().UTC().Format(time.RFC3339),
+		Status:         "RUNNING",
 	})
 
 	flushCtx, stopFlush := context.WithCancel(ctx)
@@ -269,47 +313,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	if job.MaxExecutionDurationSeconds > 0 {
 		printTimeout = fmt.Sprintf("%ds", job.MaxExecutionDurationSeconds)
 	}
-	resumeConvID := job.ResumeConversationID
-	if resumeConvID == "" && job.EnvVars != nil {
-		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
-	}
-	if job.Kind == "resume" {
-		resolver := sessionstore.DefaultResolver()
-		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
-		if (job.StoryID == "" || strings.EqualFold(job.StoryID, fallbackResumeStoryID) || strings.EqualFold(job.StoryID, "resume complete current ase flow")) && dCtx.StoryID != "" {
-			job.StoryID = dCtx.StoryID
-		}
-		if resumeConvID == "" {
-			if dCtx.ConversationID != "" {
-				resumeConvID = dCtx.ConversationID
-				log.Printf("[harness] Discovered prior conversation %s from dirty context (review: %s, verdict: %s)", resumeConvID, dCtx.ReviewFile, dCtx.Verdict)
-			} else if job.StoryID != "" {
-				if sess, err := resolver.ResolveForStory(worktree, job.StoryID); err == nil && sess != nil {
-					resumeConvID = sess.ConversationID
-				}
-			} else {
-				if sess, err := resolver.ResolveLatest(worktree); err == nil && sess != nil {
-					resumeConvID = sess.ConversationID
-				}
-			}
-		}
-		if resumeConvID != "" {
-			lowConv := strings.ToLower(resumeConvID)
-			if !strings.HasPrefix(lowConv, "cursor-") && engineName == "agent" {
-				engineName = "agy"
-				log.Printf("[harness] Auto-corrected engine from agent to agy for session %s", resumeConvID)
-			}
-			log.Printf("[harness] Auto-discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
-			_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Resuming execution: auto-discovered conversation %s (story: %s, engine: %s)\n", resumeConvID, job.StoryID, engineName)))
-		}
-	}
-	if resumeConvID != "" {
-		_ = controlplane.PostConversation(context.Background(), api, token, jobID, resumeConvID)
-	}
 	modelName, agentName, disableSlashCommands := resolveExecutionOptions(job, prepRes.Prompt)
 	runner := engines.CLI{Engine: engineName}
 
 	var convWg sync.WaitGroup
+
 	execReq := engines.ExecutionRequest{
 		Engine:                     engineName,
 		Kind:                       job.Kind,
@@ -325,14 +333,29 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		ScheduleEnv:                job.EnvVars,
 		LogFile:                    filepath.Join(spool.DefaultDir(), jobID+".engine.log"),
 		ResumeConversationID:       resumeConvID,
+		OnPID: func(pid int) {
+			activePID = pid
+			_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
+				JobID:          job.ID,
+				ScheduleID:     job.ScheduleID,
+				Engine:         engineName,
+				WorktreePath:   worktree,
+				ConversationID: activeConvID,
+				PID:            pid,
+				StartedAt:      time.Now().UTC().Format(time.RFC3339),
+				Status:         "RUNNING",
+			})
+		},
 		OnConversationID: func(cid string) {
 			if cid != "" {
+				activeConvID = cid
 				_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
 					JobID:          job.ID,
 					ScheduleID:     job.ScheduleID,
 					Engine:         engineName,
 					WorktreePath:   worktree,
 					ConversationID: cid,
+					PID:            activePID,
 					StartedAt:      time.Now().UTC().Format(time.RFC3339),
 					Status:         "RUNNING",
 				})
@@ -486,7 +509,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		ScheduleID:     job.ScheduleID,
 		Engine:         engineName,
 		WorktreePath:   worktree,
-		ConversationID: resumeConvID,
+		ConversationID: activeConvID,
 		StartedAt:      time.Now().UTC().Format(time.RFC3339),
 		Status:         finalStatus,
 		ExitCode:       execRes.ExitCode,

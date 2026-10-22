@@ -202,11 +202,12 @@ func MaterializeStoryFile(repoRoot, storyID, filename, content string) error {
 const storyFileExt = ".story.md"
 
 type remoteStoryDetail struct {
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	Status  string `json:"status"`
-	Path    string `json:"path"`
-	Content string `json:"content"`
+	ID         string   `json:"id"`
+	Title      string   `json:"title"`
+	Status     string   `json:"status"`
+	Path       string   `json:"path"`
+	Content    string   `json:"content"`
+	Submodules []string `json:"submodules,omitempty"`
 }
 
 func storyExistsOnDisk(repoRoot, storyID string) bool {
@@ -312,11 +313,15 @@ func MaterializePendingStories(ctx context.Context, repoRoot, storyID string) er
 	}
 
 	storiesDir := filepath.Join(repoRoot, "docs", "stories")
-	ensureStoryInIndex(storiesDir, storyID, detail.Title, filepath.Join("docs", "stories", targetName))
+	var sub string
+	if len(detail.Submodules) > 0 {
+		sub = detail.Submodules[0]
+	}
+	ensureStoryInIndex(storiesDir, storyID, detail.Title, filepath.Join("docs", "stories", targetName), sub)
 	return nil
 }
 
-func ensureStoryInIndex(storiesDir, storyID, title, relativePath string) {
+func ensureStoryInIndex(storiesDir, storyID, title, relativePath string, submodules ...string) {
 	indexPath := filepath.Join(storiesDir, "index.yml")
 	content, err := os.ReadFile(indexPath)
 	if err != nil {
@@ -325,7 +330,12 @@ func ensureStoryInIndex(storiesDir, storyID, title, relativePath string) {
 	if strings.Contains(string(content), storyID) {
 		return
 	}
-	entry := fmt.Sprintf("\n  - id: %s\n    title: %q\n    status: pending\n    file: %s\n", storyID, title, relativePath)
+	subStr := ""
+	if len(submodules) > 0 && submodules[0] != "" {
+		subStr = fmt.Sprintf("      submodules:\n        - %s\n", submodules[0])
+	}
+	entry := fmt.Sprintf("\n    - id: %s\n      title: %q\n      status: pending\n      priority: P3\n      path: %s\n%s      created_at: %q\n      updated_at: %q\n",
+		storyID, title, filepath.ToSlash(relativePath), subStr, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
 	_ = os.WriteFile(indexPath, append(content, []byte(entry)...), 0o644)
 }
 

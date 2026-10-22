@@ -109,6 +109,16 @@ func TestArgvOrder(t *testing.T) {
 			cwd:  "/repos/leaf-01",
 		},
 		{
+			name: "agy autonomous resume prompt",
+			req: ExecutionRequest{
+				Engine: "agy", Prompt: "", Kind: "resume",
+				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
+				ResumeConversationID: "conv-uuid-789",
+			},
+			want: []string{"agy", "--print", "resume", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--conversation", "conv-uuid-789", "--dangerously-skip-permissions"},
+			cwd:  "/repos/leaf-01",
+		},
+		{
 			name: "agent explicit model",
 			req: ExecutionRequest{
 				Engine: "agent", Prompt: "build feature", Kind: "execute",

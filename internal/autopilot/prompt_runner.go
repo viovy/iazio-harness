@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -137,6 +138,12 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	if storyID == "" {
 		if m := storyIDRegex.FindStringSubmatch(opts.Prompt); len(m) > 1 {
 			storyID = m[1]
+		}
+	}
+
+	if storyID != "" && engines.PreFlightHook != nil {
+		if pfErr := engines.PreFlightHook(ctx, opts.WorkingDir, storyID); pfErr != nil {
+			log.Printf("[prompt_runner] warning: PreFlightHook materialization error for story %s: %v", storyID, pfErr)
 		}
 	}
 
