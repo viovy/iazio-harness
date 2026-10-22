@@ -91,7 +91,7 @@ func run(args []string) error {
 }
 
 func runJob(args []string) error {
-	var api, jobID, worktree, docsHub, chunk string
+	var api, jobID, worktree, docsHub, chunk, kind, resumeConv string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--api-url":
@@ -119,6 +119,16 @@ func runJob(args []string) error {
 			if i < len(args) {
 				chunk = args[i]
 			}
+		case "--kind":
+			i++
+			if i < len(args) {
+				kind = args[i]
+			}
+		case "--resume-conversation", "--conversation":
+			i++
+			if i < len(args) {
+				resumeConv = args[i]
+			}
 		}
 	}
 	if api == "" {
@@ -140,16 +150,29 @@ func runJob(args []string) error {
 	if chunk != "" {
 		return controlplane.PostChunk(context.Background(), api, "", jobID, "stdout", chunk)
 	}
-	return executeJob(context.Background(), api, jobID, worktree, docsHub)
+	return executeJob(context.Background(), api, jobID, worktree, docsHub, kind, resumeConv)
 }
 
-func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error {
+func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
+	var kindOverride, resumeConvOverride string
+	if len(overrides) > 0 {
+		kindOverride = overrides[0]
+	}
+	if len(overrides) > 1 {
+		resumeConvOverride = overrides[1]
+	}
 	token, _ := auth.Bearer(ctx)
 	job, err := controlplane.GetJob(ctx, api, token, jobID)
 	if err != nil {
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: get job %s: %v\n", jobID, err))
 		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
 		return fmt.Errorf("get job: %w", err)
+	}
+	if kindOverride != "" {
+		job.Kind = kindOverride
+	}
+	if resumeConvOverride != "" {
+		job.ResumeConversationID = resumeConvOverride
 	}
 	if worktree == "" {
 		worktree = job.WorktreePath
@@ -273,7 +296,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 	}
 	defer lockHandle.Release()
 
-	if resumeConvID == "" && lockHandle.Info().ConversationID != "" {
+	if resumeConvID == "" && lockHandle.Info().ConversationID != "" && (job.Kind == "resume" || (job.StoryID != "" && lockHandle.Info().StoryID == job.StoryID && lockHandle.Info().Status != "COMPLETED")) {
 		resumeConvID = lockHandle.Info().ConversationID
 		log.Printf("[harness] Adopted prior conversation %s from repo lock for %s", resumeConvID, worktree)
 	}
@@ -296,6 +319,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		Engine:         engineName,
 		WorktreePath:   worktree,
 		ConversationID: activeConvID,
+		StoryID:        job.StoryID,
+		StepIndex:      0,
 		StartedAt:      time.Now().UTC().Format(time.RFC3339),
 		Status:         "RUNNING",
 	})
@@ -385,6 +410,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 				Engine:         engineName,
 				WorktreePath:   worktree,
 				ConversationID: activeConvID,
+				StoryID:        job.StoryID,
+				StepIndex:      1,
 				PID:            pid,
 				StartedAt:      time.Now().UTC().Format(time.RFC3339),
 				Status:         "RUNNING",
@@ -410,6 +437,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 					Engine:         engineName,
 					WorktreePath:   worktree,
 					ConversationID: cid,
+					StoryID:        job.StoryID,
+					StepIndex:      2,
 					PID:            activePID,
 					StartedAt:      time.Now().UTC().Format(time.RFC3339),
 					Status:         "RUNNING",
@@ -565,6 +594,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string) error
 		Engine:         engineName,
 		WorktreePath:   worktree,
 		ConversationID: activeConvID,
+		StoryID:        job.StoryID,
+		StepIndex:      3,
 		StartedAt:      time.Now().UTC().Format(time.RFC3339),
 		Status:         finalStatus,
 		ExitCode:       execRes.ExitCode,

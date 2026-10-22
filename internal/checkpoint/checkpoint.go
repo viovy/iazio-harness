@@ -15,6 +15,8 @@ type State struct {
 	Engine         string `json:"engine"`
 	WorktreePath   string `json:"worktree_path"`
 	ConversationID string `json:"conversation_id,omitempty"`
+	StoryID        string `json:"story_id,omitempty"`
+	StepIndex      int    `json:"step_index,omitempty"`
 	StartedAt      string `json:"started_at"`
 	UpdatedAt      string `json:"updated_at"`
 	Status         string `json:"status"` // "RUNNING", "COMPLETED", "FAILED"
@@ -25,6 +27,33 @@ type State struct {
 
 // CheckpointFileName is the file name stored under .iazio/ in the worktree.
 const CheckpointFileName = "execution-checkpoint.json"
+
+func atomicWriteFile(target string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(target)
+	tmpFile, err := os.CreateTemp(dir, ".tmp-ckpt-*")
+	if err != nil {
+		return os.WriteFile(target, data, perm)
+	}
+	tmpName := tmpFile.Name()
+	defer func() {
+		_ = os.Remove(tmpName)
+	}()
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, target)
+}
 
 // Save writes the execution state to both the worktree's .iazio directory and the spool directory.
 func Save(worktree, spoolDir string, state State) error {
@@ -46,7 +75,7 @@ func Save(worktree, spoolDir string, state State) error {
 				_ = os.WriteFile(giPath, []byte("*\n"), 0o644)
 			}
 			target := filepath.Join(iazioDir, CheckpointFileName)
-			_ = os.WriteFile(target, data, 0o644)
+			_ = atomicWriteFile(target, data, 0o644)
 		}
 	}
 
@@ -54,7 +83,7 @@ func Save(worktree, spoolDir string, state State) error {
 	if spoolDir != "" && state.JobID != "" {
 		if err := os.MkdirAll(spoolDir, 0o755); err == nil {
 			target := filepath.Join(spoolDir, state.JobID+".checkpoint.json")
-			_ = os.WriteFile(target, data, 0o644)
+			_ = atomicWriteFile(target, data, 0o644)
 		}
 	}
 
