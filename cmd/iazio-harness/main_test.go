@@ -606,4 +606,27 @@ func TestWriteErrorHelpers(t *testing.T) {
 	_ = run([]string{"fleet-status", "--worktree-path", tmpFleet})
 	_ = run([]string{"heal-ase", "--repo=" + tmpFleet})
 	_ = run([]string{"heal-ase", "--worktree-path", tmpFleet})
+
+	// Service commands dry-run and actions
+	if err := run([]string{"service", "install", "--dry-run"}); err != nil {
+		t.Errorf("unexpected error on service install --dry-run: %v", err)
+	}
+	if err := run([]string{"service", "dev-install", "--dry-run"}); err != nil {
+		t.Errorf("unexpected error on service dev-install --dry-run: %v", err)
+	}
+	if err := run([]string{"service", "pause", "--dry-run"}); err != nil {
+		t.Errorf("unexpected error on service pause --dry-run: %v", err)
+	}
+	if err := run([]string{"service", "resume", "--dry-run"}); err != nil {
+		t.Errorf("unexpected error on service resume --dry-run: %v", err)
+	}
+	if err := run([]string{"service", "revive-check", "--dry-run"}); err != nil {
+		t.Errorf("unexpected error on service revive-check --dry-run: %v", err)
+	}
+	if err := run([]string{"service", "status"}); err != nil {
+		t.Errorf("unexpected error on service status: %v", err)
+	}
+	if err := run([]string{"service", "invalid-action"}); err == nil {
+		t.Errorf("expected error on unknown service action")
+	}
 }
