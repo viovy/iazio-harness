@@ -94,12 +94,22 @@ func PostChunk(ctx context.Context, baseURL, token, jobID, stream, text string) 
 	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/chunks", token, raw, "chunk post")
 }
 
-// PostTick pulses an execution keepalive tick when the engine is silent.
-func PostTick(ctx context.Context, baseURL, token, jobID string, silentForMs int64) error {
-	raw, err := json.Marshal(map[string]any{
+// PostTick pulses an execution keepalive tick when the engine is silent, optionally transmitting telemetry PIDs and elapsed time.
+func PostTick(ctx context.Context, baseURL, token, jobID string, silentForMs int64, telemetryOpts ...int) error {
+	payload := map[string]any{
 		"type":          "OUTPUT_TICK",
 		"silent_for_ms": silentForMs,
-	})
+	}
+	if len(telemetryOpts) > 0 && telemetryOpts[0] > 0 {
+		payload["harness_pid"] = telemetryOpts[0]
+	}
+	if len(telemetryOpts) > 1 && telemetryOpts[1] > 0 {
+		payload["tool_pid"] = telemetryOpts[1]
+	}
+	if len(telemetryOpts) > 2 {
+		payload["elapsed_seconds"] = telemetryOpts[2]
+	}
+	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}

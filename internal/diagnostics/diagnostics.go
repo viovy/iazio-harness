@@ -543,7 +543,8 @@ func createSIR(input DiagnosticInput, report DiagnosticReport) *SIRRecord {
 			break
 		} else if f.Code == CodeDirtyWorktreePostExit {
 			category = "INCOMPLETE_DIRTY_WORKTREE"
-			remediation = f.Remediation
+			autoHeal = true
+			remediation = "Autonomously resume execution in same conversation ID with allow_dirty to complete story flow."
 			summary = f.Message
 		} else if f.Code == CodeSlashCommandIgnored {
 			category = "HARNESS_CONFIGURATION"

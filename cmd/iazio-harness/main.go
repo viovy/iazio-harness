@@ -325,6 +325,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		Status:         "RUNNING",
 	})
 
+	startTime := time.Now()
 	flushCtx, stopFlush := context.WithCancel(ctx)
 	defer stopFlush()
 	go func() {
@@ -348,7 +349,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 						}
 					} else if ev.Type == spool.EventOutputTick {
 						if now.Sub(lastTickSent) >= 5*time.Second {
-							if err := controlplane.PostTick(context.Background(), api, token, jobID, ev.SilentForMs); err != nil {
+							elapsedSec := int(time.Since(startTime).Seconds())
+							if err := controlplane.PostTick(context.Background(), api, token, jobID, ev.SilentForMs, os.Getpid(), activePID, elapsedSec); err != nil {
 								log.Printf("[harness] post tick failed for %s: %v", jobID, err)
 							} else {
 								lastTickSent = now
@@ -358,7 +360,10 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 						// so the user in iazio-web can see the process is alive and waiting for model response
 						if ev.SilentForMs >= 30000 && now.Sub(lastSilenceWarning) >= 30*time.Second {
 							lastSilenceWarning = now
-							diag := fmt.Sprintf("[iazio-harness] Execution active (job %s, engine: %s); silent for %ds (waiting for model output/response)...\n", jobID, engineName, ev.SilentForMs/1000)
+							harnessPID := os.Getpid()
+							elapsedStr := time.Since(startTime).Truncate(time.Second).String()
+							diag := fmt.Sprintf("[iazio-harness] Execution active (job %s, engine: %s, harness_pid: %d, tool_pid: %d, elapsed: %s); silent for %ds (waiting for model output/response)...\n",
+								jobID, engineName, harnessPID, activePID, elapsedStr, ev.SilentForMs/1000)
 							_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", diag)
 						}
 					}
@@ -367,7 +372,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 	}()
 
-	printTimeout := "10m"
+	printTimeout := "0"
 	if job.MaxExecutionDurationSeconds > 0 {
 		printTimeout = fmt.Sprintf("%ds", job.MaxExecutionDurationSeconds)
 	}
