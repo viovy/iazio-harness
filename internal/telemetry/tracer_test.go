@@ -268,16 +268,16 @@ func TestResolveZipkinFromConfig(t *testing.T) {
 	}
 
 	// Derived from harness_api (standard port)
-	cfgDerived := `{"endpoints":{"harness_api":"https://tian.go.ro/iazio-harness-api"}}`
+	cfgDerived := `{"endpoints":{"harness_api":"https://api.example.com/iazio-harness-api"}}`
 	_ = os.WriteFile(filepath.Join(iazioDir, "config.json"), []byte(cfgDerived), 0o644)
-	if got := resolveZipkinFromConfig(); got != "https://tian.go.ro/zipkin" {
-		t.Fatalf("expected derived zipkin URL https://tian.go.ro/zipkin, got %s", got)
+	if got := resolveZipkinFromConfig(); got != "https://api.example.com/zipkin" {
+		t.Fatalf("expected derived zipkin URL https://api.example.com/zipkin, got %s", got)
 	}
 
 	// Derived from harness_api (custom port)
-	cfgCustomPort := `{"endpoints":{"harness_api":"http://192.168.0.88:8080"}}`
+	cfgCustomPort := `{"endpoints":{"harness_api":"http://127.0.0.1:8080"}}`
 	_ = os.WriteFile(filepath.Join(iazioDir, "config.json"), []byte(cfgCustomPort), 0o644)
-	if got := resolveZipkinFromConfig(); got != "http://192.168.0.88:9411" {
+	if got := resolveZipkinFromConfig(); got != "http://127.0.0.1:9411" {
 		t.Fatalf("expected derived zipkin URL with port 9411, got %s", got)
 	}
 }
