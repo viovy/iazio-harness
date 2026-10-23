@@ -640,6 +640,8 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		timeout := req.PrintTimeout
 		if timeout == "" {
 			timeout = "10m"
+		} else if timeout == "0" || timeout == "0s" {
+			timeout = "0"
 		}
 		model := req.Model
 		if model == "" {

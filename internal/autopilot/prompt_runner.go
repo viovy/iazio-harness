@@ -151,12 +151,14 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	// If the prompt targets story execution via autopilot, route directly to the standard
 	// built-in `autopilot story run --story <ID>`, eliminating exit 99 across older host runtimes.
 	var args []string
-	if storyID != "" && (targetAgent == "autopilot" || targetAgent == "" || targetAgent == "auto") {
+	if storyID != "" && targetAgent == "autopilot" && strings.TrimSpace(opts.Prompt) == "" {
 		args = []string{"story", "run", "--story", storyID}
 	} else {
 		args = []string{"prompt", "run", "--file", tmpPath}
-		if targetAgent != "" {
+		if targetAgent != "" && targetAgent != "auto" {
 			args = append(args, "--target-agent", targetAgent)
+		} else {
+			args = append(args, "--target-agent", "agy")
 		}
 		if opts.Title != "" {
 			args = append(args, "--title", opts.Title)

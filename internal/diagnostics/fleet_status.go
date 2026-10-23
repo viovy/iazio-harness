@@ -27,7 +27,8 @@ type RepoFleetStatusResult struct {
 	UntrackedFiles       []string `json:"untracked_files"`
 	SubmodulesClean      bool     `json:"submodules_clean"`
 	DirtySubmodules      []string `json:"dirty_submodules"`
-	WorktreeState        string   `json:"worktree_state"` // CLEAN, CLEAN_SUBMODULE_DRIFT, DIRTY_UNTRACKED_ONLY, DIRTY_MODIFIED
+	NonMainSubmodules    []string `json:"non_main_submodules,omitempty"`
+	WorktreeState        string   `json:"worktree_state"` // CLEAN, CLEAN_SUBMODULE_DRIFT, DIRTY_UNTRACKED_ONLY, DIRTY_MODIFIED, BRANCH_NOT_MAIN, SUBMODULES_NOT_MAIN
 	SubmoduleDrift       []string `json:"submodule_drift,omitempty"`
 	OrphanedProcesses    []string `json:"orphaned_processes,omitempty"`
 	ASEState             string   `json:"ase_state"` // IDLE, RUNNING, SUSPENDED_HITL, FAILED_DIRTY, ORPHANED
@@ -93,12 +94,20 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 	hasUntrackedFiles := len(res.UntrackedFiles) > 0
 	hasDirtySubmodules := len(res.DirtySubmodules) > 0
 	hasSubmoduleDrift := len(res.SubmoduleDrift) > 0
+	hasNonMainSubmodules := len(res.NonMainSubmodules) > 0
+	isMainBranch := res.Branch == "main" || res.Branch == "master"
 
 	if hasModifiedFiles || hasDirtySubmodules {
 		res.WorktreeState = "DIRTY_MODIFIED"
 		res.IsClean = false
 	} else if hasUntrackedFiles {
 		res.WorktreeState = "DIRTY_UNTRACKED_ONLY"
+		res.IsClean = false
+	} else if !isMainBranch {
+		res.WorktreeState = "BRANCH_NOT_MAIN"
+		res.IsClean = false
+	} else if hasNonMainSubmodules {
+		res.WorktreeState = "SUBMODULES_NOT_MAIN"
 		res.IsClean = false
 	} else if hasSubmoduleDrift {
 		res.WorktreeState = "CLEAN_SUBMODULE_DRIFT"
@@ -107,7 +116,7 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 		res.WorktreeState = "CLEAN"
 		res.IsClean = true
 	}
-	res.SubmodulesClean = (len(res.DirtySubmodules) == 0)
+	res.SubmodulesClean = (len(res.DirtySubmodules) == 0 && len(res.NonMainSubmodules) == 0)
 
 	// 3. ASE State & Autopilot locks
 	parseASEState(cleanPath, res)
@@ -191,11 +200,21 @@ func parseSubmoduleStatus(ctx context.Context, cleanPath string, out string, res
 			fullSubPath := filepath.Join(cleanPath, subPath)
 			hasUncommitted := false
 
-			// Deep check: inspect the submodule worktree itself for uncommitted files
+			// Deep check: inspect the submodule worktree itself for uncommitted files and current branch
 			if stat, err := os.Stat(fullSubPath); err == nil && stat.IsDir() {
 				subStatusCmd := exec.CommandContext(ctx, "git", "-C", fullSubPath, "status", "--porcelain")
 				if subOut, err := subStatusCmd.Output(); err == nil && len(strings.TrimSpace(string(subOut))) > 0 {
 					hasUncommitted = true
+				}
+				branchCmd := exec.CommandContext(ctx, "git", "-C", fullSubPath, "branch", "--show-current")
+				if bOut, err := branchCmd.Output(); err == nil {
+					currBranch := strings.TrimSpace(string(bOut))
+					if currBranch == "" {
+						currBranch = "detached"
+					}
+					if currBranch != "main" && currBranch != "master" {
+						res.NonMainSubmodules = append(res.NonMainSubmodules, fmt.Sprintf("%s (on %s)", subPath, currBranch))
+					}
 				}
 			}
 
@@ -568,10 +587,20 @@ func buildDiagnosticSummary(res *RepoFleetStatusResult) {
 	}
 
 	if res.SubmodulesClean {
-		sb.WriteString("Submodules: ALL CLEAN\n")
+		sb.WriteString("Submodules: ALL CLEAN (ON PRIMARY MAIN)\n")
 	} else {
-		sb.WriteString(fmt.Sprintf("Submodules: DIRTY / DRIFT DETECTED (%s)\n",
-			strings.Join(res.DirtySubmodules, ", ")))
+		var details []string
+		if len(res.DirtySubmodules) > 0 {
+			details = append(details, fmt.Sprintf("dirty: %s", strings.Join(res.DirtySubmodules, ", ")))
+		}
+		if len(res.NonMainSubmodules) > 0 {
+			details = append(details, fmt.Sprintf("non-main branches: %s", strings.Join(res.NonMainSubmodules, ", ")))
+		}
+		if len(details) == 0 {
+			details = append(details, "submodules not aligned with primary main branch")
+		}
+		sb.WriteString(fmt.Sprintf("Submodules: INCOMPLETE / NON-MAIN / DIRTY DETECTED (%s)\n",
+			strings.Join(details, "; ")))
 	}
 
 	sb.WriteString(fmt.Sprintf("ASE State: %s", res.ASEState))

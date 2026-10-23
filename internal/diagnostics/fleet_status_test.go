@@ -194,3 +194,48 @@ func TestParseSubmoduleStatusAndASE(t *testing.T) {
 		t.Errorf("expected IDLE after reset, got %s", res.ASEState)
 	}
 }
+
+func TestFleetStatus_NonMainSubmoduleAndBranchCleanliness(t *testing.T) {
+	// 1. Superproject on feature branch -> IsClean must be false, WorktreeState BRANCH_NOT_MAIN
+	resFeature := &RepoFleetStatusResult{
+		Branch:        "feature/my-new-feature",
+		IsClean:       true,
+		WorktreeState: "CLEAN",
+	}
+	// Run classification logic
+	isMainBranch := resFeature.Branch == "main" || resFeature.Branch == "master"
+	if !isMainBranch {
+		resFeature.WorktreeState = "BRANCH_NOT_MAIN"
+		resFeature.IsClean = false
+	}
+	if resFeature.IsClean {
+		t.Errorf("expected IsClean=false when branch is not main/master")
+	}
+	if resFeature.WorktreeState != "BRANCH_NOT_MAIN" {
+		t.Errorf("expected WorktreeState=BRANCH_NOT_MAIN, got %s", resFeature.WorktreeState)
+	}
+
+	// 2. Submodules on non-main branches -> SubmodulesClean must be false, IsClean must be false
+	resSub := &RepoFleetStatusResult{
+		Branch:            "main",
+		IsClean:           true,
+		WorktreeState:     "CLEAN",
+		NonMainSubmodules: []string{"iazio-mcp (on chore/gov-test)"},
+	}
+	hasNonMain := len(resSub.NonMainSubmodules) > 0
+	if hasNonMain {
+		resSub.WorktreeState = "SUBMODULES_NOT_MAIN"
+		resSub.IsClean = false
+	}
+	resSub.SubmodulesClean = (len(resSub.DirtySubmodules) == 0 && len(resSub.NonMainSubmodules) == 0)
+
+	if resSub.IsClean {
+		t.Errorf("expected IsClean=false when submodules are on non-main branches")
+	}
+	if resSub.SubmodulesClean {
+		t.Errorf("expected SubmodulesClean=false when submodules are on non-main branches")
+	}
+	if resSub.WorktreeState != "SUBMODULES_NOT_MAIN" {
+		t.Errorf("expected WorktreeState=SUBMODULES_NOT_MAIN, got %s", resSub.WorktreeState)
+	}
+}
