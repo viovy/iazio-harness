@@ -129,6 +129,15 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	if req.Engine != "" && c.Engine != req.Engine {
 		c.Engine = req.Engine
 	}
+	// If engine is set to iazio-harness or contains harness, auto-correct engine to autopilot or agy
+	if strings.Contains(strings.ToLower(req.Engine), "harness") || strings.Contains(strings.ToLower(c.Engine), "harness") {
+		targetEngine := "agy"
+		if req.StoryID != "" && req.ResumeConversationID == "" && req.Kind == KindStoryRefinement {
+			targetEngine = "autopilot"
+		}
+		req.Engine = targetEngine
+		c.Engine = targetEngine
+	}
 	// If attempting to run agent with an Antigravity conversation ID, auto-correct engine to agy
 	if req.Engine == "agent" && req.ResumeConversationID != "" && (isAntigravityConversation(req.ResumeConversationID) || !strings.HasPrefix(strings.ToLower(req.ResumeConversationID), "cursor-")) {
 		req.Engine = "agy"
@@ -622,6 +631,13 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 	engine := strings.TrimSpace(strings.ToLower(req.Engine))
 	if engine == "" || engine == "auto" {
 		engine = ResolveDynamicTool(engine, nil)
+	}
+	if strings.Contains(engine, "harness") {
+		if req.StoryID != "" && req.ResumeConversationID == "" && req.Kind == KindStoryRefinement {
+			engine = "autopilot"
+		} else {
+			engine = "agy"
+		}
 	}
 	switch engine {
 	case "agent":

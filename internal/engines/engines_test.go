@@ -958,6 +958,24 @@ func TestExecute_Sandbox_Idempotency_AutoCorrect(t *testing.T) {
 	if err != nil || res.ExitCode != 0 {
 		t.Fatalf("expected auto-correct execution to succeed, got %+v, %v", res, err)
 	}
+
+	// 4. Auto-correct engine from "iazio-harness" to agy
+	res, err = cli.Execute(context.Background(), ExecutionRequest{
+		Engine: "iazio-harness",
+		Prompt: "echo test",
+		Argv:   []string{mockAgy},
+	}, stream)
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("expected harness engine remap execution to succeed, got %+v, %v", res, err)
+	}
+
+	builtArgv, err := BuildArgv(ExecutionRequest{
+		Engine: "iazio-harness",
+		Prompt: "run prompt",
+	})
+	if err != nil || len(builtArgv) == 0 || (builtArgv[0] != "agy" && builtArgv[0] != "gemini") {
+		t.Fatalf("expected BuildArgv to remap iazio-harness to agy/gemini, got %+v, %v", builtArgv, err)
+	}
 }
 
 func TestResolveDynamicTool(t *testing.T) {
