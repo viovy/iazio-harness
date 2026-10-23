@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -290,7 +291,16 @@ func isPIDAlive(pid int) bool {
 	if pid <= 1 {
 		return false
 	}
-	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+	if runtime.GOOS == "linux" {
+		if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err == nil {
+			return true
+		}
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = process.Signal(syscall.Signal(0))
 	return err == nil
 }
 
