@@ -951,7 +951,8 @@ func runServiceCommand(args []string) error {
 				fmt.Printf("running (pid: %d)\n", pid)
 				return nil
 			}
-			return fmt.Errorf("installed but not running")
+			fmt.Println("installed but not running")
+			return nil
 		}
 		txt := service.ActionText(goos, action, bin, force)
 		fmt.Println(txt)

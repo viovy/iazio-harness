@@ -166,3 +166,18 @@ func TestWatchdog_TouchHeartbeatAndRun(t *testing.T) {
 		t.Fatalf("expected STOPPED status after exit, got %s", st.Status)
 	}
 }
+
+func TestWatchdog_ListJobsAndDefaults(t *testing.T) {
+	tempDir := t.TempDir()
+	w := New(Options{
+		StateFile: filepath.Join(tempDir, "state.json"),
+	})
+	if len(w.ListJobs()) != 0 {
+		t.Fatalf("expected 0 jobs")
+	}
+	w.Track(TrackedJob{JobID: "j1", PID: 1})
+	jobs := w.ListJobs()
+	if len(jobs) != 1 || jobs[0].JobID != "j1" {
+		t.Fatalf("unexpected jobs: %+v", jobs)
+	}
+}
