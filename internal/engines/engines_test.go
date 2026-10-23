@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -999,6 +1000,58 @@ func TestResolveDynamicTool(t *testing.T) {
 		t.Fatalf("expected non-empty default resolved tool")
 	}
 }
+
+func TestExecute_GrandchildPipeLeakResilience(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping bash pipe test on Windows")
+	}
+
+	stream := &testCaptureStream{}
+	cli := CLI{Engine: "agy"}
+
+	// Script outputs a line, forks a background sleep that inherits stdout/stderr, then exits immediately.
+	// Previously this caused wg.Wait() to deadlock waiting indefinitely for io.Copy EOF.
+	mockScript := filepath.Join(t.TempDir(), "leak_pipes.sh")
+	scriptContent := "#!/bin/bash\necho 'engine-work-complete'\n(sleep 30 >&1) &\nexit 0\n"
+	if err := os.WriteFile(mockScript, []byte(scriptContent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := cli.Execute(ctx, ExecutionRequest{
+		Engine: "agy",
+		Argv:   []string{mockScript},
+	}, stream)
+
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("expected execute to succeed despite leaked pipe, got err: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", res.ExitCode)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("execute took too long (%v), expected prompt return under 4s", elapsed)
+	}
+
+	stream.mu.Lock()
+	foundOutput := false
+	for _, chunk := range stream.events {
+		if strings.Contains(chunk, "engine-work-complete") {
+			foundOutput = true
+			break
+		}
+	}
+	stream.mu.Unlock()
+
+	if !foundOutput {
+		t.Fatalf("expected to capture 'engine-work-complete' in stream events, got: %v", stream.events)
+	}
+}
+
 
 
 

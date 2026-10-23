@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/auth"
@@ -19,10 +22,11 @@ import (
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/prompt"
 	"github.com/viovy/iazio-harness/internal/repolock"
+	"github.com/viovy/iazio-harness/internal/service"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 	"github.com/viovy/iazio-harness/internal/spool"
 	"github.com/viovy/iazio-harness/internal/telemetry"
-	"syscall"
+	"github.com/viovy/iazio-harness/internal/watchdog"
 )
 
 const fallbackResumeStoryID = "STORY-RESUME-INPLACE"
@@ -45,7 +49,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: iazio-harness version|auth|run|story|prompt|codebase")
+		return fmt.Errorf("usage: iazio-harness version|auth|run|story|prompt|codebase|status|heal-ase|service|daemon")
 	}
 	var spanOpts = []telemetry.SpanOption{
 		telemetry.WithKind("INTERNAL"),
@@ -57,7 +61,7 @@ func run(args []string) error {
 			spanOpts = append(spanOpts, telemetry.WithParentTrace(parts[1], parts[2]))
 		}
 	}
-	_, span := telemetry.StartSpan(context.Background(), "harness."+args[0], spanOpts...)
+	ctx, span := telemetry.StartSpan(context.Background(), "harness."+args[0], spanOpts...)
 	defer span.End()
 	switch args[0] {
 	case "version":
@@ -74,7 +78,7 @@ func run(args []string) error {
 		fmt.Println(st.String())
 		return nil
 	case "run":
-		return runJob(args[1:])
+		return runJobWithContext(ctx, args[1:])
 	case "story":
 		return runStoryCommand(args[1:])
 	case "prompt":
@@ -85,12 +89,20 @@ func run(args []string) error {
 		return runFleetStatusCommand(args[1:])
 	case "heal-ase":
 		return runHealASECommand(args[1:])
+	case "service":
+		return runServiceCommand(args[1:])
+	case "daemon":
+		return runDaemonCommand(args[1:])
 	default:
 		return fmt.Errorf("unknown command")
 	}
 }
 
 func runJob(args []string) error {
+	return runJobWithContext(context.Background(), args)
+}
+
+func runJobWithContext(ctx context.Context, args []string) error {
 	var api, jobID, worktree, docsHub, chunk, kind, resumeConv string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -148,12 +160,20 @@ func runJob(args []string) error {
 		return fmt.Errorf("job-id is required")
 	}
 	if chunk != "" {
-		return controlplane.PostChunk(context.Background(), api, "", jobID, "stdout", chunk)
+		return controlplane.PostChunk(ctx, api, "", jobID, "stdout", chunk)
 	}
-	return executeJob(context.Background(), api, jobID, worktree, docsHub, kind, resumeConv)
+	return executeJob(ctx, api, jobID, worktree, docsHub, kind, resumeConv)
 }
 
 func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
+	var spanOpts = []telemetry.SpanOption{
+		telemetry.WithKind("INTERNAL"),
+		telemetry.WithTag("cli.command", "run"),
+		telemetry.WithTag("iazio.job_id", jobID),
+	}
+	ctx, span := telemetry.StartSpan(ctx, "harness.execute_job", spanOpts...)
+	defer span.End()
+
 	var kindOverride, resumeConvOverride string
 	if len(overrides) > 0 {
 		kindOverride = overrides[0]
@@ -180,12 +200,32 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	if docsHub == "" {
 		docsHub = job.DocsHubPath
 	}
+	span.SetTag("iazio.story_id", job.StoryID)
+	span.SetTag("iazio.kind", job.Kind)
+	span.SetTag("iazio.worktree", worktree)
+	span.SetTag("iazio.engine", job.Engine)
+	span.SetTag("iazio.host_id", job.HostID)
+	span.SetTag("iazio.schedule_id", job.ScheduleID)
 	targetDir, err := engines.CheckoutDir(job.Kind, worktree, docsHub)
 	if err != nil {
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: checkout dir %s: %v\n", targetDir, err))
 		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
 		return err
 	}
+
+	wd := watchdog.New(watchdog.Options{})
+	wd.Track(watchdog.TrackedJob{
+		JobID:        job.ID,
+		ScheduleID:   job.ScheduleID,
+		WorktreePath: targetDir,
+		DocsHubPath:  docsHub,
+		APIURL:       api,
+		Engine:       job.Engine,
+		StoryID:      job.StoryID,
+		PID:          os.Getpid(),
+		Status:       watchdog.StatusRunning,
+	})
+
 	lock, err := engines.Hold(targetDir, "")
 	if err != nil {
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: checkout lock on %s: %v\n", targetDir, err))
@@ -398,6 +438,19 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		ResumeConversationID:       resumeConvID,
 		OnPID: func(pid int) {
 			activePID = pid
+			span.AddAnnotation(fmt.Sprintf("engine_process_started:pid=%d", pid))
+			wd.Track(watchdog.TrackedJob{
+				JobID:          job.ID,
+				ScheduleID:     job.ScheduleID,
+				WorktreePath:   targetDir,
+				DocsHubPath:    docsHub,
+				APIURL:         api,
+				Engine:         engineName,
+				StoryID:        job.StoryID,
+				ConversationID: activeConvID,
+				PID:            pid,
+				Status:         watchdog.StatusRunning,
+			})
 			_ = lockHandle.Update(repolock.LockInfo{
 				JobID:          job.ID,
 				ScheduleID:     job.ScheduleID,
@@ -425,6 +478,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		OnConversationID: func(cid string) {
 			if cid != "" {
 				activeConvID = cid
+				span.AddAnnotation(fmt.Sprintf("conversation_detected:%s", cid))
 				_ = lockHandle.Update(repolock.LockInfo{
 					JobID:          job.ID,
 					ScheduleID:     job.ScheduleID,
@@ -467,6 +521,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		},
 	}
 	execRes, execErr := runner.Execute(ctx, execReq, sp)
+	span.AddAnnotation(fmt.Sprintf("engine_process_exited:code=%d", execRes.ExitCode))
 	stopFlush()
 
 	// Wait for any in-flight conversation ID registrations with a bounded timeout
@@ -488,6 +543,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 
 	// Execution Diagnosis & Anomaly Detection
+	_ = sp.Sync()
 	engineLogData, _ := os.ReadFile(execReq.LogFile)
 	spoolLogData, _ := os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
 	combinedOutput := string(engineLogData) + "\n" + string(spoolLogData)
@@ -541,6 +597,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			}
 
 			// Re-diagnose after fallback run
+			_ = sp.Sync()
 			engineLogData, _ = os.ReadFile(fallbackReq.LogFile)
 			spoolLogData, _ = os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
 			combinedOutput = string(engineLogData) + "\n" + string(spoolLogData)
@@ -640,6 +697,18 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 	}
 
+	span.SetTag("iazio.status", finalStatus)
+	span.SetTag("iazio.exit_code", fmt.Sprintf("%d", execRes.ExitCode))
+	if exitOpts.DiagnosticCode != "" {
+		span.SetTag("iazio.diagnostic_code", exitOpts.DiagnosticCode)
+	}
+	if exitOpts.Reason != "" {
+		span.SetTag("iazio.reason", exitOpts.Reason)
+	}
+	if execErr != nil {
+		span.SetError(execErr)
+	}
+
 	var postExitErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		postExitErr = controlplane.PostExitWithOptions(context.Background(), api, token, jobID, exitOpts)
@@ -650,6 +719,20 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 	if postExitErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: post exit failed for job %s: %v\n", jobID, postExitErr)
+	} else {
+		span.AddAnnotation("post_exit_complete")
+	}
+
+	if finalStatus == "COMPLETED" {
+		wd.Complete(job.ID, execRes.ExitCode)
+	} else {
+		errMsg := ""
+		if execErr != nil {
+			errMsg = execErr.Error()
+		} else if exitOpts.ErrorMessage != "" {
+			errMsg = exitOpts.ErrorMessage
+		}
+		wd.Fail(job.ID, execRes.ExitCode, errMsg)
 	}
 
 	if execErr != nil {
@@ -754,4 +837,148 @@ func runHealASECommand(args []string) error {
 	}
 	fmt.Printf("Successfully healed ASE state and reaped orphaned processes for %s\n", repoPath)
 	return nil
+}
+
+func runServiceCommand(args []string) error {
+	action := "status"
+	force := false
+	dry := false
+	var extraArgs []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--dry-run":
+			dry = true
+		case "--force", "-f":
+			force = true
+		default:
+			if !strings.HasPrefix(args[i], "-") && action == "status" {
+				action = args[i]
+			} else {
+				extraArgs = append(extraArgs, args[i])
+			}
+		}
+	}
+
+	bin, err := os.Executable()
+	if err != nil {
+		bin = "iazio-harness"
+	} else if resolved, err := filepath.EvalSymlinks(bin); err == nil {
+		bin = resolved
+	}
+
+	home, _ := os.UserHomeDir()
+	goos := runtime.GOOS
+
+	switch action {
+	case "install":
+		if dry {
+			fmt.Println(service.ActionText(goos, action, bin, force))
+			return nil
+		}
+		switch goos {
+		case "darwin":
+			return service.InstallDarwin(bin)
+		case "windows":
+			return service.InstallWindows(bin)
+		default:
+			if service.IsSystemdAvailable() {
+				return service.InstallLinux(bin)
+			}
+			return service.InstallUserDaemon(bin)
+		}
+	case "dev-install":
+		src := bin
+		if len(extraArgs) > 0 {
+			src = extraArgs[0]
+		}
+		if dry {
+			fmt.Printf("hot-swap %s and restart supervisor\n", src)
+			return nil
+		}
+		if err := service.DevInstall(src, home, nil); err != nil {
+			return err
+		}
+		fmt.Println("iazio-harness dev version installed and supervisor active")
+		return nil
+	case "pause":
+		if dry {
+			fmt.Println("pause supervisor and place maintenance lock")
+			return nil
+		}
+		if err := service.PauseService(home, nil); err != nil {
+			return err
+		}
+		fmt.Println("iazio-harness service paused (maintenance mode active)")
+		return nil
+	case "resume":
+		if dry {
+			fmt.Println("resume supervisor and remove maintenance lock")
+			return nil
+		}
+		if err := service.ResumeService(home, nil); err != nil {
+			return err
+		}
+		fmt.Println("iazio-harness service resumed (maintenance mode cleared)")
+		return nil
+	case "revive-check":
+		if dry {
+			fmt.Println("check supervisor health and auto-revive if inactive")
+			return nil
+		}
+		return service.ReviveCheck(home, nil)
+	case "start", "stop", "restart", "uninstall":
+		if dry {
+			fmt.Println(service.ActionText(goos, action, bin, force))
+			return nil
+		}
+		if goos == "linux" && !service.IsSystemdAvailable() {
+			switch action {
+			case "start":
+				return service.StartUserDaemonAt(home, bin, nil)
+			case "stop":
+				return service.StopUserDaemonAt(home)
+			case "restart":
+				_ = service.StopUserDaemonAt(home)
+				return service.StartUserDaemonAt(home, bin, nil)
+			case "uninstall":
+				return service.UninstallUserDaemonAt(home)
+			}
+		}
+		_, err := service.Apply(goos, action, bin, false, force, nil)
+		return err
+	case "status":
+		if goos == "linux" && !service.IsSystemdAvailable() {
+			running, pid := service.StatusUserDaemonAt(home)
+			if running {
+				fmt.Printf("running (pid: %d)\n", pid)
+				return nil
+			}
+			fmt.Println("installed but not running")
+			return nil
+		}
+		txt := service.ActionText(goos, action, bin, force)
+		fmt.Println(txt)
+		return nil
+	default:
+		return fmt.Errorf("unknown service action %s", action)
+	}
+}
+
+func runDaemonCommand(args []string) error {
+	interval := watchdog.DefaultInterval
+	for i := 0; i < len(args); i++ {
+		if (args[i] == "--interval" || args[i] == "-i") && i+1 < len(args) {
+			i++
+			if d, err := time.ParseDuration(args[i]); err == nil {
+				interval = d
+			}
+		}
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	log.Printf("[iazio-harness] Starting execution supervisor daemon (pid: %d, interval: %v)...", os.Getpid(), interval)
+	wd := watchdog.New(watchdog.Options{})
+	return wd.Run(ctx, interval)
 }

@@ -266,20 +266,32 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	}
 	defer stdin.Close()
 	cmd.Stdin = stdin
-	stdout, err := cmd.StdoutPipe()
+
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return ExecutionResult{}, err
 	}
-	stderr, err := cmd.StderrPipe()
+	defer stdoutR.Close()
+	cmd.Stdout = stdoutW
+
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		_ = stdoutW.Close()
 		return ExecutionResult{}, err
 	}
+	defer stderrR.Close()
+	cmd.Stderr = stderrW
+
 	if err := cmd.Start(); err != nil {
+		_ = stdoutW.Close()
+		_ = stderrW.Close()
 		if stream != nil {
 			_ = stream.AppendRaw("stderr", []byte(fmt.Sprintf("[iazio-harness] FATAL: failed to spawn %s: %v\n", bin, err)))
 		}
 		return ExecutionResult{}, err
 	}
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
 	postStartProcessGroup(cmd)
 	if cmd.Process != nil {
 		if stream != nil {
@@ -290,7 +302,13 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		}
 	}
 	done := make(chan struct{})
-	go watchCancel(ctx, cmd, done)
+	var doneOnce sync.Once
+	safeCloseDone := func() {
+		doneOnce.Do(func() {
+			close(done)
+		})
+	}
+	defer safeCloseDone()
 
 	var scanned bool
 	var convMu sync.Mutex
@@ -405,15 +423,56 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(stdoutWriter, stdout)
+		_, _ = io.Copy(stdoutWriter, stdoutR)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(stderrWriter, stderr)
+		_, _ = io.Copy(stderrWriter, stderrR)
 	}()
-	wg.Wait()
-	waitErr := cmd.Wait()
-	close(done)
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	pipesDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(pipesDone)
+	}()
+
+	var waitErr error
+	select {
+	case waitErr = <-waitCh:
+		// Primary engine process exited. Allow a bounded window for stdout/stderr to drain.
+		select {
+		case <-pipesDone:
+		case <-time.After(2 * time.Second):
+			// Force close pipes to unblock any io.Copy held open by orphaned background grandchildren
+			_ = stdoutR.Close()
+			_ = stderrR.Close()
+			select {
+			case <-pipesDone:
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+	case <-ctx.Done():
+		stopProcessGroup(cmd)
+		select {
+		case waitErr = <-waitCh:
+		case <-time.After(3 * time.Second):
+			killProcessGroup(cmd)
+			waitErr = <-waitCh
+		}
+		_ = stdoutR.Close()
+		_ = stderrR.Close()
+		select {
+		case <-pipesDone:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
+	safeCloseDone()
 	// Ensure no background child or grandchild MCP servers outlive the parent process group
 	killProcessGroup(cmd)
 	if req.LogFile != "" && req.OnConversationID != nil {

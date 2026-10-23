@@ -226,6 +226,16 @@ func (s *Spool) limit() int {
 	return MaxTextBytes
 }
 
+// Sync commits the current contents of the spool log to stable storage.
+func (s *Spool) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.f == nil {
+		return nil
+	}
+	return s.f.Sync()
+}
+
 // Close closes the raw log. Call it when the child exits.
 func (s *Spool) Close() error {
 	s.mu.Lock()

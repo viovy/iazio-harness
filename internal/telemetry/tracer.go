@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -166,6 +168,8 @@ func NewZipkinExporter(endpoint string) *ZipkinExporter {
 			clean = strings.TrimRight(strings.TrimSpace(env), "/")
 		} else if env := os.Getenv("OTEL_EXPORTER_ZIPKIN_ENDPOINT"); env != "" {
 			clean = strings.TrimRight(strings.TrimSpace(env), "/")
+		} else if cfgURL := resolveZipkinFromConfig(); cfgURL != "" {
+			clean = strings.TrimRight(strings.TrimSpace(cfgURL), "/")
 		} else {
 			clean = "http://localhost:9411"
 		}
@@ -522,6 +526,8 @@ func InitGlobalTracer(serviceName, zipkinURL string) func() {
 			zipkinURL = env
 		} else if env := os.Getenv("OTEL_EXPORTER_ZIPKIN_ENDPOINT"); env != "" {
 			zipkinURL = env
+		} else if cfgURL := resolveZipkinFromConfig(); cfgURL != "" {
+			zipkinURL = cfgURL
 		} else {
 			zipkinURL = "http://localhost:9411"
 		}
@@ -535,4 +541,37 @@ func InitGlobalTracer(serviceName, zipkinURL string) func() {
 		_ = exp.Flush(context.Background())
 		_ = exp.Close()
 	}
+}
+
+func resolveZipkinFromConfig() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	cfgPath := filepath.Join(home, ".iazio", "config.json")
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return ""
+	}
+	var raw struct {
+		Endpoints map[string]string `json:"endpoints"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return ""
+	}
+	if zipkin, ok := raw.Endpoints["zipkin"]; ok && strings.TrimSpace(zipkin) != "" {
+		return strings.TrimSpace(zipkin)
+	}
+	for _, key := range []string{"harness_api", "iazio_api"} {
+		if u, ok := raw.Endpoints[key]; ok && strings.TrimSpace(u) != "" {
+			u = strings.TrimSpace(u)
+			if parsed, err := url.Parse(u); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+				if parsed.Port() == "" || parsed.Port() == "80" || parsed.Port() == "443" {
+					return fmt.Sprintf("%s://%s/zipkin", parsed.Scheme, parsed.Host)
+				}
+				return fmt.Sprintf("%s://%s:9411", parsed.Scheme, parsed.Hostname())
+			}
+		}
+	}
+	return ""
 }
