@@ -543,6 +543,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 
 	// Execution Diagnosis & Anomaly Detection
+	_ = sp.Sync()
 	engineLogData, _ := os.ReadFile(execReq.LogFile)
 	spoolLogData, _ := os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
 	combinedOutput := string(engineLogData) + "\n" + string(spoolLogData)
@@ -596,6 +597,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			}
 
 			// Re-diagnose after fallback run
+			_ = sp.Sync()
 			engineLogData, _ = os.ReadFile(fallbackReq.LogFile)
 			spoolLogData, _ = os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
 			combinedOutput = string(engineLogData) + "\n" + string(spoolLogData)
