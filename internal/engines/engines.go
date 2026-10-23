@@ -290,7 +290,13 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		}
 	}
 	done := make(chan struct{})
-	go watchCancel(ctx, cmd, done)
+	var doneOnce sync.Once
+	safeCloseDone := func() {
+		doneOnce.Do(func() {
+			close(done)
+		})
+	}
+	defer safeCloseDone()
 
 	var scanned bool
 	var convMu sync.Mutex
@@ -411,9 +417,50 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		defer wg.Done()
 		_, _ = io.Copy(stderrWriter, stderr)
 	}()
-	wg.Wait()
-	waitErr := cmd.Wait()
-	close(done)
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	pipesDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(pipesDone)
+	}()
+
+	var waitErr error
+	select {
+	case waitErr = <-waitCh:
+		// Primary engine process exited. Allow a bounded window for stdout/stderr to drain.
+		select {
+		case <-pipesDone:
+		case <-time.After(2 * time.Second):
+			// Force close pipes to unblock any io.Copy held open by orphaned background grandchildren
+			_ = stdout.Close()
+			_ = stderr.Close()
+			select {
+			case <-pipesDone:
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+	case <-ctx.Done():
+		stopProcessGroup(cmd)
+		select {
+		case waitErr = <-waitCh:
+		case <-time.After(3 * time.Second):
+			killProcessGroup(cmd)
+			waitErr = <-waitCh
+		}
+		_ = stdout.Close()
+		_ = stderr.Close()
+		select {
+		case <-pipesDone:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
+	safeCloseDone()
 	// Ensure no background child or grandchild MCP servers outlive the parent process group
 	killProcessGroup(cmd)
 	if req.LogFile != "" && req.OnConversationID != nil {

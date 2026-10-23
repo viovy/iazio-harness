@@ -61,7 +61,7 @@ func run(args []string) error {
 			spanOpts = append(spanOpts, telemetry.WithParentTrace(parts[1], parts[2]))
 		}
 	}
-	_, span := telemetry.StartSpan(context.Background(), "harness."+args[0], spanOpts...)
+	ctx, span := telemetry.StartSpan(context.Background(), "harness."+args[0], spanOpts...)
 	defer span.End()
 	switch args[0] {
 	case "version":
@@ -78,7 +78,7 @@ func run(args []string) error {
 		fmt.Println(st.String())
 		return nil
 	case "run":
-		return runJob(args[1:])
+		return runJobWithContext(ctx, args[1:])
 	case "story":
 		return runStoryCommand(args[1:])
 	case "prompt":
@@ -99,6 +99,10 @@ func run(args []string) error {
 }
 
 func runJob(args []string) error {
+	return runJobWithContext(context.Background(), args)
+}
+
+func runJobWithContext(ctx context.Context, args []string) error {
 	var api, jobID, worktree, docsHub, chunk, kind, resumeConv string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -156,12 +160,20 @@ func runJob(args []string) error {
 		return fmt.Errorf("job-id is required")
 	}
 	if chunk != "" {
-		return controlplane.PostChunk(context.Background(), api, "", jobID, "stdout", chunk)
+		return controlplane.PostChunk(ctx, api, "", jobID, "stdout", chunk)
 	}
-	return executeJob(context.Background(), api, jobID, worktree, docsHub, kind, resumeConv)
+	return executeJob(ctx, api, jobID, worktree, docsHub, kind, resumeConv)
 }
 
 func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
+	var spanOpts = []telemetry.SpanOption{
+		telemetry.WithKind("INTERNAL"),
+		telemetry.WithTag("cli.command", "run"),
+		telemetry.WithTag("iazio.job_id", jobID),
+	}
+	ctx, span := telemetry.StartSpan(ctx, "harness.execute_job", spanOpts...)
+	defer span.End()
+
 	var kindOverride, resumeConvOverride string
 	if len(overrides) > 0 {
 		kindOverride = overrides[0]
@@ -188,6 +200,12 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	if docsHub == "" {
 		docsHub = job.DocsHubPath
 	}
+	span.SetTag("iazio.story_id", job.StoryID)
+	span.SetTag("iazio.kind", job.Kind)
+	span.SetTag("iazio.worktree", worktree)
+	span.SetTag("iazio.engine", job.Engine)
+	span.SetTag("iazio.host_id", job.HostID)
+	span.SetTag("iazio.schedule_id", job.ScheduleID)
 	targetDir, err := engines.CheckoutDir(job.Kind, worktree, docsHub)
 	if err != nil {
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: checkout dir %s: %v\n", targetDir, err))
@@ -420,6 +438,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		ResumeConversationID:       resumeConvID,
 		OnPID: func(pid int) {
 			activePID = pid
+			span.AddAnnotation(fmt.Sprintf("engine_process_started:pid=%d", pid))
 			wd.Track(watchdog.TrackedJob{
 				JobID:          job.ID,
 				ScheduleID:     job.ScheduleID,
@@ -459,6 +478,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		OnConversationID: func(cid string) {
 			if cid != "" {
 				activeConvID = cid
+				span.AddAnnotation(fmt.Sprintf("conversation_detected:%s", cid))
 				_ = lockHandle.Update(repolock.LockInfo{
 					JobID:          job.ID,
 					ScheduleID:     job.ScheduleID,
@@ -501,6 +521,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		},
 	}
 	execRes, execErr := runner.Execute(ctx, execReq, sp)
+	span.AddAnnotation(fmt.Sprintf("engine_process_exited:code=%d", execRes.ExitCode))
 	stopFlush()
 
 	// Wait for any in-flight conversation ID registrations with a bounded timeout
@@ -674,6 +695,18 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 	}
 
+	span.SetTag("iazio.status", finalStatus)
+	span.SetTag("iazio.exit_code", fmt.Sprintf("%d", execRes.ExitCode))
+	if exitOpts.DiagnosticCode != "" {
+		span.SetTag("iazio.diagnostic_code", exitOpts.DiagnosticCode)
+	}
+	if exitOpts.Reason != "" {
+		span.SetTag("iazio.reason", exitOpts.Reason)
+	}
+	if execErr != nil {
+		span.SetError(execErr)
+	}
+
 	var postExitErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		postExitErr = controlplane.PostExitWithOptions(context.Background(), api, token, jobID, exitOpts)
@@ -684,6 +717,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 	if postExitErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: post exit failed for job %s: %v\n", jobID, postExitErr)
+	} else {
+		span.AddAnnotation("post_exit_complete")
 	}
 
 	if finalStatus == "COMPLETED" {

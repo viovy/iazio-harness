@@ -146,6 +146,8 @@ type JobDetail struct {
 	Model                       string            `json:"model,omitempty"`
 	Agent                       string            `json:"agent,omitempty"`
 	DisableSlashCommands        *bool             `json:"disable_slash_commands,omitempty"`
+	HostID                      string            `json:"host_id,omitempty"`
+	TargetHost                  string            `json:"target_host,omitempty"`
 }
 
 // GetJob fetches the job definition from the control plane.

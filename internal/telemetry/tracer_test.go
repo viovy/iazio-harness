@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -244,3 +245,40 @@ func TestZipkinExporterErrorAndClose(t *testing.T) {
 	// Export after close
 	_ = exp.ExportSpan(&Span{})
 }
+
+func TestResolveZipkinFromConfig(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tempHome := t.TempDir()
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", origHome)
+
+	// No file -> empty
+	if got := resolveZipkinFromConfig(); got != "" {
+		t.Fatalf("expected empty, got %s", got)
+	}
+
+	iazioDir := filepath.Join(tempHome, ".iazio")
+	_ = os.MkdirAll(iazioDir, 0o755)
+
+	// Explicit endpoints.zipkin
+	cfgExplicit := `{"endpoints":{"zipkin":"https://trace.example.com"}}`
+	_ = os.WriteFile(filepath.Join(iazioDir, "config.json"), []byte(cfgExplicit), 0o644)
+	if got := resolveZipkinFromConfig(); got != "https://trace.example.com" {
+		t.Fatalf("expected explicit zipkin URL, got %s", got)
+	}
+
+	// Derived from harness_api (standard port)
+	cfgDerived := `{"endpoints":{"harness_api":"https://tian.go.ro/iazio-harness-api"}}`
+	_ = os.WriteFile(filepath.Join(iazioDir, "config.json"), []byte(cfgDerived), 0o644)
+	if got := resolveZipkinFromConfig(); got != "https://tian.go.ro/zipkin" {
+		t.Fatalf("expected derived zipkin URL https://tian.go.ro/zipkin, got %s", got)
+	}
+
+	// Derived from harness_api (custom port)
+	cfgCustomPort := `{"endpoints":{"harness_api":"http://192.168.0.88:8080"}}`
+	_ = os.WriteFile(filepath.Join(iazioDir, "config.json"), []byte(cfgCustomPort), 0o644)
+	if got := resolveZipkinFromConfig(); got != "http://192.168.0.88:9411" {
+		t.Fatalf("expected derived zipkin URL with port 9411, got %s", got)
+	}
+}
+
