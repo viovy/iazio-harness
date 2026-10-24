@@ -656,7 +656,19 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		strings.Contains(engineLogStr, "session not found") ||
 		strings.Contains(engineLogStr, "failed to open session") ||
 		strings.Contains(engineLogStr, "failed to attach to conversation") ||
-		strings.Contains(engineLogStr, "corrupted session database")
+		strings.Contains(engineLogStr, "failed to attach to session") ||
+		strings.Contains(engineLogStr, "corrupted session database") ||
+		strings.Contains(engineLogStr, "no session with id") ||
+		strings.Contains(engineLogStr, "unknown conversation") ||
+		strings.Contains(engineLogStr, "invalid session id") ||
+		strings.Contains(engineLogStr, "cannot find conversation") ||
+		strings.Contains(engineLogStr, "cannot find session") ||
+		strings.Contains(engineLogStr, "cannot load session") ||
+		strings.Contains(engineLogStr, "session file missing") ||
+		strings.Contains(engineLogStr, "no conversation found") ||
+		strings.Contains(engineLogStr, "conversation file does not exist") ||
+		strings.Contains(engineLogStr, "session does not exist") ||
+		strings.Contains(engineLogStr, "conversation does not exist")
 
 	isQuotaExhausted := false
 	for _, f := range diagReport.Findings {
@@ -665,7 +677,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			break
 		}
 	}
-	if !isQuotaExhausted && (strings.Contains(engineLogStr, "actionrequirederror") || strings.Contains(engineLogStr, "out of usage")) {
+	combinedLower := strings.ToLower(combinedOutput)
+	if !isQuotaExhausted && (strings.Contains(engineLogStr, "actionrequirederror") || strings.Contains(engineLogStr, "out of usage") || strings.Contains(combinedLower, "actionrequirederror") || strings.Contains(combinedLower, "out of usage")) {
 		isQuotaExhausted = true
 	}
 
@@ -711,6 +724,17 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			if ev.Type == spool.EventOutputChunk {
 				_ = controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text)
 			}
+		}
+
+		// Wait for any in-flight conversation registration from the fallback run
+		fallbackConvDone := make(chan struct{})
+		go func() {
+			convWg.Wait()
+			close(fallbackConvDone)
+		}()
+		select {
+		case <-fallbackConvDone:
+		case <-time.After(3 * time.Second):
 		}
 
 		// Re-diagnose after fallback run

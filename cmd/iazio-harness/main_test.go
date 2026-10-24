@@ -749,6 +749,118 @@ exit 1
 	}
 }
 
+func TestExecuteJob_DeterministicResume_PostRunAttachError_SingleFallback(t *testing.T) {
+	mockHome := t.TempDir()
+	targetConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	fallbackConvID := "99998888-7777-6666-5555-444433332222"
+	// Session exists on disk so Stage 1 pre-flight succeeds
+	_ = os.MkdirAll(filepath.Join(mockHome, ".gemini", "antigravity-cli", "brain", targetConvID), 0755)
+	t.Setenv("HOME", mockHome)
+
+	mockDir := t.TempDir()
+	countFile := filepath.Join(mockDir, "invocations.txt")
+	argsFile := filepath.Join(mockDir, "args.txt")
+	mockAgy := filepath.Join(mockDir, "agy")
+	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
+echo "$@" >> "%s"
+if ! grep -q "run1" "%s" 2>/dev/null; then
+    echo "run1" >> "%s"
+    PREV=""
+    for arg in "$@"; do
+        if [ "$PREV" = "--log-file" ]; then
+            echo "Error: failed to attach to conversation: corrupted session database" > "$arg"
+        fi
+        PREV="$arg"
+    done
+    echo "Error: failed to attach to conversation: corrupted session database" >&2
+    exit 1
+else
+    echo "run2" >> "%s"
+    echo "Conversation ID: %s"
+    exit 0
+fi
+`, argsFile, countFile, countFile, countFile, fallbackConvID)), 0755)
+
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	var postMu sync.Mutex
+	postedConvs := []map[string]any{}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") || strings.HasSuffix(r.URL.Path, "/exit") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postMu.Lock()
+			postedConvs = append(postedConvs, body)
+			postMu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-1313-postrun-attach-fail" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:                    "job-1313-postrun-attach-fail",
+				Kind:                  "resume",
+				Engine:                "agy",
+				Prompt:                "resume",
+				WorktreePath:          workDir,
+				InitialConversationID: targetConvID,
+				ResumeConversationID:  targetConvID,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	_ = executeJob(context.Background(), srv.URL, "job-1313-postrun-attach-fail", workDir, "")
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("expected count file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected exactly 2 executions (run1 attach fail, run2 fallback), got %d executions: %v", len(lines), lines)
+	}
+
+	argsData, _ := os.ReadFile(argsFile)
+	argLines := strings.Split(strings.TrimSpace(string(argsData)), "\n")
+	if len(argLines) < 2 {
+		t.Fatalf("expected at least 2 arg lines, got: %v", argLines)
+	}
+	if !strings.Contains(argLines[0], "--conversation="+targetConvID) {
+		t.Fatalf("expected first run to have --conversation=%s, got: %s", targetConvID, argLines[0])
+	}
+	if strings.Contains(argLines[1], "--conversation="+targetConvID) {
+		t.Fatalf("expected second run to NOT have --conversation=%s, got: %s", targetConvID, argLines[1])
+	}
+
+	postMu.Lock()
+	defer postMu.Unlock()
+	foundFallback := false
+	for _, pc := range postedConvs {
+		if pc["conversation_id"] == fallbackConvID {
+			foundFallback = true
+			if pc["fallback"] != true {
+				t.Fatalf("expected fallback: true, got %v", pc["fallback"])
+			}
+			if pc["role"] != "fallback_primary" {
+				t.Fatalf("expected role: fallback_primary, got %v", pc["role"])
+			}
+		}
+	}
+	if !foundFallback {
+		t.Fatalf("expected fallback conversation %s to be posted, got: %+v", fallbackConvID, postedConvs)
+	}
+}
+
 
 func TestPipedStdinHandlers(t *testing.T) {
 	origStdin := os.Stdin
