@@ -87,7 +87,6 @@ func TestSubmoduleRegistrationAndResolution(t *testing.T) {
 	}
 }
 
-
 func TestCandidateFleetRoots(t *testing.T) {
 	t.Setenv("IAZIO_FLEET_ROOT", "/tmp/fleet-1")
 	t.Setenv("FLEET_ROOT", "/tmp/fleet-2")

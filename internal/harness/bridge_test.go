@@ -45,8 +45,8 @@ func (m *mockAutopilot) Resume(ctx context.Context, worktreePath string, resumeC
 }
 
 type mockExecutor struct {
-	mu             sync.Mutex
-	executeCalls   []string
+	mu              sync.Mutex
+	executeCalls    []string
 	receivedPrompts []string
 }
 

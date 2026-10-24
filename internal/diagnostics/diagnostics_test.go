@@ -692,4 +692,3 @@ func TestCheckASECompletion_StoryDone_Complete(t *testing.T) {
 		t.Fatalf("expected complete=true when story is DONE on disk, got false")
 	}
 }
-

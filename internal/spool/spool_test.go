@@ -35,12 +35,12 @@ func TestStripANSI(t *testing.T) {
 
 func TestUTF8Truncation(t *testing.T) {
 	tests := []struct {
-		name         string
-		in           string
-		max          int
-		wantHead     string
-		wantTail     string
-		wantDropped  int
+		name        string
+		in          string
+		max         int
+		wantHead    string
+		wantTail    string
+		wantDropped int
 	}{
 		{name: "fits", in: "abc", max: 4, wantHead: "abc", wantTail: "", wantDropped: 0},
 		{name: "ascii middle", in: "abcdef", max: 4, wantHead: "ab", wantTail: "ef", wantDropped: 2},
@@ -233,4 +233,3 @@ func TestDefaultDirAndFlush(t *testing.T) {
 		t.Errorf("expected 'Hello World\\n', got %q", stripped)
 	}
 }
-

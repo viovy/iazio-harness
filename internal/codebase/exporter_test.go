@@ -476,4 +476,3 @@ func TestCodebaseExtraCoverage(t *testing.T) {
 		}
 	}
 }
-

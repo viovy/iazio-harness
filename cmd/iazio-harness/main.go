@@ -93,6 +93,8 @@ func run(args []string) error {
 		return runServiceCommand(args[1:])
 	case "daemon":
 		return runDaemonCommand(args[1:])
+	case "verify-release", "verify-live-release":
+		return runVerifyReleaseCommand(args[1:])
 	default:
 		return fmt.Errorf("unknown command")
 	}
@@ -1336,4 +1338,59 @@ func runDaemonCommand(args []string) error {
 	log.Printf("[iazio-harness] Starting execution supervisor daemon (pid: %d, interval: %v)...", os.Getpid(), interval)
 	wd := watchdog.New(watchdog.Options{})
 	return wd.Run(ctx, interval)
+}
+
+func runVerifyReleaseCommand(args []string) error {
+	var api, token string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--api-url":
+			i++
+			if i < len(args) {
+				api = args[i]
+			}
+		case "--token":
+			i++
+			if i < len(args) {
+				token = args[i]
+			}
+		}
+	}
+	if api == "" {
+		api = os.Getenv("IAZIO_HARNESS_API_URL")
+	}
+	if api == "" {
+		api = os.Getenv("IAZIO_API_URL")
+	}
+	if api == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if b, err := os.ReadFile(filepath.Join(home, ".iazio", "api_url")); err == nil {
+				api = strings.TrimSpace(string(b))
+			}
+		}
+	}
+	if api == "" {
+		api = "https://tian.go.ro"
+	}
+	if token == "" {
+		if t, err := auth.Bearer(context.Background()); err == nil && t != "" {
+			token = t
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	fmt.Printf("[iazio-harness] Running post-release live verification against %s...\n", api)
+	res, err := controlplane.VerifyLiveRelease(ctx, api, token)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[iazio-harness] Live verification failed: %v\n", err)
+		return err
+	}
+
+	fmt.Println("[iazio-harness] Live verification passed successfully:")
+	for _, detail := range res.Details {
+		fmt.Printf("  - %s\n", detail)
+	}
+	return nil
 }

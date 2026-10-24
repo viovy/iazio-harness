@@ -16,7 +16,7 @@ import (
 // Anomaly codes.
 const (
 	CodeAlreadyDoneOnMain     = "ALREADY_DONE_ON_MAIN"
-	CodeDirtyWorktreePostExit  = "DIRTY_WORKTREE_POST_EXIT"
+	CodeDirtyWorktreePostExit = "DIRTY_WORKTREE_POST_EXIT"
 	CodeBranchSuperseded      = "BRANCH_SUPERSEDED"
 	CodeSlashCommandIgnored   = "SLASH_COMMAND_IGNORED"
 	CodePermissionDenied      = "PERMISSION_DENIED"

@@ -159,35 +159,35 @@ func PostConversationWithOptions(ctx context.Context, baseURL, token, jobID, con
 
 // JobDetail carries the execution specification from iazio-harness-api.
 type JobDetail struct {
-	ID                          string                 `json:"id"`
-	ScheduleID                  string                 `json:"schedule_id"`
-	Kind                        string                 `json:"kind"`
-	Status                      string                 `json:"status"`
-	Engine                      string                 `json:"engine"`
-	Prompt                      string                 `json:"prompt"`
-	StoryID                     string                 `json:"story_id"`
-	SourceIdeaID                string                 `json:"source_idea_id"`
-	Transcript                  string                 `json:"transcript"`
-	WorktreePath                string                 `json:"worktree_path"`
-	DocsHubPath                 string                 `json:"docs_hub_path"`
-	EnvVars                     map[string]string      `json:"env_vars"`
-	MaxExecutionDurationSeconds int                    `json:"max_execution_duration_seconds"`
-	ResumeConversationID        string                 `json:"resume_conversation_id,omitempty"`
-	Model                       string                 `json:"model,omitempty"`
-	Agent                       string                 `json:"agent,omitempty"`
-	DisableSlashCommands        *bool                  `json:"disable_slash_commands,omitempty"`
-	HostID                      string                 `json:"host_id,omitempty"`
-	TargetHost                  string                 `json:"target_host,omitempty"`
-	ParentJobID                 string                 `json:"parent_job_id,omitempty"`
-	RootJobID                   string                 `json:"root_job_id,omitempty"`
-	ExecutionAttempt            int                    `json:"execution_attempt,omitempty"`
-	ExecutionChain              []string               `json:"execution_chain,omitempty"`
-	InitialConversationID       string                 `json:"initial_conversation_id,omitempty"`
-	ActiveConversationID        string                 `json:"active_conversation_id,omitempty"`
-	ResumeMode                  string                 `json:"resume_mode,omitempty"`
-	ResumeFallbackReason        string                 `json:"resume_fallback_reason,omitempty"`
-	InterruptedASEState         map[string]any         `json:"interrupted_ase_state,omitempty"`
-	ConversationIDs             []string               `json:"conversation_ids,omitempty"`
+	ID                          string            `json:"id"`
+	ScheduleID                  string            `json:"schedule_id"`
+	Kind                        string            `json:"kind"`
+	Status                      string            `json:"status"`
+	Engine                      string            `json:"engine"`
+	Prompt                      string            `json:"prompt"`
+	StoryID                     string            `json:"story_id"`
+	SourceIdeaID                string            `json:"source_idea_id"`
+	Transcript                  string            `json:"transcript"`
+	WorktreePath                string            `json:"worktree_path"`
+	DocsHubPath                 string            `json:"docs_hub_path"`
+	EnvVars                     map[string]string `json:"env_vars"`
+	MaxExecutionDurationSeconds int               `json:"max_execution_duration_seconds"`
+	ResumeConversationID        string            `json:"resume_conversation_id,omitempty"`
+	Model                       string            `json:"model,omitempty"`
+	Agent                       string            `json:"agent,omitempty"`
+	DisableSlashCommands        *bool             `json:"disable_slash_commands,omitempty"`
+	HostID                      string            `json:"host_id,omitempty"`
+	TargetHost                  string            `json:"target_host,omitempty"`
+	ParentJobID                 string            `json:"parent_job_id,omitempty"`
+	RootJobID                   string            `json:"root_job_id,omitempty"`
+	ExecutionAttempt            int               `json:"execution_attempt,omitempty"`
+	ExecutionChain              []string          `json:"execution_chain,omitempty"`
+	InitialConversationID       string            `json:"initial_conversation_id,omitempty"`
+	ActiveConversationID        string            `json:"active_conversation_id,omitempty"`
+	ResumeMode                  string            `json:"resume_mode,omitempty"`
+	ResumeFallbackReason        string            `json:"resume_fallback_reason,omitempty"`
+	InterruptedASEState         map[string]any    `json:"interrupted_ase_state,omitempty"`
+	ConversationIDs             []string          `json:"conversation_ids,omitempty"`
 }
 
 // GetJob fetches the job definition from the control plane.
@@ -272,4 +272,3 @@ func PostStoryDraft(ctx context.Context, baseURL, token, jobID, storyID, body st
 	}
 	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/story-draft", token, raw, "story draft post")
 }
-

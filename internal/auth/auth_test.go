@@ -287,11 +287,11 @@ func TestDeviceLogin(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/device" {
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"device_code":               "dev-code-123",
-				"user_code":                 "ABCD",
-				"verification_uri":          "https://auth.example.com/verify",
-				"interval":                  1,
-				"expires_in":                10,
+				"device_code":      "dev-code-123",
+				"user_code":        "ABCD",
+				"verification_uri": "https://auth.example.com/verify",
+				"interval":         1,
+				"expires_in":       10,
 			})
 			return
 		}
@@ -473,6 +473,3 @@ func TestAuthHelpers_Comprehensive(t *testing.T) {
 		t.Errorf("expected refreshPresent=true, got %v, %v", pres, err)
 	}
 }
-
-
-

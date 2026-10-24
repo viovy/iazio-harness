@@ -68,8 +68,8 @@ type ExecutionRequest struct {
 	BaseEnv     []string
 	ScheduleEnv map[string]string
 	// Sandbox executes child in an isolated ephemeral worktree snapshot.
-	Sandbox       bool
-	OnSandboxDiff func(string)
+	Sandbox           bool
+	OnSandboxDiff     func(string)
 	IdempotencyClient *idempotency.Client
 	StepIndex         int
 	JobID             string

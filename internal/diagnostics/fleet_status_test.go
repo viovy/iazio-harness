@@ -137,7 +137,6 @@ func TestSubmoduleDriftClassification(t *testing.T) {
 	}
 }
 
-
 func TestToolIdentificationAndLiveness(t *testing.T) {
 	if tool, ok := isAgentTool("/usr/local/bin/autopilot"); !ok || tool != "autopilot" {
 		t.Errorf("expected autopilot, got %s (%v)", tool, ok)

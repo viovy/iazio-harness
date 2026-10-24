@@ -281,4 +281,3 @@ func TestResolveZipkinFromConfig(t *testing.T) {
 		t.Fatalf("expected derived zipkin URL with port 9411, got %s", got)
 	}
 }
-

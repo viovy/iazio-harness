@@ -79,7 +79,6 @@ func TestFormatVersion(t *testing.T) {
 	}
 }
 
-
 func TestResolveExecutionOptions(t *testing.T) {
 	// 1. Defaults for normal prompt
 	m, a, disableSlash := resolveExecutionOptions(controlplane.JobDetail{}, "Refactor the authentication module")
@@ -1075,7 +1074,6 @@ fi
 		t.Fatalf("expected fallback conversation %s to be posted, got: %+v", fallbackConvID, postedConvs)
 	}
 }
-
 
 func TestExecuteJob_DeterministicResume_Run1AlreadyFellBack_NoStage2DoubleAllocation(t *testing.T) {
 	mockHome := t.TempDir()

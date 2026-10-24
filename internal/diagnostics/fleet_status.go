@@ -37,7 +37,7 @@ type RepoFleetStatusResult struct {
 	LockDetails          string   `json:"lock_details,omitempty"`
 	AgentTool            string   `json:"agent_tool,omitempty"`
 	AgentPID             int      `json:"agent_pid,omitempty"`
-	ToolLiveness         string   `json:"tool_liveness"` // LIVE, TERMINATED, KILLED, NONE
+	ToolLiveness         string   `json:"tool_liveness"`        // LIVE, TERMINATED, KILLED, NONE
 	ExecutionProvenance  string   `json:"execution_provenance"` // INDEPENDENT_USER_SESSION, COORDINATED_HARNESS, COORDINATED_HARNESS_FAILED, NONE
 	ActiveConversationID string   `json:"active_conversation_id,omitempty"`
 	DiagnosticSummary    string   `json:"diagnostic_summary"`
