@@ -123,7 +123,7 @@ func TestArgvOrder(t *testing.T) {
 			name: "agent explicit model",
 			req: ExecutionRequest{
 				Engine: "agent", Prompt: "build feature", Kind: "execute",
-				Model: "gpt-5",
+				Model:        "gpt-5",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
 			want: []string{"agent", "--print", "--output-format", "text", "--trust", "--force", "--model", "gpt-5", "--", "build feature"},
@@ -151,7 +151,7 @@ func TestArgvOrder(t *testing.T) {
 			name: "autopilot-prompt-run",
 			req: ExecutionRequest{
 				Engine: "autopilot", Prompt: "STORY-GOV-3576", Kind: "execute",
-				StoryID: "STORY-GOV-3576",
+				StoryID:      "STORY-GOV-3576",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
 			want: []string{"autopilot", "prompt", "run", "--story", "STORY-GOV-3576", "STORY-GOV-3576"},
@@ -161,7 +161,7 @@ func TestArgvOrder(t *testing.T) {
 			name: "autopilot-story-execution",
 			req: ExecutionRequest{
 				Engine: "autopilot", Kind: "story_execution",
-				StoryID: "STORY-GOV-3576",
+				StoryID:      "STORY-GOV-3576",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
 			want: []string{"autopilot", "story", "run", "--story", "STORY-GOV-3576"},
@@ -171,7 +171,7 @@ func TestArgvOrder(t *testing.T) {
 			name: "autopilot-story-begin",
 			req: ExecutionRequest{
 				Engine: "autopilot", Kind: "story_begin",
-				StoryID: "STORY-GOV-3576",
+				StoryID:      "STORY-GOV-3576",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
 			want: []string{"autopilot", "story", "begin", "--story", "STORY-GOV-3576"},
@@ -278,7 +278,6 @@ func TestChildEnvPATHAugmentation(t *testing.T) {
 		}
 	}
 }
-
 
 func TestLockRefusal(t *testing.T) {
 	tests := []struct {
@@ -1136,8 +1135,3 @@ func TestExecute_GrandchildPipeLeakResilience(t *testing.T) {
 		t.Fatalf("expected to capture 'engine-work-complete' in stream events, got: %v", stream.events)
 	}
 }
-
-
-
-
-

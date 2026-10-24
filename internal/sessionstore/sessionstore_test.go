@@ -300,5 +300,3 @@ func TestIsValidConversationID(t *testing.T) {
 		}
 	}
 }
-
-

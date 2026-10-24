@@ -117,12 +117,12 @@ type AutopilotClient interface {
 
 // HarnessEvent records progress transitions for telemetry and SSE streaming.
 type HarnessEvent struct {
-	Type        string    `json:"type"` // "stage_transition", "sir_halt", "token_telemetry", "hitl_suspend"
-	JobID       string    `json:"job_id"`
-	Stage       string    `json:"stage,omitempty"`
-	Checkpoint  string    `json:"checkpoint,omitempty"`
-	Tokens      int       `json:"tokens,omitempty"`
-	Duration    string    `json:"duration,omitempty"`
-	Payload     any       `json:"payload,omitempty"`
-	Timestamp   time.Time `json:"timestamp"`
+	Type       string    `json:"type"` // "stage_transition", "sir_halt", "token_telemetry", "hitl_suspend"
+	JobID      string    `json:"job_id"`
+	Stage      string    `json:"stage,omitempty"`
+	Checkpoint string    `json:"checkpoint,omitempty"`
+	Tokens     int       `json:"tokens,omitempty"`
+	Duration   string    `json:"duration,omitempty"`
+	Payload    any       `json:"payload,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
 }

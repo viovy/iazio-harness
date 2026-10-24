@@ -79,7 +79,6 @@ func TestFormatVersion(t *testing.T) {
 	}
 }
 
-
 func TestResolveExecutionOptions(t *testing.T) {
 	// 1. Defaults for normal prompt
 	m, a, disableSlash := resolveExecutionOptions(controlplane.JobDetail{}, "Refactor the authentication module")
@@ -1076,7 +1075,6 @@ fi
 	}
 }
 
-
 func TestExecuteJob_DeterministicResume_Run1AlreadyFellBack_NoStage2DoubleAllocation(t *testing.T) {
 	mockHome := t.TempDir()
 	targetConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
@@ -1671,5 +1669,86 @@ func TestWriteErrorHelpers(t *testing.T) {
 	}
 	if err := run([]string{"service", "invalid-action"}); err == nil {
 		t.Errorf("expected error on unknown service action")
+	}
+}
+
+func TestRunVerifyReleaseCommand(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/agents/debian/tools", func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"host":                   "debian",
+			"supported_capabilities": []string{"user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1"},
+			"tools": []map[string]any{
+				{
+					"name":              "iazio-agent",
+					"installed":         true,
+					"installation_type": "systemd-user",
+					"active_state":      "active",
+					"watchdog_enabled":  true,
+					"config_status":     "synced",
+				},
+				{
+					"name":              "iazio-harvester",
+					"installed":         true,
+					"installation_type": "systemd-user",
+					"active_state":      "active",
+					"watchdog_enabled":  true,
+					"config_status":     "synced",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("GET /api/v1/agents/mac-mini/meta-repo-03/jobs/job-1311", func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"id":                      "job-1311",
+			"initial_conversation_id": "aad902c8-bda6-44c7-8a68-c468a1562399",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("GET /api/v1/agents/mac-mini/meta-repo-03/jobs/job-1313", func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"id":                      "job-1313",
+			"parent_job_id":           "job-1311",
+			"initial_conversation_id": "aad902c8-bda6-44c7-8a68-c468a1562399",
+			"conversation_lineage": []map[string]any{
+				{
+					"conversation_id": "aad902c8-bda6-44c7-8a68-c468a1562399",
+					"role":            "root_initial",
+				},
+				{
+					"conversation_id": "1d446877-5bf9-44eb-9db5-e1c007a9fe31",
+					"role":            "legacy_unpinned_secondary",
+				},
+				{
+					"conversation_id": "14de9a1f-5679-4f11-a08f-f32bc7e47663",
+					"role":            "legacy_unpinned_secondary",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	if err := runVerifyReleaseCommand([]string{"--api-url", server.URL, "--token", "test-token"}); err != nil {
+		t.Fatalf("unexpected error running verify-release command: %v", err)
+	}
+
+	if err := run([]string{"verify-release", "--api-url", server.URL, "--token", "test-token"}); err != nil {
+		t.Fatalf("unexpected error running verify-release via run: %v", err)
+	}
+
+	if err := run([]string{"verify-live-release", "--api-url", server.URL, "--token", "test-token"}); err != nil {
+		t.Fatalf("unexpected error running verify-live-release via run: %v", err)
+	}
+
+	// Failure case
+	if err := runVerifyReleaseCommand([]string{"--api-url", "http://127.0.0.1:1"}); err == nil {
+		t.Fatal("expected error connecting to non-existent server, got nil")
 	}
 }

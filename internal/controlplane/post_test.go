@@ -280,6 +280,3 @@ func TestControlplaneExtraCoverage(t *testing.T) {
 	// 6. Non-retryable GetJob on non-transient status
 	_, _ = GetJob(context.Background(), srv.URL, "tok", "fail-post")
 }
-
-
-

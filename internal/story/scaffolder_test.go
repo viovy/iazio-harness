@@ -414,4 +414,3 @@ func TestMaterializeLiveStory(t *testing.T) {
 		t.Fatalf("MaterializePendingStories live failed: %v", err)
 	}
 }
-
