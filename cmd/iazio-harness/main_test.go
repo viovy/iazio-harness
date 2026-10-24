@@ -749,6 +749,61 @@ exit 1
 	}
 }
 
+func TestExecuteJob_DeterministicResume_ToolOutputNotAttachError(t *testing.T) {
+	mockHome := t.TempDir()
+	targetConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	_ = os.MkdirAll(filepath.Join(mockHome, ".gemini", "antigravity-cli", "brain", targetConvID), 0755)
+	t.Setenv("HOME", mockHome)
+
+	mockDir := t.TempDir()
+	countFile := filepath.Join(mockDir, "invocations.txt")
+	mockAgy := filepath.Join(mockDir, "agy")
+	// The mock tool outputs a line containing "conversation not found" in regular command stdout, but NOT an engine error line
+	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
+echo "run" >> "%s"
+echo "grep: checking source files..."
+echo "file scanner: conversation not found in local index"
+exit 1
+`, countFile)), 0755)
+
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") || strings.HasSuffix(r.URL.Path, "/conversations") || strings.HasSuffix(r.URL.Path, "/exit") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-1313-tool-output-no-fallback" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:                    "job-1313-tool-output-no-fallback",
+				Kind:                  "resume",
+				Engine:                "agy",
+				Prompt:                "resume",
+				WorktreePath:          workDir,
+				InitialConversationID: targetConvID,
+				ResumeConversationID:  targetConvID,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	_ = executeJob(context.Background(), srv.URL, "job-1313-tool-output-no-fallback", workDir, "")
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("expected count file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected exactly 1 execution (no false-positive Stage 2 fallback from tool output), got %d executions", len(lines))
+	}
+}
+
 func TestExecuteJob_DeterministicResume_PostRunAttachError_SingleFallback(t *testing.T) {
 	mockHome := t.TempDir()
 	targetConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"

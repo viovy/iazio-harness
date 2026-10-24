@@ -165,6 +165,46 @@ func runJobWithContext(ctx context.Context, args []string) error {
 	return executeJob(ctx, api, jobID, worktree, docsHub, kind, resumeConv)
 }
 
+// hasEngineSessionAttachError inspects engine execution log/stderr specifically for session attachment errors.
+// It requires candidate lines to be anchored by an engine-emitted error prefix
+// (e.g. "[error]", "error:", "fatal:", "failed to...", "cannot find...") to prevent false positives
+// when task commands or tool output mention session/conversation keywords in normal output (Finding B6).
+func hasEngineSessionAttachError(logData []byte) bool {
+	if len(logData) == 0 {
+		return false
+	}
+	lines := strings.Split(string(logData), "\n")
+	for _, raw := range lines {
+		line := strings.TrimSpace(strings.ToLower(raw))
+		if line == "" {
+			continue
+		}
+		isErrorPrefix := strings.HasPrefix(line, "[error]") ||
+			strings.HasPrefix(line, "error:") ||
+			strings.HasPrefix(line, "fatal:") ||
+			strings.HasPrefix(line, "[fatal]") ||
+			strings.HasPrefix(line, "failed to attach") ||
+			strings.HasPrefix(line, "failed to open session") ||
+			strings.HasPrefix(line, "cannot find session") ||
+			strings.HasPrefix(line, "cannot find conversation") ||
+			strings.HasPrefix(line, "corrupted session") ||
+			strings.HasPrefix(line, "conversation not found") ||
+			strings.HasPrefix(line, "session not found") ||
+			strings.HasPrefix(line, "invalid session")
+
+		if !isErrorPrefix {
+			continue
+		}
+
+		if strings.Contains(line, "conversation") ||
+			strings.Contains(line, "session") ||
+			strings.Contains(line, "database") {
+			return true
+		}
+	}
+	return false
+}
+
 func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
 	var spanOpts = []telemetry.SpanOption{
 		telemetry.WithKind("INTERNAL"),
@@ -635,8 +675,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	// Execution Diagnosis & Anomaly Detection
 	_ = sp.Sync()
 	engineLogData, _ := os.ReadFile(execReq.LogFile)
+	engineLogStr := string(engineLogData)
 	spoolLogData, _ := os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
-	combinedOutput := string(engineLogData) + "\n" + string(spoolLogData)
+	combinedOutput := engineLogStr + "\n" + string(spoolLogData)
 
 	diagReport := diagnostics.Diagnose(diagnostics.DiagnosticInput{
 		JobID:        job.ID,
@@ -650,25 +691,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	sessionConfirmed := (confirmedConvID == resumeConvID)
 	convMu.Unlock()
 
-	// Inspect engine execution log/stderr specifically (never LLM agent output or transcript) for session attach errors
-	engineLogStr := strings.ToLower(string(engineLogData))
-	hasEngineSessionError := strings.Contains(engineLogStr, "conversation not found") ||
-		strings.Contains(engineLogStr, "session not found") ||
-		strings.Contains(engineLogStr, "failed to open session") ||
-		strings.Contains(engineLogStr, "failed to attach to conversation") ||
-		strings.Contains(engineLogStr, "failed to attach to session") ||
-		strings.Contains(engineLogStr, "corrupted session database") ||
-		strings.Contains(engineLogStr, "no session with id") ||
-		strings.Contains(engineLogStr, "unknown conversation") ||
-		strings.Contains(engineLogStr, "invalid session id") ||
-		strings.Contains(engineLogStr, "cannot find conversation") ||
-		strings.Contains(engineLogStr, "cannot find session") ||
-		strings.Contains(engineLogStr, "cannot load session") ||
-		strings.Contains(engineLogStr, "session file missing") ||
-		strings.Contains(engineLogStr, "no conversation found") ||
-		strings.Contains(engineLogStr, "conversation file does not exist") ||
-		strings.Contains(engineLogStr, "session does not exist") ||
-		strings.Contains(engineLogStr, "conversation does not exist")
+	// Inspect engine execution log/stderr specifically (never LLM agent output or transcript) for session attach errors (Finding B6)
+	hasEngineSessionError := hasEngineSessionAttachError(engineLogData)
+	if !hasEngineSessionError && len(combinedOutput) > 0 {
+		hasEngineSessionError = hasEngineSessionAttachError([]byte(combinedOutput))
+	}
 
 	isQuotaExhausted := false
 	for _, f := range diagReport.Findings {
