@@ -278,11 +278,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 
 	resumeConvID := job.ResumeConversationID
-	if resumeConvID == "" {
-		resumeConvID = job.InitialConversationID
-	}
 	if resumeConvID == "" && job.ActiveConversationID != "" {
 		resumeConvID = job.ActiveConversationID
+	}
+	if resumeConvID == "" {
+		resumeConvID = job.InitialConversationID
 	}
 	if resumeConvID == "" && job.EnvVars != nil {
 		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
@@ -358,9 +358,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			preflightFallbackReason = fmt.Sprintf("invalid initial conversation id format: %s", resumeConvID)
 			log.Printf("[harness] [job.resume.conversation_fallback] initial_conversation_id=%s reason=%q", resumeConvID, preflightFallbackReason)
 			resumeConvID = ""
-		} else if !sessionstore.DefaultResolver().SessionExists(resumeConvID) {
+		} else if engineName == "agy" && !sessionstore.DefaultResolver().SessionExists(resumeConvID) {
 			isPreflightFallback = true
-			preflightFallbackReason = fmt.Sprintf("initial conversation %s does not exist on disk on host", resumeConvID)
+			preflightFallbackReason = fmt.Sprintf("initial conversation %s does not exist on disk on host for engine agy", resumeConvID)
 			log.Printf("[harness] [job.resume.conversation_fallback] initial_conversation_id=%s reason=%q", resumeConvID, preflightFallbackReason)
 			resumeConvID = ""
 		}
@@ -646,8 +646,32 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		OutputText:   combinedOutput,
 	})
 
+	convMu.Lock()
+	sessionAttached := (confirmedConvID != "" && confirmedConvID == resumeConvID)
+	convMu.Unlock()
+
+	hasSessionError := strings.Contains(strings.ToLower(combinedOutput), "session not found") ||
+		strings.Contains(strings.ToLower(combinedOutput), "conversation not found") ||
+		strings.Contains(strings.ToLower(combinedOutput), "failed to load session") ||
+		strings.Contains(strings.ToLower(combinedOutput), "failed to resume conversation") ||
+		strings.Contains(strings.ToLower(combinedOutput), "corrupted session")
+
+	isQuotaExhausted := false
+	for _, f := range diagReport.Findings {
+		if f.Code == diagnostics.CodeQuotaExhausted {
+			isQuotaExhausted = true
+			break
+		}
+	}
+	if !isQuotaExhausted && (strings.Contains(combinedOutput, "ActionRequiredError") || strings.Contains(combinedOutput, "out of usage")) {
+		isQuotaExhausted = true
+	}
+
+	isSessionAttachFailure := (!sessionAttached || hasSessionError) && !isQuotaExhausted
+
 	// Check for conversation resume failure auto-fallback (Stage 2 Fallback)
-	if resumeConvID != "" && execRes.ExitCode != 0 && ctx.Err() == nil {
+	// ONLY trigger if session could not be attached or unrecoverable session error occurred (F2)
+	if resumeConvID != "" && execRes.ExitCode != 0 && ctx.Err() == nil && isSessionAttachFailure {
 		fallbackReason := fmt.Sprintf("tool execution failed to resume on conversation %s (exit code %d)", resumeConvID, execRes.ExitCode)
 		fallbackMsg := fmt.Sprintf("[iazio-harness] [job.resume.conversation_fallback] %s; activating Stage 2 fallback: starting new conversation...\n", fallbackReason)
 		_ = sp.AppendRaw("stdout", []byte(fallbackMsg))
@@ -700,7 +724,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 
 	// Check for quota exhaustion auto-fallback
-	isQuotaExhausted := false
+	isQuotaExhausted = false
 	for _, f := range diagReport.Findings {
 		if f.Code == diagnostics.CodeQuotaExhausted {
 			isQuotaExhausted = true

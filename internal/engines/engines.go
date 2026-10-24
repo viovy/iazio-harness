@@ -162,9 +162,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		return ExecutionResult{}, errors.New("empty argv")
 	}
 
-	if req.ResumeConversationID != "" && req.OnConversationID != nil {
-		req.OnConversationID(req.ResumeConversationID)
-	} else if req.Engine == "agent" && req.OnConversationID != nil && len(req.Argv) == 0 {
+	if req.Engine == "agent" && req.ResumeConversationID == "" && req.OnConversationID != nil && len(req.Argv) == 0 {
 		look := c.LookPath
 		if look == nil {
 			look = exec.LookPath
@@ -575,6 +573,11 @@ func (w rawWriter) Write(p []byte) (int, error) {
 func extractConversationIDFromText(sData string) string {
 	markers := []string{
 		"Created conversation ",
+		"Resumed conversation ",
+		"Resuming conversation ",
+		"Loaded conversation ",
+		"Active conversation ",
+		"Using conversation ",
 		"Print mode: conversation=",
 		"conversation=",
 		"conversationID=",
