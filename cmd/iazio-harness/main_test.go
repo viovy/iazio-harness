@@ -917,6 +917,204 @@ fi
 }
 
 
+func TestExecuteJob_DeterministicResume_Run1AlreadyFellBack_NoStage2DoubleAllocation(t *testing.T) {
+	mockHome := t.TempDir()
+	targetConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	fallbackConvX := "11112222-3333-4444-5555-666677778888"
+	_ = os.MkdirAll(filepath.Join(mockHome, ".gemini", "antigravity-cli", "brain", targetConvID), 0755)
+	t.Setenv("HOME", mockHome)
+
+	mockDir := t.TempDir()
+	countFile := filepath.Join(mockDir, "invocations.txt")
+	mockAgy := filepath.Join(mockDir, "agy")
+	// Run 1 emits "Conversation ID: fallbackConvX" during execution, and then exits with attach error.
+	// Since run 1 already fell back to fallbackConvX, Stage 2 must NOT execute again and allocate a second ID (Finding F1).
+	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
+echo "run" >> "%s"
+echo "Conversation ID: %s"
+PREV=""
+for arg in "$@"; do
+    if [ "$PREV" = "--log-file" ]; then
+        echo "fatal: session not found on host" > "$arg"
+    fi
+    PREV="$arg"
+done
+exit 1
+`, countFile, fallbackConvX)), 0755)
+
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	var postMu sync.Mutex
+	postedConvs := []map[string]any{}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") || strings.HasSuffix(r.URL.Path, "/exit") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postMu.Lock()
+			postedConvs = append(postedConvs, body)
+			postMu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-f1-check" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:                    "job-f1-check",
+				Kind:                  "resume",
+				Engine:                "agy",
+				Prompt:                "resume",
+				WorktreePath:          workDir,
+				InitialConversationID: targetConvID,
+				ResumeConversationID:  targetConvID,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	_ = executeJob(context.Background(), srv.URL, "job-f1-check", workDir, "")
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("expected count file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected exactly 1 execution (no secondary Stage 2 allocation when run 1 already fell back), got %d executions: %v", len(lines), lines)
+	}
+
+	postMu.Lock()
+	defer postMu.Unlock()
+	if len(postedConvs) != 1 {
+		t.Fatalf("expected exactly 1 posted conversation, got %d: %+v", len(postedConvs), postedConvs)
+	}
+	if postedConvs[0]["conversation_id"] != fallbackConvX {
+		t.Fatalf("expected conversation_id %s, got %v", fallbackConvX, postedConvs[0]["conversation_id"])
+	}
+	if postedConvs[0]["role"] != "fallback_primary" {
+		t.Fatalf("expected role fallback_primary, got %v", postedConvs[0]["role"])
+	}
+}
+
+func TestExecuteJob_DeterministicResume_SpoolDatabaseKeyword_NoFallback(t *testing.T) {
+	mockHome := t.TempDir()
+	targetConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	_ = os.MkdirAll(filepath.Join(mockHome, ".gemini", "antigravity-cli", "brain", targetConvID), 0755)
+	t.Setenv("HOME", mockHome)
+
+	mockDir := t.TempDir()
+	countFile := filepath.Join(mockDir, "invocations.txt")
+	mockAgy := filepath.Join(mockDir, "agy")
+	// The tool outputs "Error: database migration failed" in tool stdout, but NOT in engine log
+	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
+echo "run" >> "%s"
+echo "Error: database migration failed"
+exit 1
+`, countFile)), 0755)
+
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") || strings.HasSuffix(r.URL.Path, "/conversations") || strings.HasSuffix(r.URL.Path, "/exit") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-db-keyword-test" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:                    "job-db-keyword-test",
+				Kind:                  "resume",
+				Engine:                "agy",
+				Prompt:                "resume",
+				WorktreePath:          workDir,
+				InitialConversationID: targetConvID,
+				ResumeConversationID:  targetConvID,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	_ = executeJob(context.Background(), srv.URL, "job-db-keyword-test", workDir, "")
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("expected count file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected exactly 1 execution (no false-positive Stage 2 from database keyword), got %d executions", len(lines))
+	}
+}
+
+func TestExecuteJob_DeterministicResume_ControlPlaneResume_NoHeuristicDiscovery(t *testing.T) {
+	mockHome := t.TempDir()
+	t.Setenv("HOME", mockHome)
+
+	mockDir := t.TempDir()
+	countFile := filepath.Join(mockDir, "invocations.txt")
+	argsFile := filepath.Join(mockDir, "args.txt")
+	mockAgy := filepath.Join(mockDir, "agy")
+	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
+echo "run" >> "%s"
+echo "$@" >> "%s"
+echo "Conversation ID: new-allocated-conv-12345"
+exit 0
+`, countFile, argsFile)), 0755)
+
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	// Create dirty context that would normally trigger heuristic discovery
+	_ = os.MkdirAll(filepath.Join(workDir, "docs", "reviews"), 0755)
+	_ = os.WriteFile(filepath.Join(workDir, "docs", "reviews", "2026-10-24-review-test.md"), []byte(`---
+conversation_id: "heuristic-guessed-conv-id"
+---
+`), 0644)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") || strings.HasSuffix(r.URL.Path, "/conversations") || strings.HasSuffix(r.URL.Path, "/exit") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-cp-no-heuristic" {
+			w.WriteHeader(http.StatusOK)
+			// Control-plane resume with empty ResumeConversationID (fallback or fresh resume requested)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:           "job-cp-no-heuristic",
+				ParentJobID:  "job-parent-123",
+				RootJobID:    "job-root-100",
+				Kind:         "resume",
+				Engine:       "agy",
+				Prompt:       "resume",
+				WorktreePath: workDir,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	_ = executeJob(context.Background(), srv.URL, "job-cp-no-heuristic", workDir, "")
+
+	argsData, _ := os.ReadFile(argsFile)
+	if strings.Contains(string(argsData), "heuristic-guessed-conv-id") {
+		t.Fatalf("control-plane resume must NOT heuristically discover or bind unpinned conversation from dirty context, got args: %s", string(argsData))
+	}
+}
+
 func TestPipedStdinHandlers(t *testing.T) {
 	origStdin := os.Stdin
 	defer func() { os.Stdin = origStdin }()

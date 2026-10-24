@@ -168,7 +168,7 @@ func runJobWithContext(ctx context.Context, args []string) error {
 // hasEngineSessionAttachError inspects engine execution log/stderr specifically for session attachment errors.
 // It requires candidate lines to be anchored by an engine-emitted error prefix
 // (e.g. "[error]", "error:", "fatal:", "failed to...", "cannot find...") to prevent false positives
-// when task commands or tool output mention session/conversation keywords in normal output (Finding B6).
+// when task commands or tool output mention session/conversation keywords in normal output (Finding B6, F5).
 func hasEngineSessionAttachError(logData []byte) bool {
 	if len(logData) == 0 {
 		return false
@@ -197,12 +197,21 @@ func hasEngineSessionAttachError(logData []byte) bool {
 		}
 
 		if strings.Contains(line, "conversation") ||
-			strings.Contains(line, "session") ||
-			strings.Contains(line, "database") {
+			strings.Contains(line, "session") {
 			return true
 		}
 	}
 	return false
+}
+
+func sanitizeAlphanumeric(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
@@ -330,7 +339,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	if resumeConvID == "" && len(job.ConversationIDs) > 0 {
 		resumeConvID = job.ConversationIDs[len(job.ConversationIDs)-1]
 	}
-	if job.Kind == "resume" {
+	isControlPlaneResume := (job.ParentJobID != "" || job.RootJobID != "")
+	if job.Kind == "resume" && !isControlPlaneResume {
 		resolver := sessionstore.DefaultResolver()
 		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
 		if (job.StoryID == "" || strings.EqualFold(job.StoryID, fallbackResumeStoryID) || strings.EqualFold(job.StoryID, "resume complete current ase flow")) && dCtx.StoryID != "" {
@@ -351,12 +361,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			}
 		}
 		if resumeConvID != "" {
-			lowConv := strings.ToLower(resumeConvID)
-			if !strings.HasPrefix(lowConv, "cursor-") && engineName == "agent" {
-				engineName = "agy"
-				log.Printf("[harness] Auto-corrected engine from agent to agy for session %s", resumeConvID)
-			}
-			log.Printf("[harness] Auto-discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
+			log.Printf("[harness] Standalone resume discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
 		}
 	}
 	lockHandle, lockErr := repolock.Acquire(worktree, repolock.LockInfo{
@@ -385,7 +390,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 	defer lockHandle.Release()
 
-	if resumeConvID == "" && lockHandle.Info().ConversationID != "" && (job.Kind == "resume" || (job.StoryID != "" && lockHandle.Info().StoryID == job.StoryID && lockHandle.Info().Status != "COMPLETED")) {
+	if !isControlPlaneResume && resumeConvID == "" && lockHandle.Info().ConversationID != "" && (job.Kind == "resume" || (job.StoryID != "" && lockHandle.Info().StoryID == job.StoryID && lockHandle.Info().Status != "COMPLETED")) {
 		resumeConvID = lockHandle.Info().ConversationID
 		log.Printf("[harness] Adopted prior conversation %s from repo lock for %s", resumeConvID, worktree)
 	}
@@ -408,14 +413,18 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 
 	if isPreflightFallback && job.InterruptedASEState != nil && len(job.InterruptedASEState) > 0 {
-		resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s interrupted. Fallback to new conversation. Interrupted State: phase=%v, step=%v, story_id=%v, gate=%v. Resume execution from this checkpoint.]\n\n",
-			attemptedResumeConv,
-			job.InterruptedASEState["phase"],
-			job.InterruptedASEState["step"],
-			job.InterruptedASEState["story_id"],
-			job.InterruptedASEState["last_completed_gate"],
-		)
-		prepRes.Prompt = resumeDirective + prepRes.Prompt
+		phase, _ := job.InterruptedASEState["phase"].(string)
+		phaseSource, _ := job.InterruptedASEState["phase_source"].(string)
+		if phase != "" && phase != "UNKNOWN" && phaseSource != "default" {
+			resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s interrupted. Fallback to new conversation. Interrupted State: phase=%s, step=%v, story_id=%v, gate=%v. Resume execution from this checkpoint.]\n\n",
+				sanitizeAlphanumeric(attemptedResumeConv),
+				sanitizeAlphanumeric(phase),
+				job.InterruptedASEState["step"],
+				sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["story_id"])),
+				sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["last_completed_gate"])),
+			)
+			prepRes.Prompt = resumeDirective + prepRes.Prompt
+		}
 	}
 
 	var activePID int
@@ -645,7 +654,10 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 					time.Sleep(time.Duration(attempt*100) * time.Millisecond)
 				}
 				if err != nil {
-					log.Printf("warning: failed to post conversation ID %s for job %s: %v", c, jobID, err)
+					fatalMsg := fmt.Sprintf("[iazio-harness] FATAL: failed to register conversation ID %s for job %s with control plane after 10 attempts: %v\n", c, jobID, err)
+					log.Printf("%s", fatalMsg)
+					_ = sp.AppendRaw("stderr", []byte(fatalMsg))
+					_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fatalMsg)
 				}
 			}(cid, isFallback, fallbackReason, role, asePhase)
 		},
@@ -689,13 +701,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 
 	convMu.Lock()
 	sessionConfirmed := (confirmedConvID == resumeConvID)
+	alreadyFellBack := (confirmedConvID != "" && confirmedConvID != resumeConvID)
 	convMu.Unlock()
 
-	// Inspect engine execution log/stderr specifically (never LLM agent output or transcript) for session attach errors (Finding B6)
+	// Inspect engine execution log/stderr specifically (never LLM agent output or spool) for session attach errors (Finding B6, F5)
 	hasEngineSessionError := hasEngineSessionAttachError(engineLogData)
-	if !hasEngineSessionError && len(combinedOutput) > 0 {
-		hasEngineSessionError = hasEngineSessionAttachError([]byte(combinedOutput))
-	}
 
 	isQuotaExhausted := false
 	for _, f := range diagReport.Findings {
@@ -711,7 +721,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 
 	// Stage 2 fallback ONLY triggers if the engine actively failed to attach to resumeConvID.
 	// Normal task failures (lint, tests, build) inside the session must NEVER trigger Stage 2 fallback (F1, F2).
-	isSessionAttachFailure := !sessionConfirmed && hasEngineSessionError && !isQuotaExhausted
+	// If run 1 already fell back and pinned a new conversation (alreadyFellBack), Stage 2 must NOT run again (F1).
+	isSessionAttachFailure := !sessionConfirmed && !alreadyFellBack && hasEngineSessionError && !isQuotaExhausted
 
 	// Check for conversation resume failure auto-fallback (Stage 2 Fallback)
 	// ONLY trigger if session could not be attached or unrecoverable session error occurred (F2)
@@ -733,15 +744,19 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		convMu.Unlock()
 
 		if job.InterruptedASEState != nil && len(job.InterruptedASEState) > 0 {
-			resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s failed with exit code %d. Fallback to new conversation. Interrupted State: phase=%v, step=%v, story_id=%v, gate=%v. Resume execution from this checkpoint.]\n\n",
-				resumeConvID,
-				execRes.ExitCode,
-				job.InterruptedASEState["phase"],
-				job.InterruptedASEState["step"],
-				job.InterruptedASEState["story_id"],
-				job.InterruptedASEState["last_completed_gate"],
-			)
-			fallbackReq.Prompt = resumeDirective + fallbackReq.Prompt
+			phase, _ := job.InterruptedASEState["phase"].(string)
+			phaseSource, _ := job.InterruptedASEState["phase_source"].(string)
+			if phase != "" && phase != "UNKNOWN" && phaseSource != "default" {
+				resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s failed with exit code %d. Fallback to new conversation. Interrupted State: phase=%s, step=%v, story_id=%v, gate=%v. Resume execution from this checkpoint.]\n\n",
+					sanitizeAlphanumeric(resumeConvID),
+					execRes.ExitCode,
+					sanitizeAlphanumeric(phase),
+					job.InterruptedASEState["step"],
+					sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["story_id"])),
+					sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["last_completed_gate"])),
+				)
+				fallbackReq.Prompt = resumeDirective + fallbackReq.Prompt
+			}
 		}
 
 		execRes, execErr = runner.Execute(ctx, fallbackReq, sp)
