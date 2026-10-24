@@ -296,8 +296,16 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		job.Kind = kindOverride
 	}
 	if resumeConvOverride != "" {
-		if isControlPlaneResume && job.ResumeConversationID == "" && job.ActiveConversationID == "" {
-			log.Printf("[harness] ignoring --resume-conversation=%s override for control plane resume with empty parent conversation", resumeConvOverride)
+		if isControlPlaneResume {
+			// For Control Plane resumes, the control plane job record is authoritative (Finding L1)
+			if (job.ResumeConversationID != "" && resumeConvOverride != job.ResumeConversationID) ||
+				(job.ActiveConversationID != "" && resumeConvOverride != job.ActiveConversationID) {
+				log.Printf("[harness] [job.resume.identity_mismatch] ignoring argv override %s, adhering to control plane resume identity %s", resumeConvOverride, job.ResumeConversationID)
+			} else if job.ResumeConversationID == "" && job.ActiveConversationID == "" {
+				log.Printf("[harness] ignoring --resume-conversation=%s override for control plane resume with empty parent conversation", resumeConvOverride)
+			} else {
+				job.ResumeConversationID = resumeConvOverride
+			}
 		} else {
 			job.ResumeConversationID = resumeConvOverride
 		}
@@ -767,7 +775,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	// Execution Diagnosis & Anomaly Detection
 	_ = sp.Sync()
 	engineLogData, _ := os.ReadFile(execReq.LogFile)
-	engineLogStr := string(engineLogData)
+	stderrLogData, _ := os.ReadFile(strings.TrimSuffix(execReq.LogFile, ".log") + ".stderr.log")
+	combinedEngineLog := append(append([]byte(nil), engineLogData...), stderrLogData...)
+	engineLogStr := string(combinedEngineLog)
 	spoolLogData, _ := os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
 	combinedOutput := engineLogStr + "\n" + string(spoolLogData)
 
@@ -784,11 +794,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	alreadyFellBack := (confirmedConvID != "" && confirmedConvID != resumeConvID)
 	convMu.Unlock()
 
-	// Inspect engine execution log/stderr specifically (never LLM agent output or spool) for session attach errors (Finding B6, F5)
-	hasEngineSessionError := hasEngineSessionAttachError(engineLogData)
+	// Inspect engine execution log/stderr specifically (never LLM agent output or spool) for session attach errors (Finding B6, F5, H1)
+	hasEngineSessionError := hasEngineSessionAttachError(combinedEngineLog)
 
-	// Inspect engine execution log/stderr specifically (never LLM agent output or spool) for quota exhaustion errors (Finding M3)
-	isQuotaExhausted := hasEngineQuotaExhaustedError(engineLogData)
+	// Inspect engine execution log/stderr specifically (never LLM agent output or spool) for quota exhaustion errors (Finding M3, H1)
+	isQuotaExhausted := hasEngineQuotaExhaustedError(combinedEngineLog)
 	if !isQuotaExhausted {
 		for _, f := range diagReport.Findings {
 			if f.Code == diagnostics.CodeQuotaExhausted {
@@ -865,19 +875,25 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		// Re-diagnose after fallback run
 		_ = sp.Sync()
 		engineLogData, _ = os.ReadFile(fallbackReq.LogFile)
+		stderrLogData, _ = os.ReadFile(strings.TrimSuffix(fallbackReq.LogFile, ".log") + ".stderr.log")
+		combinedEngineLog = append(append([]byte(nil), engineLogData...), stderrLogData...)
+		engineLogStr = string(combinedEngineLog)
 		spoolLogData, _ = os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
-		combinedOutput = string(engineLogData) + "\n" + string(spoolLogData)
+		combinedOutput = engineLogStr + "\n" + string(spoolLogData)
 		diagReport = diagnostics.Diagnose(diagnostics.DiagnosticInput{
 			JobID:        job.ID,
 			StoryID:      job.StoryID,
 			WorktreePath: worktree,
 			ExitCode:     execRes.ExitCode,
-			OutputText:   string(engineLogData),
+			OutputText:   engineLogStr,
 		})
 	}
 
 	// Check for quota exhaustion auto-fallback (inspect engine log only, never spool/LLM text - Finding M3)
-	isQuotaExhausted = hasEngineQuotaExhaustedError(engineLogData)
+	isQuotaExhausted = hasEngineQuotaExhaustedError(combinedEngineLog)
+	if !isQuotaExhausted && engineName == "agent" {
+		isQuotaExhausted = hasEngineQuotaExhaustedError([]byte(spoolLogData))
+	}
 	if !isQuotaExhausted {
 		for _, f := range diagReport.Findings {
 			if f.Code == diagnostics.CodeQuotaExhausted {
@@ -935,14 +951,17 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			// Re-diagnose after fallback run
 			_ = sp.Sync()
 			engineLogData, _ = os.ReadFile(fallbackReq.LogFile)
+			stderrLogData, _ = os.ReadFile(strings.TrimSuffix(fallbackReq.LogFile, ".log") + ".stderr.log")
+			combinedEngineLog = append(append([]byte(nil), engineLogData...), stderrLogData...)
+			engineLogStr = string(combinedEngineLog)
 			spoolLogData, _ = os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
-			combinedOutput = string(engineLogData) + "\n" + string(spoolLogData)
+			combinedOutput = engineLogStr + "\n" + string(spoolLogData)
 			diagReport = diagnostics.Diagnose(diagnostics.DiagnosticInput{
 				JobID:        job.ID,
 				StoryID:      job.StoryID,
 				WorktreePath: worktree,
 				ExitCode:     execRes.ExitCode,
-				OutputText:   string(engineLogData),
+				OutputText:   engineLogStr,
 			})
 		} else {
 			warnMsg := fmt.Sprintf("[iazio-harness] Auto-fallback engine '%s' is not installed on host PATH: %v\n", fallbackEngine, checkErr)

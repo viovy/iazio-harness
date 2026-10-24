@@ -609,7 +609,7 @@ func (m *mockRawStream) AppendRaw(stream string, p []byte) error {
 }
 
 func TestRawWriter_ResumeConversationIsolation(t *testing.T) {
-	// Verify that when ResumeConversationID is set, rawWriter ignores LLM stdout containing foreign conversation IDs (Finding H1)
+	// Verify that when ResumeConversationID is set, rawWriter ignores LLM stdout containing foreign conversation IDs (Finding H1, M1)
 	expectedID := "aad902c8-bda6-44c7-8a68-c468a1562399"
 	foreignID := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
 
@@ -638,7 +638,27 @@ func TestRawWriter_ResumeConversationIsolation(t *testing.T) {
 		t.Fatalf("expected foreign ID to be ignored, but detected: %s", detectedID)
 	}
 
-	// 2. Real engine marker with expected ID is received
+	// 2. LLM echoes 'Created conversation <foreign>' in its markdown
+	llmCreated := []byte("The prior output was: Created conversation " + foreignID + "\n")
+	_, err = writer.Write(llmCreated)
+	if err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	if detectedID != "" {
+		t.Fatalf("expected foreign created ID to be ignored during resume, but detected: %s", detectedID)
+	}
+
+	// 3. LLM echoes JSON '{"conversation_id":"<foreign>"}'
+	llmJSON := []byte(`{"event":"chunk","conversation_id":"` + foreignID + `"}` + "\n")
+	_, err = writer.Write(llmJSON)
+	if err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	if detectedID != "" {
+		t.Fatalf("expected foreign JSON conversation_id to be ignored during resume, but detected: %s", detectedID)
+	}
+
+	// 4. Real engine marker with expected ID is received
 	engineMarker := []byte("Resumed conversation " + expectedID + "\n")
 	_, err = writer.Write(engineMarker)
 	if err != nil {

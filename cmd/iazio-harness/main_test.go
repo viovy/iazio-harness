@@ -1091,16 +1091,17 @@ func TestExecuteJob_DeterministicResume_Run1AlreadyFellBack_NoStage2DoubleAlloca
 	// Since run 1 already fell back to fallbackConvX, Stage 2 must NOT execute again and allocate a second ID (Finding F1).
 	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
 echo "run" >> "%s"
-echo "Conversation ID: %s"
 PREV=""
 for arg in "$@"; do
     if [ "$PREV" = "--log-file" ]; then
-        echo "fatal: session not found on host" > "$arg"
+        echo "Conversation ID: %s" > "$arg"
+        echo "fatal: session not found on host" >> "$arg"
     fi
     PREV="$arg"
 done
+echo "Conversation ID: %s"
 exit 1
-`, countFile, fallbackConvX)), 0755)
+`, countFile, fallbackConvX, fallbackConvX)), 0755)
 
 	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
 

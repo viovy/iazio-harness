@@ -312,17 +312,18 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	var scanned bool
 	var convMu sync.Mutex
 	var recentOut, recentErr string
-	var logFileHandle *os.File
+	var stderrLogFile *os.File
 	if req.LogFile != "" {
-		_ = os.MkdirAll(filepath.Dir(req.LogFile), 0755)
-		if lf, errL := os.OpenFile(req.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); errL == nil {
-			logFileHandle = lf
-			defer logFileHandle.Close()
+		stderrLogPath := strings.TrimSuffix(req.LogFile, ".log") + ".stderr.log"
+		_ = os.MkdirAll(filepath.Dir(stderrLogPath), 0755)
+		if f, err := os.OpenFile(stderrLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+			stderrLogFile = f
+			defer stderrLogFile.Close()
 		}
 	}
 
-	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentOut, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: logFileHandle}
-	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentErr, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: logFileHandle}
+	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentOut, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: nil}
+	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentErr, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: stderrLogFile}
 
 	startTime := time.Now().Add(-2 * time.Second)
 	var logOffset int64
@@ -351,7 +352,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 						data, errR := io.ReadAll(f)
 						if errR == nil && len(data) > 0 {
 							logOffset = fi.Size()
-							if cid := extractConversationIDFromText(string(data)); cid != "" {
+							if cid := extractConversationIDFromText(string(data), ""); cid != "" {
 								scanned = true
 								req.OnConversationID(cid)
 								return
@@ -396,7 +397,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 					_, _ = fCli.Seek(seekPos, io.SeekStart)
 					dataCli, _ := io.ReadAll(fCli)
 					if len(dataCli) > 0 {
-						if cid := extractConversationIDFromText(string(dataCli)); cid != "" {
+						if cid := extractConversationIDFromText(string(dataCli), ""); cid != "" {
 							scanned = true
 							req.OnConversationID(cid)
 							return
@@ -592,9 +593,13 @@ func (w rawWriter) Write(p []byte) (int, error) {
 			} else {
 				combined = string(p)
 			}
-			if cid := extractConversationID(combined); cid != "" {
-				*w.scanned = true
-				w.onConv(cid)
+			if cid := extractConversationID(combined, w.resumeConvID); cid != "" {
+				if w.resumeConvID != "" && cid != w.resumeConvID {
+					// Ignore foreign conversation ID emitted on stdout/stderr during a resume run (Finding M1)
+				} else {
+					*w.scanned = true
+					w.onConv(cid)
+				}
 			}
 		}
 		w.mu.Unlock()
@@ -608,7 +613,11 @@ func (w rawWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func extractConversationIDFromText(sData string) string {
+func extractConversationIDFromText(sData string, resumeConvIDs ...string) string {
+	var resumeConvID string
+	if len(resumeConvIDs) > 0 {
+		resumeConvID = resumeConvIDs[0]
+	}
 	markers := []string{
 		"Created conversation ",
 		"created conversation ",
@@ -631,6 +640,7 @@ func extractConversationIDFromText(sData string) string {
 		"streaming conversation ",
 		"GetConversationDetail: found conversation ",
 	}
+	var firstCandidate string
 	for _, marker := range markers {
 		searchData := sData
 		for {
@@ -646,32 +656,60 @@ func extractConversationIDFromText(sData string) string {
 				candidate := strings.Trim(fields[0], " .,;:\"'")
 				candidate = strings.TrimPrefix(candidate, "--conversation=")
 				if len(candidate) >= 32 && sessionstore.IsValidConversationID(candidate) {
-					return candidate
+					if resumeConvID != "" && candidate == resumeConvID {
+						return candidate
+					}
+					if firstCandidate == "" {
+						firstCandidate = candidate
+					}
 				}
 			}
 			searchData = rest
 		}
 	}
+	if resumeConvID == "" {
+		return firstCandidate
+	}
 	return ""
 }
 
-func extractConversationID(s string) string {
+func extractConversationID(s string, resumeConvIDs ...string) string {
+	var resumeConvID string
+	if len(resumeConvIDs) > 0 {
+		resumeConvID = resumeConvIDs[0]
+	}
 	keys := []string{`"conversation_id":"`, `"session_id":"`, `"conversationId":"`, `"sessionId":"`}
+	var firstCandidate string
 	for _, k := range keys {
-		idx := strings.Index(s, k)
-		if idx != -1 {
+		search := s
+		for {
+			idx := strings.Index(search, k)
+			if idx == -1 {
+				break
+			}
 			start := idx + len(k)
-			end := strings.IndexByte(s[start:], '"')
+			end := strings.IndexByte(search[start:], '"')
 			if end != -1 {
-				val := strings.TrimSpace(s[start : start+end])
+				val := strings.TrimSpace(search[start : start+end])
 				if len(val) > 0 && sessionstore.IsValidConversationID(val) {
-					return val
+					if resumeConvID != "" && val == resumeConvID {
+						return val
+					}
+					if firstCandidate == "" {
+						firstCandidate = val
+					}
 				}
+				search = search[start+end:]
+			} else {
+				break
 			}
 		}
 	}
-	if cid := extractConversationIDFromText(s); cid != "" {
+	if cid := extractConversationIDFromText(s, resumeConvID); cid != "" {
 		return cid
+	}
+	if resumeConvID == "" {
+		return firstCandidate
 	}
 	return ""
 }
