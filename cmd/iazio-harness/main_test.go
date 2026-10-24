@@ -428,9 +428,13 @@ func TestExecuteJob_AutoFallbackOnQuota(t *testing.T) {
 }
 
 func TestExecuteJob_DeterministicResumeConversationPinning(t *testing.T) {
+	mockHome := t.TempDir()
+	targetConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	_ = os.MkdirAll(filepath.Join(mockHome, ".gemini", "antigravity-cli", "brain", targetConvID), 0755)
+	t.Setenv("HOME", mockHome)
+
 	mockDir := t.TempDir()
 	mockAgy := filepath.Join(mockDir, "agy")
-	targetConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
 	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
 for arg in "$@"; do
   if [ "$arg" = "--conversation=%s" ]; then
@@ -498,6 +502,102 @@ exit 1
 		if pc["conversation_id"] != targetConvID {
 			t.Fatalf("unexpected posted conversation ID: %v (want %s)", pc["conversation_id"], targetConvID)
 		}
+	}
+}
+
+func TestExecuteJob_DeterministicResumeConversationPinning_FallbackNewConversation(t *testing.T) {
+	mockHome := t.TempDir()
+	targetConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	// Do NOT create targetConvID on disk, to trigger Stage 2 fallback
+	t.Setenv("HOME", mockHome)
+
+	fallbackConvID := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+	mockDir := t.TempDir()
+	mockAgy := filepath.Join(mockDir, "agy")
+	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --log-file)
+      shift
+      echo "I1024 12:00:00.000000 1 server.go:1274] Created conversation %s" > "$1"
+      ;;
+  esac
+  shift
+done
+echo "fallback execution completed successfully"
+exit 0
+`, fallbackConvID)), 0755)
+
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	var postedConvs []map[string]any
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			var m map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&m)
+			mu.Lock()
+			postedConvs = append(postedConvs, m)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/exit") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-1313-fallback" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:                    "job-1313-fallback",
+				Kind:                  "resume",
+				Engine:                "agy",
+				Prompt:                "resume",
+				WorktreePath:          workDir,
+				InitialConversationID: targetConvID,
+				ResumeConversationID:  targetConvID,
+				InterruptedASEState: map[string]any{
+					"phase": "PHASE_4_METADATA_REVIEW",
+					"step":  3,
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := executeJob(context.Background(), srv.URL, "job-1313-fallback", workDir, "")
+	if err != nil {
+		t.Fatalf("expected successful fallback resume execution, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(postedConvs) == 0 {
+		t.Fatal("expected at least one posted conversation on fallback")
+	}
+	foundFallback := false
+	for _, pc := range postedConvs {
+		if pc["conversation_id"] == fallbackConvID {
+			foundFallback = true
+			if pc["fallback"] != true {
+				t.Fatalf("expected fallback: true, got %v", pc["fallback"])
+			}
+			if pc["role"] != "fallback_primary" {
+				t.Fatalf("expected role: fallback_primary, got %v", pc["role"])
+			}
+		}
+	}
+	if !foundFallback {
+		t.Fatalf("expected posted conversation %s, got: %+v", fallbackConvID, postedConvs)
 	}
 }
 

@@ -273,3 +273,32 @@ func TestScanBrainSessionsByStory(t *testing.T) {
 	}
 }
 
+func TestIsValidConversationID(t *testing.T) {
+	valid := []string{
+		"aad902c8-bda6-44c7-8a68-c468a1562399",
+		"conv-1234",
+		"session_abc-xyz_123",
+	}
+	for _, id := range valid {
+		if !IsValidConversationID(id) {
+			t.Errorf("expected %q to be valid", id)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"../traversal",
+		"foo/bar",
+		"foo\\bar",
+		"id with spaces",
+		"id;rm -rf /",
+		"id$var",
+	}
+	for _, id := range invalid {
+		if IsValidConversationID(id) {
+			t.Errorf("expected %q to be invalid", id)
+		}
+	}
+}
+
+

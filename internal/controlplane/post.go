@@ -180,6 +180,8 @@ type JobDetail struct {
 	TargetHost                  string                 `json:"target_host,omitempty"`
 	ParentJobID                 string                 `json:"parent_job_id,omitempty"`
 	RootJobID                   string                 `json:"root_job_id,omitempty"`
+	ExecutionAttempt            int                    `json:"execution_attempt,omitempty"`
+	ExecutionChain              []string               `json:"execution_chain,omitempty"`
 	InitialConversationID       string                 `json:"initial_conversation_id,omitempty"`
 	ActiveConversationID        string                 `json:"active_conversation_id,omitempty"`
 	ResumeMode                  string                 `json:"resume_mode,omitempty"`

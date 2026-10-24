@@ -104,11 +104,29 @@ func DefaultResolver() *Resolver {
 	}
 }
 
+// IsValidConversationID checks if a conversation ID has a safe format (alphanumeric, hyphens, underscores, max 128 chars).
+// It prevents directory traversal and injection.
+func IsValidConversationID(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	if strings.Contains(id, "..") || strings.Contains(id, "/") || strings.Contains(id, "\\") {
+		return false
+	}
+	for _, r := range id {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
 // SessionExists reports whether the given conversation ID exists locally on disk
 // in the brain directory, conversations SQLite databases, or local worktree.
 func (r *Resolver) SessionExists(conversationID string) bool {
 	conversationID = strings.TrimSpace(conversationID)
-	if conversationID == "" {
+	if !IsValidConversationID(conversationID) {
 		return false
 	}
 	// 1. Brain directory check
