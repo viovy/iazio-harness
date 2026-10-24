@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/viovy/iazio-harness/internal/controlplane"
@@ -422,6 +424,80 @@ func TestExecuteJob_AutoFallbackOnQuota(t *testing.T) {
 	// Because initial log contains ActionRequiredError, diagnostics flags the finding resulting in exit code 1.
 	if err != nil && !strings.Contains(err.Error(), "engine agy") {
 		t.Fatalf("expected fallback to agy to execute, got %v", err)
+	}
+}
+
+func TestExecuteJob_DeterministicResumeConversationPinning(t *testing.T) {
+	mockDir := t.TempDir()
+	mockAgy := filepath.Join(mockDir, "agy")
+	targetConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "--conversation=%s" ]; then
+    echo "successfully resumed conversation $arg"
+    exit 0
+  fi
+done
+echo "error: missing expected --conversation=%s"
+exit 1
+`, targetConvID, targetConvID)), 0755)
+
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	var postedConvs []map[string]any
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			var m map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&m)
+			mu.Lock()
+			postedConvs = append(postedConvs, m)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/exit") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-1313-resume" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:                    "job-1313-resume",
+				Kind:                  "resume",
+				Engine:                "agy",
+				Prompt:                "resume",
+				WorktreePath:          workDir,
+				InitialConversationID: targetConvID,
+				ResumeConversationID:  targetConvID,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := executeJob(context.Background(), srv.URL, "job-1313-resume", workDir, "")
+	if err != nil {
+		t.Fatalf("expected successful resume job execution, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(postedConvs) == 0 {
+		t.Fatal("expected at least one posted conversation")
+	}
+	for _, pc := range postedConvs {
+		if pc["conversation_id"] != targetConvID {
+			t.Fatalf("unexpected posted conversation ID: %v (want %s)", pc["conversation_id"], targetConvID)
+		}
 	}
 }
 

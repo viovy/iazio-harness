@@ -734,7 +734,7 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		}
 		argv := []string{bin, "--print", prompt, "--print-timeout", timeout, "--model", model}
 		if req.ResumeConversationID != "" {
-			argv = append(argv, "--conversation", req.ResumeConversationID)
+			argv = append(argv, "--conversation="+req.ResumeConversationID)
 		}
 		if req.Agent != "" {
 			argv = append(argv, "--agent", req.Agent)

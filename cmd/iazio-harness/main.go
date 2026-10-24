@@ -278,8 +278,17 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 
 	resumeConvID := job.ResumeConversationID
+	if resumeConvID == "" {
+		resumeConvID = job.InitialConversationID
+	}
+	if resumeConvID == "" && job.ActiveConversationID != "" {
+		resumeConvID = job.ActiveConversationID
+	}
 	if resumeConvID == "" && job.EnvVars != nil {
 		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
+	}
+	if resumeConvID == "" && len(job.ConversationIDs) > 0 {
+		resumeConvID = job.ConversationIDs[len(job.ConversationIDs)-1]
 	}
 	if job.Kind == "resume" {
 		resolver := sessionstore.DefaultResolver()
@@ -420,8 +429,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	runner := engines.CLI{Engine: engineName}
 
 	var convWg sync.WaitGroup
+	var execReq engines.ExecutionRequest
 
-	execReq := engines.ExecutionRequest{
+	execReq = engines.ExecutionRequest{
 		Engine:                     engineName,
 		Kind:                       job.Kind,
 		StoryID:                    sessionstore.ExtractStoryID(storyID),
@@ -476,48 +486,78 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			})
 		},
 		OnConversationID: func(cid string) {
-			if cid != "" {
-				activeConvID = cid
-				span.AddAnnotation(fmt.Sprintf("conversation_detected:%s", cid))
-				_ = lockHandle.Update(repolock.LockInfo{
-					JobID:          job.ID,
-					ScheduleID:     job.ScheduleID,
-					PID:            os.Getpid(),
-					HarnessPID:     activePID,
-					Engine:         engineName,
-					ConversationID: cid,
-					StoryID:        job.StoryID,
-					Prompt:         job.Prompt,
-					Status:         "RUNNING",
-				})
-				_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
-					JobID:          job.ID,
-					ScheduleID:     job.ScheduleID,
-					Engine:         engineName,
-					WorktreePath:   worktree,
-					ConversationID: cid,
-					StoryID:        job.StoryID,
-					StepIndex:      2,
-					PID:            activePID,
-					StartedAt:      time.Now().UTC().Format(time.RFC3339),
-					Status:         "RUNNING",
-				})
-				convWg.Add(1)
-				go func(c string) {
-					defer convWg.Done()
-					var err error
-					for attempt := 1; attempt <= 10; attempt++ {
-						err = controlplane.PostConversation(context.Background(), api, token, jobID, c)
-						if err == nil {
-							return
-						}
-						time.Sleep(time.Duration(attempt*100) * time.Millisecond)
-					}
-					if err != nil {
-						log.Printf("warning: failed to post conversation ID %s for job %s: %v", c, jobID, err)
-					}
-				}(cid)
+			if cid == "" {
+				return
 			}
+			// Pinning check: if activeConvID was already set to a non-initial active conversation
+			// and cid is different from it, ignore the newly discovered unpinned conversation!
+			if activeConvID != "" && activeConvID != resumeConvID && cid != activeConvID {
+				log.Printf("[harness] ignoring unpinned tertiary conversation %s; keeping active conversation %s pinned for job %s", cid, activeConvID, jobID)
+				return
+			}
+
+			isFallback := false
+			fallbackReason := ""
+			role := "initial_active"
+			if resumeConvID != "" {
+				if cid == resumeConvID {
+					role = "initial_resumed"
+				} else {
+					isFallback = true
+					role = "fallback_primary"
+					fallbackReason = fmt.Sprintf("failed to attach to initial conversation %s; started new conversation %s", resumeConvID, cid)
+					log.Printf("[harness] [job.resume.conversation_fallback] initial_conversation_id=%s active_conversation_id=%s reason=%q", resumeConvID, cid, fallbackReason)
+				}
+			}
+
+			activeConvID = cid
+			execReq.ResumeConversationID = cid
+
+			span.AddAnnotation(fmt.Sprintf("conversation_detected:%s:fallback=%v", cid, isFallback))
+			_ = lockHandle.Update(repolock.LockInfo{
+				JobID:          job.ID,
+				ScheduleID:     job.ScheduleID,
+				PID:            os.Getpid(),
+				HarnessPID:     activePID,
+				Engine:         engineName,
+				ConversationID: cid,
+				StoryID:        job.StoryID,
+				Prompt:         job.Prompt,
+				Status:         "RUNNING",
+			})
+			_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
+				JobID:          job.ID,
+				ScheduleID:     job.ScheduleID,
+				Engine:         engineName,
+				WorktreePath:   worktree,
+				ConversationID: cid,
+				StoryID:        job.StoryID,
+				StepIndex:      2,
+				PID:            activePID,
+				StartedAt:      time.Now().UTC().Format(time.RFC3339),
+				Status:         "RUNNING",
+			})
+			convWg.Add(1)
+			go func(c string, fb bool, fbReason, r string) {
+				defer convWg.Done()
+				var err error
+				opt := controlplane.PostConversationOptions{
+					Fallback:       fb,
+					FallbackReason: fbReason,
+					Role:           r,
+					CLIArgs:        fmt.Sprintf("--conversation=%s", c),
+				}
+				for attempt := 1; attempt <= 10; attempt++ {
+					err = controlplane.PostConversationWithOptions(context.Background(), api, token, jobID, c, opt)
+					if err == nil {
+						return
+					}
+					time.Sleep(time.Duration(attempt*100) * time.Millisecond)
+				}
+				if err != nil {
+					log.Printf("warning: failed to post conversation ID %s for job %s: %v", c, jobID, err)
+				}
+			}(cid, isFallback, fallbackReason, role)
 		},
 	}
 	execRes, execErr := runner.Execute(ctx, execReq, sp)

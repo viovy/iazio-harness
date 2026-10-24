@@ -117,10 +117,40 @@ func PostTick(ctx context.Context, baseURL, token, jobID string, silentForMs int
 }
 
 // PostConversation registers an early or streamed conversation ID with the control plane.
+// PostConversationOptions specifies fallback and lineage flags when attaching a conversation.
+type PostConversationOptions struct {
+	Fallback       bool   `json:"fallback,omitempty"`
+	FallbackReason string `json:"fallback_reason,omitempty"`
+	Role           string `json:"role,omitempty"`
+	CLIArgs        string `json:"cli_args,omitempty"`
+	ASEPhase       string `json:"ase_phase,omitempty"`
+}
+
 func PostConversation(ctx context.Context, baseURL, token, jobID, conversationID string) error {
-	raw, err := json.Marshal(map[string]string{
+	return PostConversationWithOptions(ctx, baseURL, token, jobID, conversationID, PostConversationOptions{})
+}
+
+// PostConversationWithOptions attaches a conversation with fallback and lineage options.
+func PostConversationWithOptions(ctx context.Context, baseURL, token, jobID, conversationID string, opt PostConversationOptions) error {
+	payload := map[string]any{
 		"conversation_id": conversationID,
-	})
+	}
+	if opt.Fallback {
+		payload["fallback"] = true
+	}
+	if opt.FallbackReason != "" {
+		payload["fallback_reason"] = opt.FallbackReason
+	}
+	if opt.Role != "" {
+		payload["role"] = opt.Role
+	}
+	if opt.CLIArgs != "" {
+		payload["cli_args"] = opt.CLIArgs
+	}
+	if opt.ASEPhase != "" {
+		payload["ase_phase"] = opt.ASEPhase
+	}
+	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -129,25 +159,33 @@ func PostConversation(ctx context.Context, baseURL, token, jobID, conversationID
 
 // JobDetail carries the execution specification from iazio-harness-api.
 type JobDetail struct {
-	ID                          string            `json:"id"`
-	ScheduleID                  string            `json:"schedule_id"`
-	Kind                        string            `json:"kind"`
-	Status                      string            `json:"status"`
-	Engine                      string            `json:"engine"`
-	Prompt                      string            `json:"prompt"`
-	StoryID                     string            `json:"story_id"`
-	SourceIdeaID                string            `json:"source_idea_id"`
-	Transcript                  string            `json:"transcript"`
-	WorktreePath                string            `json:"worktree_path"`
-	DocsHubPath                 string            `json:"docs_hub_path"`
-	EnvVars                     map[string]string `json:"env_vars"`
-	MaxExecutionDurationSeconds int               `json:"max_execution_duration_seconds"`
-	ResumeConversationID        string            `json:"resume_conversation_id,omitempty"`
-	Model                       string            `json:"model,omitempty"`
-	Agent                       string            `json:"agent,omitempty"`
-	DisableSlashCommands        *bool             `json:"disable_slash_commands,omitempty"`
-	HostID                      string            `json:"host_id,omitempty"`
-	TargetHost                  string            `json:"target_host,omitempty"`
+	ID                          string                 `json:"id"`
+	ScheduleID                  string                 `json:"schedule_id"`
+	Kind                        string                 `json:"kind"`
+	Status                      string                 `json:"status"`
+	Engine                      string                 `json:"engine"`
+	Prompt                      string                 `json:"prompt"`
+	StoryID                     string                 `json:"story_id"`
+	SourceIdeaID                string                 `json:"source_idea_id"`
+	Transcript                  string                 `json:"transcript"`
+	WorktreePath                string                 `json:"worktree_path"`
+	DocsHubPath                 string                 `json:"docs_hub_path"`
+	EnvVars                     map[string]string      `json:"env_vars"`
+	MaxExecutionDurationSeconds int                    `json:"max_execution_duration_seconds"`
+	ResumeConversationID        string                 `json:"resume_conversation_id,omitempty"`
+	Model                       string                 `json:"model,omitempty"`
+	Agent                       string                 `json:"agent,omitempty"`
+	DisableSlashCommands        *bool                  `json:"disable_slash_commands,omitempty"`
+	HostID                      string                 `json:"host_id,omitempty"`
+	TargetHost                  string                 `json:"target_host,omitempty"`
+	ParentJobID                 string                 `json:"parent_job_id,omitempty"`
+	RootJobID                   string                 `json:"root_job_id,omitempty"`
+	InitialConversationID       string                 `json:"initial_conversation_id,omitempty"`
+	ActiveConversationID        string                 `json:"active_conversation_id,omitempty"`
+	ResumeMode                  string                 `json:"resume_mode,omitempty"`
+	ResumeFallbackReason        string                 `json:"resume_fallback_reason,omitempty"`
+	InterruptedASEState         map[string]any         `json:"interrupted_ase_state,omitempty"`
+	ConversationIDs             []string               `json:"conversation_ids,omitempty"`
 }
 
 // GetJob fetches the job definition from the control plane.

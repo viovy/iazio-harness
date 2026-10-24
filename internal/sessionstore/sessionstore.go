@@ -104,6 +104,38 @@ func DefaultResolver() *Resolver {
 	}
 }
 
+// SessionExists reports whether the given conversation ID exists locally on disk
+// in the brain directory, conversations SQLite databases, or local worktree.
+func (r *Resolver) SessionExists(conversationID string) bool {
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" {
+		return false
+	}
+	// 1. Brain directory check
+	if r != nil && r.BrainDir != "" {
+		brainPath := filepath.Join(r.BrainDir, conversationID)
+		if fi, err := os.Stat(brainPath); err == nil && fi.IsDir() {
+			return true
+		}
+	}
+	// 2. Antigravity conversations storage directories
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		flavors := []string{"antigravity-cli", "antigravity-ide", "antigravity"}
+		for _, fl := range flavors {
+			p := filepath.Join(home, ".gemini", fl, "conversations", conversationID+".db")
+			if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+				return true
+			}
+			brainP := filepath.Join(home, ".gemini", fl, "brain", conversationID)
+			if fi, err := os.Stat(brainP); err == nil && fi.IsDir() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ResolveLatest finds the most recent conversation ID for the worktree across all tiers.
 func (r *Resolver) ResolveLatest(worktreePath string) (*Session, error) {
 	sessions, err := r.ListRecent(worktreePath, 1)
