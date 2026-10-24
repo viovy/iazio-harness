@@ -214,6 +214,24 @@ func sanitizeAlphanumeric(s string) string {
 	return b.String()
 }
 
+func sanitizeStep(v any) string {
+	if v == nil {
+		return "0"
+	}
+	s := strings.TrimSpace(fmt.Sprintf("%v", v))
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	res := b.String()
+	if res == "" {
+		return "0"
+	}
+	return res
+}
+
 func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
 	var spanOpts = []telemetry.SpanOption{
 		telemetry.WithKind("INTERNAL"),
@@ -326,18 +344,29 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		engineName = "agy"
 	}
 
+	isPreflightFallback := false
+	preflightFallbackReason := ""
+
 	resumeConvID := job.ActiveConversationID
-	if resumeConvID == "" {
+	if resumeConvID == "" && job.ResumeMode != "fallback_new_conversation" {
 		resumeConvID = job.ResumeConversationID
 	}
-	if resumeConvID == "" {
+	if resumeConvID == "" && job.ResumeMode != "fallback_new_conversation" {
 		resumeConvID = job.InitialConversationID
 	}
-	if resumeConvID == "" && job.EnvVars != nil {
+	if resumeConvID == "" && job.ResumeMode != "fallback_new_conversation" && job.EnvVars != nil {
 		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
 	}
-	if resumeConvID == "" && len(job.ConversationIDs) > 0 {
-		resumeConvID = job.ConversationIDs[len(job.ConversationIDs)-1]
+	if resumeConvID == "" && job.ResumeMode != "fallback_new_conversation" && len(job.ConversationIDs) > 0 {
+		resumeConvID = job.ConversationIDs[0]
+	}
+	if job.ResumeMode == "fallback_new_conversation" && job.ActiveConversationID == "" {
+		isPreflightFallback = true
+		preflightFallbackReason = job.ResumeFallbackReason
+		if preflightFallbackReason == "" {
+			preflightFallbackReason = "control plane initiated fallback to new conversation"
+		}
+		log.Printf("[harness] [job.resume.conversation_fallback] resume_mode=fallback_new_conversation reason=%q", preflightFallbackReason)
 	}
 	isControlPlaneResume := (job.ParentJobID != "" || job.RootJobID != "")
 	if job.Kind == "resume" && !isControlPlaneResume {
@@ -395,8 +424,6 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		log.Printf("[harness] Adopted prior conversation %s from repo lock for %s", resumeConvID, worktree)
 	}
 
-	isPreflightFallback := false
-	preflightFallbackReason := ""
 	attemptedResumeConv := resumeConvID
 	if resumeConvID != "" {
 		if !sessionstore.IsValidConversationID(resumeConvID) {
@@ -405,10 +432,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			log.Printf("[harness] [job.resume.conversation_fallback] initial_conversation_id=%s reason=%q", resumeConvID, preflightFallbackReason)
 			resumeConvID = ""
 		} else if engineName == "agy" && !sessionstore.DefaultResolver().SessionExists(resumeConvID) {
-			isPreflightFallback = true
-			preflightFallbackReason = fmt.Sprintf("initial conversation %s does not exist on disk on host for engine agy", resumeConvID)
-			log.Printf("[harness] [job.resume.conversation_fallback] initial_conversation_id=%s reason=%q", resumeConvID, preflightFallbackReason)
-			resumeConvID = ""
+			// C6: SessionExists is advisory; do not abort attach since agy state may reside in non-standard/relocated data dirs.
+			// Stage 2 fallback handles real attachment failures safely.
+			log.Printf("[harness] advisory: initial conversation %s not found in standard brain directories; attempting attach with engine %s anyway (Stage 2 fallback armed)", resumeConvID, engineName)
 		}
 	}
 
@@ -416,10 +442,10 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		phase, _ := job.InterruptedASEState["phase"].(string)
 		phaseSource, _ := job.InterruptedASEState["phase_source"].(string)
 		if phase != "" && phase != "UNKNOWN" && phaseSource != "default" {
-			resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s interrupted. Fallback to new conversation. Interrupted State: phase=%s, step=%v, story_id=%v, gate=%v. Resume execution from this checkpoint.]\n\n",
+			resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s interrupted. Fallback to new conversation. Interrupted State: phase=%s, step=%s, story_id=%s, gate=%s. Resume execution from this checkpoint.]\n\n",
 				sanitizeAlphanumeric(attemptedResumeConv),
 				sanitizeAlphanumeric(phase),
-				job.InterruptedASEState["step"],
+				sanitizeStep(job.InterruptedASEState["step"]),
 				sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["story_id"])),
 				sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["last_completed_gate"])),
 			)
@@ -573,7 +599,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			if confirmedConvID != "" {
 				if cid != confirmedConvID {
 					log.Printf("[harness] ignoring unpinned tertiary conversation %s; keeping active conversation %s pinned for job %s", cid, confirmedConvID, jobID)
+					convWg.Add(1)
 					go func(droppedID, pinnedID string) {
+						defer convWg.Done()
 						_ = controlplane.PostConversationWithOptions(context.Background(), api, token, jobID, droppedID, controlplane.PostConversationOptions{
 							Role:           "dropped_unpinned",
 							FallbackReason: fmt.Sprintf("rejected tertiary conversation %s; active conversation %s is already pinned", droppedID, pinnedID),
@@ -639,11 +667,19 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			go func(c string, fb bool, fbReason, r, phase string) {
 				defer convWg.Done()
 				var err error
+				actualCLIArgs := ""
+				if !fb && resumeConvID != "" && c == resumeConvID {
+					if engineName == "agent" {
+						actualCLIArgs = fmt.Sprintf("--resume %s", c)
+					} else {
+						actualCLIArgs = fmt.Sprintf("--conversation=%s", c)
+					}
+				}
 				opt := controlplane.PostConversationOptions{
 					Fallback:       fb,
 					FallbackReason: fbReason,
 					Role:           r,
-					CLIArgs:        fmt.Sprintf("--conversation=%s", c),
+					CLIArgs:        actualCLIArgs,
 					ASEPhase:       phase,
 				}
 				for attempt := 1; attempt <= 10; attempt++ {
@@ -747,11 +783,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			phase, _ := job.InterruptedASEState["phase"].(string)
 			phaseSource, _ := job.InterruptedASEState["phase_source"].(string)
 			if phase != "" && phase != "UNKNOWN" && phaseSource != "default" {
-				resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s failed with exit code %d. Fallback to new conversation. Interrupted State: phase=%s, step=%v, story_id=%v, gate=%v. Resume execution from this checkpoint.]\n\n",
+				resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s failed with exit code %d. Fallback to new conversation. Interrupted State: phase=%s, step=%s, story_id=%s, gate=%s. Resume execution from this checkpoint.]\n\n",
 					sanitizeAlphanumeric(resumeConvID),
 					execRes.ExitCode,
 					sanitizeAlphanumeric(phase),
-					job.InterruptedASEState["step"],
+					sanitizeStep(job.InterruptedASEState["step"]),
 					sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["story_id"])),
 					sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["last_completed_gate"])),
 				)
@@ -816,9 +852,15 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		fallbackReq.Engine = fallbackEngine
 		fallbackReq.Model = fallbackModel
 		fallbackReq.Argv = nil
-		if fallbackReq.ResumeConversationID != "" && strings.HasPrefix(strings.ToLower(fallbackReq.ResumeConversationID), "cursor-") {
-			fallbackReq.ResumeConversationID = ""
-		}
+		fallbackReq.ResumeConversationID = "" // clear to ensure fresh start on agy (Finding C2)
+
+		// Reset confirmed conversation pin so the new agy conversation can be pinned as fallback_primary (Finding C2)
+		convMu.Lock()
+		confirmedConvID = ""
+		isPreflightFallback = true
+		preflightFallbackReason = "quota_exhausted_engine_switch: switched from agent to agy"
+		convMu.Unlock()
+
 		fallbackRunner := engines.CLI{Engine: fallbackEngine}
 		if checkErr := fallbackRunner.HealthCheck(); checkErr == nil {
 			log.Printf("[harness] Auto-engine fallback: switching from agent to agy for job %s", jobID)
@@ -831,6 +873,17 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 				if ev.Type == spool.EventOutputChunk {
 					_ = controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text)
 				}
+			}
+
+			// Wait for any in-flight conversation registration from the quota fallback run
+			fallbackConvDone := make(chan struct{})
+			go func() {
+				convWg.Wait()
+				close(fallbackConvDone)
+			}()
+			select {
+			case <-fallbackConvDone:
+			case <-time.After(3 * time.Second):
 			}
 
 			// Re-diagnose after fallback run

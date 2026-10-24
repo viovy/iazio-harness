@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/viovy/iazio-harness/internal/checkpoint"
 	"github.com/viovy/iazio-harness/internal/controlplane"
 )
 
@@ -381,15 +382,34 @@ func TestExecuteJob_SuccessfulRunWithMockEngine(t *testing.T) {
 }
 
 func TestExecuteJob_AutoFallbackOnQuota(t *testing.T) {
+	mockHome := t.TempDir()
+	t.Setenv("HOME", mockHome)
 	mockDir := t.TempDir()
 	mockAgent := filepath.Join(mockDir, "agent")
 	_ = os.WriteFile(mockAgent, []byte("#!/bin/sh\nif [ \"$1\" = \"create-chat\" ]; then echo 'cursor-chat-123'; exit 0; fi\necho \"ActionRequiredError: You're out of usage.\"\nexit 1\n"), 0755)
 	mockAgy := filepath.Join(mockDir, "agy")
-	_ = os.WriteFile(mockAgy, []byte("#!/bin/sh\necho 'fallback agy execution success'\nexit 0\n"), 0755)
+	agyConvID := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --log-file)
+      shift
+      echo "I1024 12:00:00.000000 1 server.go:1274] Created conversation %s" > "$1"
+      ;;
+  esac
+  shift
+done
+echo 'fallback agy execution success'
+exit 0
+`, agyConvID)), 0755)
 
 	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
 
 	workDir := t.TempDir()
+	var postedConvs []map[string]any
+	var exitPosted map[string]any
+	var mu sync.Mutex
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasSuffix(r.URL.Path, "/chunks") {
@@ -397,10 +417,20 @@ func TestExecuteJob_AutoFallbackOnQuota(t *testing.T) {
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			var m map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&m)
+			mu.Lock()
+			postedConvs = append(postedConvs, m)
+			mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, "/exit") {
+			var m map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&m)
+			mu.Lock()
+			exitPosted = m
+			mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -420,10 +450,139 @@ func TestExecuteJob_AutoFallbackOnQuota(t *testing.T) {
 	defer srv.Close()
 
 	err := executeJob(context.Background(), srv.URL, "job-quota-fallback", workDir, "")
-	// Fallback was activated: initial engine 'agent' fell back to 'agy'.
-	// Because initial log contains ActionRequiredError, diagnostics flags the finding resulting in exit code 1.
 	if err != nil && !strings.Contains(err.Error(), "engine agy") {
 		t.Fatalf("expected fallback to agy to execute, got %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Finding C2 Verification: the agy conversation MUST be registered as fallback_primary, NOT dropped_unpinned!
+	foundAgyFallback := false
+	for _, pc := range postedConvs {
+		if pc["conversation_id"] == agyConvID {
+			if pc["role"] == "dropped_unpinned" {
+				t.Fatalf("finding C2 regression: agy conversation %s was mislabeled as dropped_unpinned", agyConvID)
+			}
+			if pc["role"] == "fallback_primary" && pc["fallback"] == true {
+				foundAgyFallback = true
+			}
+		}
+	}
+	if !foundAgyFallback {
+		t.Fatalf("expected agy conversation %s to be registered as fallback_primary with fallback:true, got: %+v", agyConvID, postedConvs)
+	}
+	if exitPosted == nil {
+		t.Fatal("expected exit to be posted")
+	}
+	if exitPosted["engine"] != "agy" {
+		t.Fatalf("expected exit engine to be agy, got %v", exitPosted["engine"])
+	}
+
+	ck, err := checkpoint.ReadWorktree(workDir)
+	if err != nil {
+		t.Fatalf("failed to read checkpoint: %v", err)
+	}
+	if ck.ConversationID != agyConvID {
+		t.Fatalf("expected checkpoint conversation ID to be %s, got %s", agyConvID, ck.ConversationID)
+	}
+	if ck.Engine != "agy" {
+		t.Fatalf("expected checkpoint engine to be agy, got %s", ck.Engine)
+	}
+}
+
+func TestExecuteJob_DeterministicResume_ControlPlaneFallbackMode_StartsClean(t *testing.T) {
+	mockDir := t.TempDir()
+	mockAgy := filepath.Join(mockDir, "agy")
+	cleanConvID := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    --conversation=*)
+      echo "FATAL: received unexpected --conversation flag on clean fallback: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --log-file)
+      shift
+      echo "I1024 12:00:00.000000 1 server.go:1274] Created conversation %s" > "$1"
+      ;;
+  esac
+  shift
+done
+echo "clean fallback execution success"
+exit 0
+`, cleanConvID)), 0755)
+
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	var postedConvs []map[string]any
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			var m map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&m)
+			mu.Lock()
+			postedConvs = append(postedConvs, m)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/exit") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-cp-fallback" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:                    "job-cp-fallback",
+				Kind:                  "resume",
+				Engine:                "agy",
+				Prompt:                "resume",
+				WorktreePath:          workDir,
+				InitialConversationID: "aad902c8-bda6-44c7-8a68-c468a1562399",
+				ActiveConversationID:  "", // empty -> must start clean
+				ResumeMode:            "fallback_new_conversation",
+				ResumeFallbackReason:  "cross-engine fallback ordered by CP",
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := executeJob(context.Background(), srv.URL, "job-cp-fallback", workDir, "")
+	if err != nil {
+		t.Fatalf("expected successful execution of clean fallback, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	foundClean := false
+	for _, pc := range postedConvs {
+		if pc["conversation_id"] == cleanConvID {
+			foundClean = true
+			if pc["fallback"] != true {
+				t.Fatalf("expected fallback: true, got %v", pc["fallback"])
+			}
+			if pc["role"] != "fallback_primary" {
+				t.Fatalf("expected role: fallback_primary, got %v", pc["role"])
+			}
+		}
+	}
+	if !foundClean {
+		t.Fatalf("expected clean fallback conversation %s, got: %+v", cleanConvID, postedConvs)
 	}
 }
 
