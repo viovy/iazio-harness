@@ -16,6 +16,7 @@ import (
 
 	"github.com/viovy/iazio-harness/internal/idempotency"
 	"github.com/viovy/iazio-harness/internal/sandbox"
+	"github.com/viovy/iazio-harness/internal/sessionstore"
 )
 
 // KindStoryRefinement selects the docs hub as the child working directory and lock target.
@@ -162,9 +163,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		return ExecutionResult{}, errors.New("empty argv")
 	}
 
-	if req.ResumeConversationID != "" && req.OnConversationID != nil {
-		req.OnConversationID(req.ResumeConversationID)
-	} else if req.Engine == "agent" && req.OnConversationID != nil && len(req.Argv) == 0 {
+	if req.Engine == "agent" && req.ResumeConversationID == "" && req.OnConversationID != nil && len(req.Argv) == 0 {
 		look := c.LookPath
 		if look == nil {
 			look = exec.LookPath
@@ -313,8 +312,18 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	var scanned bool
 	var convMu sync.Mutex
 	var recentOut, recentErr string
-	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentOut, mu: &convMu}
-	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentErr, mu: &convMu}
+	var stderrLogFile *os.File
+	if req.LogFile != "" {
+		stderrLogPath := strings.TrimSuffix(req.LogFile, ".log") + ".stderr.log"
+		_ = os.MkdirAll(filepath.Dir(stderrLogPath), 0755)
+		if f, err := os.OpenFile(stderrLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+			stderrLogFile = f
+			defer stderrLogFile.Close()
+		}
+	}
+
+	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentOut, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: nil}
+	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentErr, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: stderrLogFile}
 
 	startTime := time.Now().Add(-2 * time.Second)
 	var logOffset int64
@@ -343,7 +352,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 						data, errR := io.ReadAll(f)
 						if errR == nil && len(data) > 0 {
 							logOffset = fi.Size()
-							if cid := extractConversationIDFromText(string(data)); cid != "" {
+							if cid := extractConversationIDFromText(string(data), ""); cid != "" {
 								scanned = true
 								req.OnConversationID(cid)
 								return
@@ -354,10 +363,31 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 			}
 		}
 
-		// Also scan default ~/.gemini/antigravity-cli/cli.log as eager fallback
+		// When ResumeConversationID is set, restrict discovery strictly to verifying the requested conversation:
+		// Only check if <req.ResumeConversationID>.db was updated after startTime.
+		// Never scan shared ~/.gemini/antigravity-cli/cli.log or arbitrary foreign .db files (Finding H1).
+		if req.ResumeConversationID != "" {
+			if home, errH := os.UserHomeDir(); errH == nil && home != "" {
+				targetDb := filepath.Join(home, ".gemini", "antigravity-cli", "conversations", req.ResumeConversationID+".db")
+				if fi, errStat := os.Stat(targetDb); errStat == nil && fi.ModTime().After(startTime) {
+					scanned = true
+					req.OnConversationID(req.ResumeConversationID)
+					return
+				}
+			}
+			return
+		}
+
+		// When per-job LogFile is specified or for managed harness jobs, restrict discovery strictly to req.LogFile.
+		// Shared cli.log has no per-job isolation and causes cross-job session hijacking under concurrency (Finding H1).
+		if req.LogFile != "" || req.JobID != "" {
+			return
+		}
+
+		// Fallback for unmanaged/standalone CLI invocations without a JobID:
 		if home, errH := os.UserHomeDir(); errH == nil && home != "" {
 			cliLog := filepath.Join(home, ".gemini", "antigravity-cli", "cli.log")
-			if fi, errStat := os.Stat(cliLog); errStat == nil && fi.Size() > 0 {
+			if fi, errStat := os.Stat(cliLog); errStat == nil && fi.Size() > 0 && fi.ModTime().After(startTime) {
 				if fCli, errO := os.Open(cliLog); errO == nil {
 					defer fCli.Close()
 					var seekPos int64
@@ -367,7 +397,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 					_, _ = fCli.Seek(seekPos, io.SeekStart)
 					dataCli, _ := io.ReadAll(fCli)
 					if len(dataCli) > 0 {
-						if cid := extractConversationIDFromText(string(dataCli)); cid != "" {
+						if cid := extractConversationIDFromText(string(dataCli), ""); cid != "" {
 							scanned = true
 							req.OnConversationID(cid)
 							return
@@ -386,7 +416,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 					info, errI := entry.Info()
 					if errI == nil && info.ModTime().After(startTime) {
 						cid := strings.TrimSuffix(entry.Name(), ".db")
-						if len(cid) >= 32 {
+						if len(cid) >= 32 && sessionstore.IsValidConversationID(cid) {
 							scanned = true
 							req.OnConversationID(cid)
 							return
@@ -533,17 +563,22 @@ func exitCode(err error) int {
 }
 
 type rawWriter struct {
-	stream  string
-	dst     EventStream
-	onConv  func(string)
-	scanned *bool
-	recent  *string
-	mu      *sync.Mutex
+	stream       string
+	dst          EventStream
+	onConv       func(string)
+	scanned      *bool
+	recent       *string
+	mu           *sync.Mutex
+	resumeConvID string
+	logFile      *os.File
 }
 
 func (w rawWriter) Write(p []byte) (int, error) {
-	if w.dst == nil || len(p) == 0 {
-		return len(p), nil
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if w.logFile != nil {
+		_, _ = w.logFile.Write(p)
 	}
 	if w.onConv != nil && w.scanned != nil && w.mu != nil {
 		w.mu.Lock()
@@ -558,33 +593,54 @@ func (w rawWriter) Write(p []byte) (int, error) {
 			} else {
 				combined = string(p)
 			}
-			if cid := extractConversationID(combined); cid != "" {
-				*w.scanned = true
-				w.onConv(cid)
+			if cid := extractConversationID(combined, w.resumeConvID); cid != "" {
+				if w.resumeConvID != "" && cid != w.resumeConvID {
+					// Ignore foreign conversation ID emitted on stdout/stderr during a resume run (Finding M1)
+				} else {
+					*w.scanned = true
+					w.onConv(cid)
+				}
 			}
 		}
 		w.mu.Unlock()
 	}
-	buf := append([]byte(nil), p...)
-	if err := w.dst.AppendRaw(w.stream, buf); err != nil {
-		return 0, err
+	if w.dst != nil {
+		buf := append([]byte(nil), p...)
+		if err := w.dst.AppendRaw(w.stream, buf); err != nil {
+			return 0, err
+		}
 	}
 	return len(p), nil
 }
 
-func extractConversationIDFromText(sData string) string {
+func extractConversationIDFromText(sData string, resumeConvIDs ...string) string {
+	var resumeConvID string
+	if len(resumeConvIDs) > 0 {
+		resumeConvID = resumeConvIDs[0]
+	}
 	markers := []string{
 		"Created conversation ",
+		"created conversation ",
+		"Resumed conversation ",
+		"resumed conversation ",
+		"Resuming conversation ",
+		"resuming conversation ",
+		"Loaded conversation ",
+		"loaded conversation ",
+		"Active conversation ",
+		"active conversation ",
+		"Using conversation ",
+		"using conversation ",
 		"Print mode: conversation=",
-		"conversation=",
-		"conversationID=",
-		"conversation_id=",
 		"Conversation ID: ",
+		"conversation ID: ",
 		"Conversation ID=",
-		"conversation: ",
+		"conversation ID=",
 		"Streaming conversation ",
+		"streaming conversation ",
 		"GetConversationDetail: found conversation ",
 	}
+	var firstCandidate string
 	for _, marker := range markers {
 		searchData := sData
 		for {
@@ -598,33 +654,62 @@ func extractConversationIDFromText(sData string) string {
 			})
 			if len(fields) > 0 {
 				candidate := strings.Trim(fields[0], " .,;:\"'")
-				if len(candidate) >= 32 {
-					return candidate
+				candidate = strings.TrimPrefix(candidate, "--conversation=")
+				if len(candidate) >= 32 && sessionstore.IsValidConversationID(candidate) {
+					if resumeConvID != "" && candidate == resumeConvID {
+						return candidate
+					}
+					if firstCandidate == "" {
+						firstCandidate = candidate
+					}
 				}
 			}
 			searchData = rest
 		}
 	}
+	if resumeConvID == "" {
+		return firstCandidate
+	}
 	return ""
 }
 
-func extractConversationID(s string) string {
+func extractConversationID(s string, resumeConvIDs ...string) string {
+	var resumeConvID string
+	if len(resumeConvIDs) > 0 {
+		resumeConvID = resumeConvIDs[0]
+	}
 	keys := []string{`"conversation_id":"`, `"session_id":"`, `"conversationId":"`, `"sessionId":"`}
+	var firstCandidate string
 	for _, k := range keys {
-		idx := strings.Index(s, k)
-		if idx != -1 {
+		search := s
+		for {
+			idx := strings.Index(search, k)
+			if idx == -1 {
+				break
+			}
 			start := idx + len(k)
-			end := strings.IndexByte(s[start:], '"')
+			end := strings.IndexByte(search[start:], '"')
 			if end != -1 {
-				val := strings.TrimSpace(s[start : start+end])
-				if val != "" {
-					return val
+				val := strings.TrimSpace(search[start : start+end])
+				if len(val) > 0 && sessionstore.IsValidConversationID(val) {
+					if resumeConvID != "" && val == resumeConvID {
+						return val
+					}
+					if firstCandidate == "" {
+						firstCandidate = val
+					}
 				}
+				search = search[start+end:]
+			} else {
+				break
 			}
 		}
 	}
-	if cid := extractConversationIDFromText(s); cid != "" {
+	if cid := extractConversationIDFromText(s, resumeConvID); cid != "" {
 		return cid
+	}
+	if resumeConvID == "" {
+		return firstCandidate
 	}
 	return ""
 }
@@ -734,7 +819,7 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		}
 		argv := []string{bin, "--print", prompt, "--print-timeout", timeout, "--model", model}
 		if req.ResumeConversationID != "" {
-			argv = append(argv, "--conversation", req.ResumeConversationID)
+			argv = append(argv, "--conversation="+req.ResumeConversationID)
 		}
 		if req.Agent != "" {
 			argv = append(argv, "--agent", req.Agent)

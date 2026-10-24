@@ -165,6 +165,109 @@ func runJobWithContext(ctx context.Context, args []string) error {
 	return executeJob(ctx, api, jobID, worktree, docsHub, kind, resumeConv)
 }
 
+// hasEngineSessionAttachError inspects engine execution log/stderr specifically for session attachment errors.
+// It requires candidate lines to be anchored by an engine-emitted error prefix
+// (e.g. "[error]", "error:", "fatal:", "failed to...", "cannot find...") to prevent false positives
+// when task commands or tool output mention session/conversation keywords in normal output (Finding B6, F5).
+func hasEngineSessionAttachError(logData []byte) bool {
+	if len(logData) == 0 {
+		return false
+	}
+	lines := strings.Split(string(logData), "\n")
+	for _, raw := range lines {
+		line := strings.TrimSpace(strings.ToLower(raw))
+		if line == "" {
+			continue
+		}
+		isErrorPrefix := strings.HasPrefix(line, "[error]") ||
+			strings.HasPrefix(line, "error:") ||
+			strings.HasPrefix(line, "fatal:") ||
+			strings.HasPrefix(line, "[fatal]") ||
+			strings.HasPrefix(line, "failed to attach") ||
+			strings.HasPrefix(line, "failed to open session") ||
+			strings.HasPrefix(line, "cannot find session") ||
+			strings.HasPrefix(line, "cannot find conversation") ||
+			strings.HasPrefix(line, "corrupted session") ||
+			strings.HasPrefix(line, "conversation not found") ||
+			strings.HasPrefix(line, "session not found") ||
+			strings.HasPrefix(line, "invalid session")
+
+		if !isErrorPrefix {
+			continue
+		}
+
+		if strings.Contains(line, "conversation") ||
+			strings.Contains(line, "session") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasEngineQuotaExhaustedError scans engine execution logs (excluding LLM spool output)
+// for explicit quota/usage exhaustion error messages (Finding M3).
+func hasEngineQuotaExhaustedError(logData []byte) bool {
+	if len(logData) == 0 {
+		return false
+	}
+	lines := strings.Split(string(logData), "\n")
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		lineLower := strings.ToLower(line)
+		isErrorLine := strings.HasPrefix(lineLower, "[error]") ||
+			strings.HasPrefix(lineLower, "error:") ||
+			strings.HasPrefix(lineLower, "fatal:") ||
+			strings.HasPrefix(lineLower, "[fatal]") ||
+			strings.HasPrefix(lineLower, "actionrequirederror")
+
+		if !isErrorLine {
+			continue
+		}
+
+		if strings.Contains(lineLower, "actionrequirederror") ||
+			strings.Contains(lineLower, "out of usage") ||
+			strings.Contains(lineLower, "quota exceeded") ||
+			strings.Contains(lineLower, "rate limit exceeded") ||
+			strings.Contains(lineLower, "resource_exhausted") ||
+			strings.Contains(lineLower, "insufficient_quota") ||
+			strings.Contains(lineLower, "switch to auto, or ask your admin to increase your limit") {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeAlphanumeric(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func sanitizeStep(v any) string {
+	if v == nil {
+		return "0"
+	}
+	s := strings.TrimSpace(fmt.Sprintf("%v", v))
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	res := b.String()
+	if res == "" {
+		return "0"
+	}
+	return res
+}
+
 func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
 	var spanOpts = []telemetry.SpanOption{
 		telemetry.WithKind("INTERNAL"),
@@ -188,11 +291,24 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
 		return fmt.Errorf("get job: %w", err)
 	}
+	isControlPlaneResume := (job.ParentJobID != "" || job.RootJobID != "")
 	if kindOverride != "" {
 		job.Kind = kindOverride
 	}
 	if resumeConvOverride != "" {
-		job.ResumeConversationID = resumeConvOverride
+		if isControlPlaneResume {
+			// For Control Plane resumes, the control plane job record is authoritative (Finding L1)
+			if (job.ResumeConversationID != "" && resumeConvOverride != job.ResumeConversationID) ||
+				(job.ActiveConversationID != "" && resumeConvOverride != job.ActiveConversationID) {
+				log.Printf("[harness] [job.resume.identity_mismatch] ignoring argv override %s, adhering to control plane resume identity %s", resumeConvOverride, job.ResumeConversationID)
+			} else if job.ResumeConversationID == "" && job.ActiveConversationID == "" {
+				log.Printf("[harness] ignoring --resume-conversation=%s override for control plane resume with empty parent conversation", resumeConvOverride)
+			} else {
+				job.ResumeConversationID = resumeConvOverride
+			}
+		} else {
+			job.ResumeConversationID = resumeConvOverride
+		}
 	}
 	if worktree == "" {
 		worktree = job.WorktreePath
@@ -277,11 +393,31 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		engineName = "agy"
 	}
 
-	resumeConvID := job.ResumeConversationID
-	if resumeConvID == "" && job.EnvVars != nil {
+	isPreflightFallback := false
+	preflightFallbackReason := ""
+
+	resumeConvID := job.ActiveConversationID
+	if resumeConvID == "" && job.ResumeMode != "fallback_new_conversation" {
+		resumeConvID = job.ResumeConversationID
+	}
+	if resumeConvID == "" && job.ResumeMode != "fallback_new_conversation" {
+		resumeConvID = job.InitialConversationID
+	}
+	if resumeConvID == "" && job.ResumeMode != "fallback_new_conversation" && job.EnvVars != nil {
 		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
 	}
-	if job.Kind == "resume" {
+	if resumeConvID == "" && job.ResumeMode != "fallback_new_conversation" && len(job.ConversationIDs) > 0 {
+		resumeConvID = job.ConversationIDs[0]
+	}
+	if job.ResumeMode == "fallback_new_conversation" && job.ActiveConversationID == "" {
+		isPreflightFallback = true
+		preflightFallbackReason = job.ResumeFallbackReason
+		if preflightFallbackReason == "" {
+			preflightFallbackReason = "control plane initiated fallback to new conversation"
+		}
+		log.Printf("[harness] [job.resume.conversation_fallback] resume_mode=fallback_new_conversation reason=%q", preflightFallbackReason)
+	}
+	if job.Kind == "resume" && !isControlPlaneResume {
 		resolver := sessionstore.DefaultResolver()
 		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
 		if (job.StoryID == "" || strings.EqualFold(job.StoryID, fallbackResumeStoryID) || strings.EqualFold(job.StoryID, "resume complete current ase flow")) && dCtx.StoryID != "" {
@@ -302,12 +438,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			}
 		}
 		if resumeConvID != "" {
-			lowConv := strings.ToLower(resumeConvID)
-			if !strings.HasPrefix(lowConv, "cursor-") && engineName == "agent" {
-				engineName = "agy"
-				log.Printf("[harness] Auto-corrected engine from agent to agy for session %s", resumeConvID)
-			}
-			log.Printf("[harness] Auto-discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
+			log.Printf("[harness] Standalone resume discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
 		}
 	}
 	lockHandle, lockErr := repolock.Acquire(worktree, repolock.LockInfo{
@@ -336,13 +467,42 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 	defer lockHandle.Release()
 
-	if resumeConvID == "" && lockHandle.Info().ConversationID != "" && (job.Kind == "resume" || (job.StoryID != "" && lockHandle.Info().StoryID == job.StoryID && lockHandle.Info().Status != "COMPLETED")) {
+	if !isControlPlaneResume && resumeConvID == "" && lockHandle.Info().ConversationID != "" && (job.Kind == "resume" || (job.StoryID != "" && lockHandle.Info().StoryID == job.StoryID && lockHandle.Info().Status != "COMPLETED")) {
 		resumeConvID = lockHandle.Info().ConversationID
 		log.Printf("[harness] Adopted prior conversation %s from repo lock for %s", resumeConvID, worktree)
 	}
 
+	attemptedResumeConv := resumeConvID
 	if resumeConvID != "" {
-		_ = controlplane.PostConversation(context.Background(), api, token, jobID, resumeConvID)
+		if !sessionstore.IsValidConversationID(resumeConvID) {
+			isPreflightFallback = true
+			preflightFallbackReason = fmt.Sprintf("invalid initial conversation id format: %s", resumeConvID)
+			log.Printf("[harness] [job.resume.conversation_fallback] initial_conversation_id=%s reason=%q", resumeConvID, preflightFallbackReason)
+			resumeConvID = ""
+		} else if engineName == "agy" && !sessionstore.DefaultResolver().SessionExists(resumeConvID) {
+			// C6: SessionExists is advisory; do not abort attach since agy state may reside in non-standard/relocated data dirs.
+			// Stage 2 fallback handles real attachment failures safely.
+			log.Printf("[harness] advisory: initial conversation %s not found in standard brain directories; attempting attach with engine %s anyway (Stage 2 fallback armed)", resumeConvID, engineName)
+		}
+	}
+
+	if isPreflightFallback && job.InterruptedASEState != nil && len(job.InterruptedASEState) > 0 {
+		phase, _ := job.InterruptedASEState["phase"].(string)
+		phaseSource, _ := job.InterruptedASEState["phase_source"].(string)
+		if phase != "" && phase != "UNKNOWN" && phaseSource != "default" {
+			phaseText := sanitizeAlphanumeric(phase)
+			if phaseSource == "repo_halted_dirty" {
+				phaseText += " [inferred from uncommitted changes]"
+			}
+			resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s interrupted. Fallback to new conversation. Interrupted State: phase=%s, step=%s, story_id=%s, gate=%s. Resume execution from this checkpoint.]\n\n",
+				sanitizeAlphanumeric(attemptedResumeConv),
+				phaseText,
+				sanitizeStep(job.InterruptedASEState["step"]),
+				sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["story_id"])),
+				sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["last_completed_gate"])),
+			)
+			prepRes.Prompt = resumeDirective + prepRes.Prompt
+		}
 	}
 
 	var activePID int
@@ -420,8 +580,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	runner := engines.CLI{Engine: engineName}
 
 	var convWg sync.WaitGroup
+	var convMu sync.Mutex
+	var confirmedConvID string
+	var execReq engines.ExecutionRequest
 
-	execReq := engines.ExecutionRequest{
+	execReq = engines.ExecutionRequest{
 		Engine:                     engineName,
 		Kind:                       job.Kind,
 		StoryID:                    sessionstore.ExtractStoryID(storyID),
@@ -476,48 +639,115 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			})
 		},
 		OnConversationID: func(cid string) {
-			if cid != "" {
-				activeConvID = cid
-				span.AddAnnotation(fmt.Sprintf("conversation_detected:%s", cid))
-				_ = lockHandle.Update(repolock.LockInfo{
-					JobID:          job.ID,
-					ScheduleID:     job.ScheduleID,
-					PID:            os.Getpid(),
-					HarnessPID:     activePID,
-					Engine:         engineName,
-					ConversationID: cid,
-					StoryID:        job.StoryID,
-					Prompt:         job.Prompt,
-					Status:         "RUNNING",
-				})
-				_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
-					JobID:          job.ID,
-					ScheduleID:     job.ScheduleID,
-					Engine:         engineName,
-					WorktreePath:   worktree,
-					ConversationID: cid,
-					StoryID:        job.StoryID,
-					StepIndex:      2,
-					PID:            activePID,
-					StartedAt:      time.Now().UTC().Format(time.RFC3339),
-					Status:         "RUNNING",
-				})
-				convWg.Add(1)
-				go func(c string) {
-					defer convWg.Done()
-					var err error
-					for attempt := 1; attempt <= 10; attempt++ {
-						err = controlplane.PostConversation(context.Background(), api, token, jobID, c)
-						if err == nil {
-							return
-						}
-						time.Sleep(time.Duration(attempt*100) * time.Millisecond)
-					}
-					if err != nil {
-						log.Printf("warning: failed to post conversation ID %s for job %s: %v", c, jobID, err)
-					}
-				}(cid)
+			convMu.Lock()
+			defer convMu.Unlock()
+
+			if cid == "" || !sessionstore.IsValidConversationID(cid) {
+				return
 			}
+
+			// Strict pinning: once a conversation ID has been confirmed and pinned for this job execution,
+			// any differing subsequent conversation ID is an unpinned tertiary leak and must be rejected!
+			if confirmedConvID != "" {
+				if cid != confirmedConvID {
+					log.Printf("[harness] ignoring unpinned tertiary conversation %s; keeping active conversation %s pinned for job %s", cid, confirmedConvID, jobID)
+					convWg.Add(1)
+					go func(droppedID, pinnedID string) {
+						defer convWg.Done()
+						_ = controlplane.PostConversationWithOptions(context.Background(), api, token, jobID, droppedID, controlplane.PostConversationOptions{
+							Role:           "dropped_unpinned",
+							FallbackReason: fmt.Sprintf("rejected tertiary conversation %s; active conversation %s is already pinned", droppedID, pinnedID),
+						})
+					}(cid, confirmedConvID)
+				}
+				return
+			}
+
+			isFallback := false
+			fallbackReason := ""
+			role := "initial_active"
+			if resumeConvID != "" {
+				if cid == resumeConvID {
+					role = "initial_resumed"
+				} else {
+					isFallback = true
+					role = "fallback_primary"
+					fallbackReason = fmt.Sprintf("failed to attach to initial conversation %s; started new conversation %s", resumeConvID, cid)
+					log.Printf("[harness] [job.resume.conversation_fallback] initial_conversation_id=%s active_conversation_id=%s reason=%q", resumeConvID, cid, fallbackReason)
+				}
+			} else if isPreflightFallback {
+				isFallback = true
+				role = "fallback_primary"
+				fallbackReason = preflightFallbackReason
+				log.Printf("[harness] [job.resume.conversation_fallback] initial_conversation_id=%s active_conversation_id=%s reason=%q", job.InitialConversationID, cid, fallbackReason)
+			}
+
+			confirmedConvID = cid
+			activeConvID = cid
+
+			span.AddAnnotation(fmt.Sprintf("conversation_detected:%s:fallback=%v:role=%s", cid, isFallback, role))
+			_ = lockHandle.Update(repolock.LockInfo{
+				JobID:          job.ID,
+				ScheduleID:     job.ScheduleID,
+				PID:            os.Getpid(),
+				HarnessPID:     activePID,
+				Engine:         engineName,
+				ConversationID: cid,
+				StoryID:        job.StoryID,
+				Prompt:         job.Prompt,
+				Status:         "RUNNING",
+			})
+			_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
+				JobID:          job.ID,
+				ScheduleID:     job.ScheduleID,
+				Engine:         engineName,
+				WorktreePath:   worktree,
+				ConversationID: cid,
+				StoryID:        job.StoryID,
+				StepIndex:      2,
+				PID:            activePID,
+				StartedAt:      time.Now().UTC().Format(time.RFC3339),
+				Status:         "RUNNING",
+			})
+			convWg.Add(1)
+			asePhase := ""
+			if job.InterruptedASEState != nil {
+				if p, ok := job.InterruptedASEState["phase"].(string); ok {
+					asePhase = p
+				}
+			}
+			go func(c string, fb bool, fbReason, r, phase string) {
+				defer convWg.Done()
+				var err error
+				actualCLIArgs := ""
+				if !fb && resumeConvID != "" && c == resumeConvID {
+					if engineName == "agent" {
+						actualCLIArgs = fmt.Sprintf("--resume %s", c)
+					} else {
+						actualCLIArgs = fmt.Sprintf("--conversation=%s", c)
+					}
+				}
+				opt := controlplane.PostConversationOptions{
+					Fallback:       fb,
+					FallbackReason: fbReason,
+					Role:           r,
+					CLIArgs:        actualCLIArgs,
+					ASEPhase:       phase,
+				}
+				for attempt := 1; attempt <= 10; attempt++ {
+					err = controlplane.PostConversationWithOptions(context.Background(), api, token, jobID, c, opt)
+					if err == nil {
+						return
+					}
+					time.Sleep(time.Duration(attempt*100) * time.Millisecond)
+				}
+				if err != nil {
+					fatalMsg := fmt.Sprintf("[iazio-harness] FATAL: failed to register conversation ID %s for job %s with control plane after 10 attempts: %v\n", c, jobID, err)
+					log.Printf("%s", fatalMsg)
+					_ = sp.AppendRaw("stderr", []byte(fatalMsg))
+					_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fatalMsg)
+				}
+			}(cid, isFallback, fallbackReason, role, asePhase)
 		},
 	}
 	execRes, execErr := runner.Execute(ctx, execReq, sp)
@@ -545,27 +775,132 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	// Execution Diagnosis & Anomaly Detection
 	_ = sp.Sync()
 	engineLogData, _ := os.ReadFile(execReq.LogFile)
+	stderrLogData, _ := os.ReadFile(strings.TrimSuffix(execReq.LogFile, ".log") + ".stderr.log")
+	combinedEngineLog := append(append([]byte(nil), engineLogData...), stderrLogData...)
+	engineLogStr := string(combinedEngineLog)
 	spoolLogData, _ := os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
-	combinedOutput := string(engineLogData) + "\n" + string(spoolLogData)
+	combinedOutput := engineLogStr + "\n" + string(spoolLogData)
 
 	diagReport := diagnostics.Diagnose(diagnostics.DiagnosticInput{
 		JobID:        job.ID,
 		StoryID:      job.StoryID,
 		WorktreePath: worktree,
 		ExitCode:     execRes.ExitCode,
-		OutputText:   combinedOutput,
+		OutputText:   engineLogStr,
 	})
 
-	// Check for quota exhaustion auto-fallback
-	isQuotaExhausted := false
-	for _, f := range diagReport.Findings {
-		if f.Code == diagnostics.CodeQuotaExhausted {
-			isQuotaExhausted = true
-			break
+	convMu.Lock()
+	sessionConfirmed := (confirmedConvID == resumeConvID)
+	alreadyFellBack := (confirmedConvID != "" && confirmedConvID != resumeConvID)
+	convMu.Unlock()
+
+	// Inspect engine execution log/stderr specifically (never LLM agent output or spool) for session attach errors (Finding B6, F5, H1)
+	hasEngineSessionError := hasEngineSessionAttachError(combinedEngineLog)
+
+	// Inspect engine execution log/stderr specifically (never LLM agent output or spool) for quota exhaustion errors (Finding M3, H1)
+	isQuotaExhausted := hasEngineQuotaExhaustedError(combinedEngineLog)
+	if !isQuotaExhausted {
+		for _, f := range diagReport.Findings {
+			if f.Code == diagnostics.CodeQuotaExhausted {
+				isQuotaExhausted = true
+				break
+			}
 		}
 	}
-	if !isQuotaExhausted && (strings.Contains(combinedOutput, "ActionRequiredError") || strings.Contains(combinedOutput, "out of usage")) {
-		isQuotaExhausted = true
+
+	// Stage 2 fallback ONLY triggers if the engine actively failed to attach to resumeConvID.
+	// Normal task failures (lint, tests, build) inside the session must NEVER trigger Stage 2 fallback (F1, F2).
+	// If run 1 already fell back and pinned a new conversation (alreadyFellBack), Stage 2 must NOT run again (F1).
+	isSessionAttachFailure := !sessionConfirmed && !alreadyFellBack && hasEngineSessionError && !isQuotaExhausted
+
+	// Check for conversation resume failure auto-fallback (Stage 2 Fallback)
+	// ONLY trigger if session could not be attached or unrecoverable session error occurred (F2)
+	if resumeConvID != "" && execRes.ExitCode != 0 && ctx.Err() == nil && isSessionAttachFailure {
+		fallbackReason := fmt.Sprintf("tool execution failed to resume on conversation %s (exit code %d)", resumeConvID, execRes.ExitCode)
+		fallbackMsg := fmt.Sprintf("[iazio-harness] [job.resume.conversation_fallback] %s; activating Stage 2 fallback: starting new conversation...\n", fallbackReason)
+		_ = sp.AppendRaw("stdout", []byte(fallbackMsg))
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", fallbackMsg)
+
+		fallbackReq := execReq
+		fallbackReq.ResumeConversationID = "" // clear to start a new conversation
+		fallbackReq.Argv = nil
+
+		// Reset confirmed conversation so the new fallback conversation can be pinned
+		convMu.Lock()
+		confirmedConvID = ""
+		isPreflightFallback = true
+		preflightFallbackReason = fallbackReason
+		convMu.Unlock()
+
+		if job.InterruptedASEState != nil && len(job.InterruptedASEState) > 0 {
+			phase, _ := job.InterruptedASEState["phase"].(string)
+			phaseSource, _ := job.InterruptedASEState["phase_source"].(string)
+			if phase != "" && phase != "UNKNOWN" && phaseSource != "default" {
+				phaseText := sanitizeAlphanumeric(phase)
+				if phaseSource == "repo_halted_dirty" {
+					phaseText += " [inferred from uncommitted changes]"
+				}
+				resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s failed with exit code %d. Fallback to new conversation. Interrupted State: phase=%s, step=%s, story_id=%s, gate=%s. Resume execution from this checkpoint.]\n\n",
+					sanitizeAlphanumeric(resumeConvID),
+					execRes.ExitCode,
+					phaseText,
+					sanitizeStep(job.InterruptedASEState["step"]),
+					sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["story_id"])),
+					sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["last_completed_gate"])),
+				)
+				fallbackReq.Prompt = resumeDirective + fallbackReq.Prompt
+			}
+		}
+
+		execRes, execErr = runner.Execute(ctx, fallbackReq, sp)
+
+		// Re-flush spool after fallback
+		for _, ev := range sp.Flush() {
+			if ev.Type == spool.EventOutputChunk {
+				_ = controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text)
+			}
+		}
+
+		// Wait for any in-flight conversation registration from the fallback run
+		fallbackConvDone := make(chan struct{})
+		go func() {
+			convWg.Wait()
+			close(fallbackConvDone)
+		}()
+		select {
+		case <-fallbackConvDone:
+		case <-time.After(3 * time.Second):
+		}
+
+		// Re-diagnose after fallback run
+		_ = sp.Sync()
+		engineLogData, _ = os.ReadFile(fallbackReq.LogFile)
+		stderrLogData, _ = os.ReadFile(strings.TrimSuffix(fallbackReq.LogFile, ".log") + ".stderr.log")
+		combinedEngineLog = append(append([]byte(nil), engineLogData...), stderrLogData...)
+		engineLogStr = string(combinedEngineLog)
+		spoolLogData, _ = os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
+		combinedOutput = engineLogStr + "\n" + string(spoolLogData)
+		diagReport = diagnostics.Diagnose(diagnostics.DiagnosticInput{
+			JobID:        job.ID,
+			StoryID:      job.StoryID,
+			WorktreePath: worktree,
+			ExitCode:     execRes.ExitCode,
+			OutputText:   engineLogStr,
+		})
+	}
+
+	// Check for quota exhaustion auto-fallback (inspect engine log only, never spool/LLM text - Finding M3)
+	isQuotaExhausted = hasEngineQuotaExhaustedError(combinedEngineLog)
+	if !isQuotaExhausted && engineName == "agent" {
+		isQuotaExhausted = hasEngineQuotaExhaustedError([]byte(spoolLogData))
+	}
+	if !isQuotaExhausted {
+		for _, f := range diagReport.Findings {
+			if f.Code == diagnostics.CodeQuotaExhausted {
+				isQuotaExhausted = true
+				break
+			}
+		}
 	}
 
 	if isQuotaExhausted && engineName == "agent" && ctx.Err() == nil {
@@ -579,9 +914,15 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		fallbackReq.Engine = fallbackEngine
 		fallbackReq.Model = fallbackModel
 		fallbackReq.Argv = nil
-		if fallbackReq.ResumeConversationID != "" && strings.HasPrefix(strings.ToLower(fallbackReq.ResumeConversationID), "cursor-") {
-			fallbackReq.ResumeConversationID = ""
-		}
+		fallbackReq.ResumeConversationID = "" // clear to ensure fresh start on agy (Finding C2)
+
+		// Reset confirmed conversation pin so the new agy conversation can be pinned as fallback_primary (Finding C2)
+		convMu.Lock()
+		confirmedConvID = ""
+		isPreflightFallback = true
+		preflightFallbackReason = "quota_exhausted_engine_switch: switched from agent to agy"
+		convMu.Unlock()
+
 		fallbackRunner := engines.CLI{Engine: fallbackEngine}
 		if checkErr := fallbackRunner.HealthCheck(); checkErr == nil {
 			log.Printf("[harness] Auto-engine fallback: switching from agent to agy for job %s", jobID)
@@ -596,17 +937,31 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 				}
 			}
 
+			// Wait for any in-flight conversation registration from the quota fallback run
+			fallbackConvDone := make(chan struct{})
+			go func() {
+				convWg.Wait()
+				close(fallbackConvDone)
+			}()
+			select {
+			case <-fallbackConvDone:
+			case <-time.After(3 * time.Second):
+			}
+
 			// Re-diagnose after fallback run
 			_ = sp.Sync()
 			engineLogData, _ = os.ReadFile(fallbackReq.LogFile)
+			stderrLogData, _ = os.ReadFile(strings.TrimSuffix(fallbackReq.LogFile, ".log") + ".stderr.log")
+			combinedEngineLog = append(append([]byte(nil), engineLogData...), stderrLogData...)
+			engineLogStr = string(combinedEngineLog)
 			spoolLogData, _ = os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
-			combinedOutput = string(engineLogData) + "\n" + string(spoolLogData)
+			combinedOutput = engineLogStr + "\n" + string(spoolLogData)
 			diagReport = diagnostics.Diagnose(diagnostics.DiagnosticInput{
 				JobID:        job.ID,
 				StoryID:      job.StoryID,
 				WorktreePath: worktree,
 				ExitCode:     execRes.ExitCode,
-				OutputText:   combinedOutput,
+				OutputText:   engineLogStr,
 			})
 		} else {
 			warnMsg := fmt.Sprintf("[iazio-harness] Auto-fallback engine '%s' is not installed on host PATH: %v\n", fallbackEngine, checkErr)
