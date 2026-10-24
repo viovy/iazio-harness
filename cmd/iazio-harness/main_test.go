@@ -15,6 +15,7 @@ import (
 
 	"github.com/viovy/iazio-harness/internal/checkpoint"
 	"github.com/viovy/iazio-harness/internal/controlplane"
+	"github.com/viovy/iazio-harness/internal/spool"
 )
 
 func TestRunJobDefaults(t *testing.T) {
@@ -1271,6 +1272,199 @@ conversation_id: "heuristic-guessed-conv-id"
 	argsData, _ := os.ReadFile(argsFile)
 	if strings.Contains(string(argsData), "heuristic-guessed-conv-id") {
 		t.Fatalf("control-plane resume must NOT heuristically discover or bind unpinned conversation from dirty context, got args: %s", string(argsData))
+	}
+}
+
+func TestHasEngineQuotaExhaustedError(t *testing.T) {
+	// 1. Legitimate engine error lines with quota/usage exhaustion
+	legitCases := [][]byte{
+		[]byte("ActionRequiredError: You're out of usage.\n"),
+		[]byte("[error] rate limit exceeded for model\n"),
+		[]byte("error: quota exceeded on project\n"),
+		[]byte("[fatal] RESOURCE_EXHAUSTED: quota limit reached\n"),
+		[]byte("FATAL: Switch to Auto, or ask your admin to increase your limit\n"),
+	}
+	for i, c := range legitCases {
+		if !hasEngineQuotaExhaustedError(c) {
+			t.Fatalf("case %d: expected quota error detected for %q", i, string(c))
+		}
+	}
+
+	// 2. Spool / LLM output / normal prose mentioning quota keywords must NOT trigger (Finding M3)
+	falseCases := [][]byte{
+		[]byte("The user asked about ActionRequiredError and how to resolve it.\n"),
+		[]byte("I checked if the system is out of usage in previous logs.\n"),
+		[]byte("docs/runbooks: when quota exceeded occurs, switch engine.\n"),
+		[]byte("print('ActionRequiredError: not real error')\n"),
+		[]byte(""),
+	}
+	for i, c := range falseCases {
+		if hasEngineQuotaExhaustedError(c) {
+			t.Fatalf("case %d: expected no quota error for narrative text %q", i, string(c))
+		}
+	}
+}
+
+func TestExecuteJob_DeterministicResume_SpoolQuotaKeyword_DoesNotSuppressStage2(t *testing.T) {
+	mockHome := t.TempDir()
+	t.Setenv("HOME", mockHome)
+	_ = os.MkdirAll(filepath.Join(mockHome, ".gemini", "antigravity-cli", "conversations"), 0755)
+
+	binDir := t.TempDir()
+	agyBin := filepath.Join(binDir, "agy")
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	runCountFile := filepath.Join(binDir, "run_count.txt")
+	_ = os.WriteFile(runCountFile, []byte("0"), 0644)
+
+	script := fmt.Sprintf(`#!/bin/sh
+cnt=$(cat %s)
+cnt=$((cnt + 1))
+echo "$cnt" > %s
+
+if [ "$cnt" -eq 1 ]; then
+    PREV=""
+    for arg in "$@"; do
+        if [ "$PREV" = "--log-file" ]; then
+            echo "[error] failed to attach to conversation: session corrupted" > "$arg"
+        fi
+        PREV="$arg"
+    done
+    echo "[error] failed to attach to conversation: session corrupted" >&2
+    exit 1
+fi
+
+# Run 2 (Stage 2 Fallback): starts clean new conversation
+PREV=""
+for arg in "$@"; do
+    if [ "$PREV" = "--log-file" ]; then
+        echo "Created conversation 88888888-8888-8888-8888-888888888888" > "$arg"
+    fi
+    PREV="$arg"
+done
+echo "Created conversation 88888888-8888-8888-8888-888888888888"
+exit 0
+`, runCountFile, runCountFile)
+
+	_ = os.WriteFile(agyBin, []byte(script), 0755)
+
+	initialConvID := "11111111-1111-1111-1111-111111111111"
+	workDir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(workDir, ".git"), 0755)
+
+	// Pre-seed spool log with text containing "ActionRequiredError: You're out of usage."
+	// In M3, this used to trick combinedOutput and suppress Stage 2 fallback!
+	spoolLogPath := filepath.Join(spool.DefaultDir(), "job-spool-quota-test.log")
+	_ = os.MkdirAll(spool.DefaultDir(), 0755)
+	_ = os.WriteFile(spoolLogPath, []byte("Prompt text discussing ActionRequiredError: You're out of usage. How do I fix this?\n"), 0644)
+	defer os.Remove(spoolLogPath)
+
+	var recordedMode, recordedFallbackReason string
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") || strings.HasSuffix(r.URL.Path, "/exit") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			if r, ok := body["role"].(string); ok && r == "fallback_primary" {
+				recordedMode = "fallback_new_conversation"
+				recordedFallbackReason, _ = body["fallback_reason"].(string)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-spool-quota-test" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:                    "job-spool-quota-test",
+				ParentJobID:           "job-parent-001",
+				InitialConversationID: initialConvID,
+				ResumeConversationID:  initialConvID,
+				ActiveConversationID:  initialConvID,
+				Kind:                  "resume",
+				Engine:                "agy",
+				Prompt:                "test prompt",
+				WorktreePath:          workDir,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	_ = executeJob(context.Background(), srv.URL, "job-spool-quota-test", workDir, "")
+
+	finalCountBytes, _ := os.ReadFile(runCountFile)
+	finalCount := strings.TrimSpace(string(finalCountBytes))
+	if finalCount != "2" {
+		t.Fatalf("expected Stage 2 fallback to run (run count 2), but got run count %s (spool keyword falsely suppressed Stage 2)", finalCount)
+	}
+
+	mu.Lock()
+	mode := recordedMode
+	reason := recordedFallbackReason
+	mu.Unlock()
+
+	if mode != "fallback_new_conversation" {
+		t.Fatalf("expected fallback_new_conversation, got %q", mode)
+	}
+	if !strings.Contains(reason, "failed to attach") && !strings.Contains(reason, "failed to resume") {
+		t.Fatalf("expected fallback reason mentioning failure to attach or resume, got %q", reason)
+	}
+}
+
+func TestExecuteJob_DeterministicResume_ControlPlaneResume_ArgvOverrideIgnoredWhenEmptyParent(t *testing.T) {
+	binDir := t.TempDir()
+	agyBin := filepath.Join(binDir, "agy")
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	argsFile := filepath.Join(binDir, "received_args.txt")
+	script := fmt.Sprintf(`#!/bin/sh
+echo "$@" > %s
+exit 0
+`, argsFile)
+	_ = os.WriteFile(agyBin, []byte(script), 0755)
+
+	workDir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(workDir, ".git"), 0755)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") || strings.HasSuffix(r.URL.Path, "/conversations") || strings.HasSuffix(r.URL.Path, "/exit") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-cp-override-test" {
+			w.WriteHeader(http.StatusOK)
+			// Parent has NO conversation ID registered
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:           "job-cp-override-test",
+				ParentJobID:  "job-parent-999",
+				Kind:         "resume",
+				Engine:       "agy",
+				Prompt:       "resume prompt",
+				WorktreePath: workDir,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Pass arbitrary foreign ID as argv override
+	foreignLockID := "lock-foreign-conv-1234-uuid"
+	_ = executeJob(context.Background(), srv.URL, "job-cp-override-test", workDir, "", "resume", foreignLockID)
+
+	argsData, _ := os.ReadFile(argsFile)
+	if strings.Contains(string(argsData), foreignLockID) {
+		t.Fatalf("CP resume with empty parent conversation must NOT adopt argv override %s, got args: %s", foreignLockID, string(argsData))
 	}
 }
 

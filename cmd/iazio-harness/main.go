@@ -204,6 +204,42 @@ func hasEngineSessionAttachError(logData []byte) bool {
 	return false
 }
 
+// hasEngineQuotaExhaustedError scans engine execution logs (excluding LLM spool output)
+// for explicit quota/usage exhaustion error messages (Finding M3).
+func hasEngineQuotaExhaustedError(logData []byte) bool {
+	if len(logData) == 0 {
+		return false
+	}
+	lines := strings.Split(string(logData), "\n")
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		lineLower := strings.ToLower(line)
+		isErrorLine := strings.HasPrefix(lineLower, "[error]") ||
+			strings.HasPrefix(lineLower, "error:") ||
+			strings.HasPrefix(lineLower, "fatal:") ||
+			strings.HasPrefix(lineLower, "[fatal]") ||
+			strings.HasPrefix(lineLower, "actionrequirederror")
+
+		if !isErrorLine {
+			continue
+		}
+
+		if strings.Contains(lineLower, "actionrequirederror") ||
+			strings.Contains(lineLower, "out of usage") ||
+			strings.Contains(lineLower, "quota exceeded") ||
+			strings.Contains(lineLower, "rate limit exceeded") ||
+			strings.Contains(lineLower, "resource_exhausted") ||
+			strings.Contains(lineLower, "insufficient_quota") ||
+			strings.Contains(lineLower, "switch to auto, or ask your admin to increase your limit") {
+			return true
+		}
+	}
+	return false
+}
+
 func sanitizeAlphanumeric(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -255,11 +291,16 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
 		return fmt.Errorf("get job: %w", err)
 	}
+	isControlPlaneResume := (job.ParentJobID != "" || job.RootJobID != "")
 	if kindOverride != "" {
 		job.Kind = kindOverride
 	}
 	if resumeConvOverride != "" {
-		job.ResumeConversationID = resumeConvOverride
+		if isControlPlaneResume && job.ResumeConversationID == "" && job.ActiveConversationID == "" {
+			log.Printf("[harness] ignoring --resume-conversation=%s override for control plane resume with empty parent conversation", resumeConvOverride)
+		} else {
+			job.ResumeConversationID = resumeConvOverride
+		}
 	}
 	if worktree == "" {
 		worktree = job.WorktreePath
@@ -368,7 +409,6 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 		log.Printf("[harness] [job.resume.conversation_fallback] resume_mode=fallback_new_conversation reason=%q", preflightFallbackReason)
 	}
-	isControlPlaneResume := (job.ParentJobID != "" || job.RootJobID != "")
 	if job.Kind == "resume" && !isControlPlaneResume {
 		resolver := sessionstore.DefaultResolver()
 		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
@@ -442,9 +482,13 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		phase, _ := job.InterruptedASEState["phase"].(string)
 		phaseSource, _ := job.InterruptedASEState["phase_source"].(string)
 		if phase != "" && phase != "UNKNOWN" && phaseSource != "default" {
+			phaseText := sanitizeAlphanumeric(phase)
+			if phaseSource == "repo_halted_dirty" {
+				phaseText += " [inferred from uncommitted changes]"
+			}
 			resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s interrupted. Fallback to new conversation. Interrupted State: phase=%s, step=%s, story_id=%s, gate=%s. Resume execution from this checkpoint.]\n\n",
 				sanitizeAlphanumeric(attemptedResumeConv),
-				sanitizeAlphanumeric(phase),
+				phaseText,
 				sanitizeStep(job.InterruptedASEState["step"]),
 				sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["story_id"])),
 				sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["last_completed_gate"])),
@@ -732,7 +776,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		StoryID:      job.StoryID,
 		WorktreePath: worktree,
 		ExitCode:     execRes.ExitCode,
-		OutputText:   combinedOutput,
+		OutputText:   engineLogStr,
 	})
 
 	convMu.Lock()
@@ -743,16 +787,15 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	// Inspect engine execution log/stderr specifically (never LLM agent output or spool) for session attach errors (Finding B6, F5)
 	hasEngineSessionError := hasEngineSessionAttachError(engineLogData)
 
-	isQuotaExhausted := false
-	for _, f := range diagReport.Findings {
-		if f.Code == diagnostics.CodeQuotaExhausted {
-			isQuotaExhausted = true
-			break
+	// Inspect engine execution log/stderr specifically (never LLM agent output or spool) for quota exhaustion errors (Finding M3)
+	isQuotaExhausted := hasEngineQuotaExhaustedError(engineLogData)
+	if !isQuotaExhausted {
+		for _, f := range diagReport.Findings {
+			if f.Code == diagnostics.CodeQuotaExhausted {
+				isQuotaExhausted = true
+				break
+			}
 		}
-	}
-	combinedLower := strings.ToLower(combinedOutput)
-	if !isQuotaExhausted && (strings.Contains(engineLogStr, "actionrequirederror") || strings.Contains(engineLogStr, "out of usage") || strings.Contains(combinedLower, "actionrequirederror") || strings.Contains(combinedLower, "out of usage")) {
-		isQuotaExhausted = true
 	}
 
 	// Stage 2 fallback ONLY triggers if the engine actively failed to attach to resumeConvID.
@@ -783,10 +826,14 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			phase, _ := job.InterruptedASEState["phase"].(string)
 			phaseSource, _ := job.InterruptedASEState["phase_source"].(string)
 			if phase != "" && phase != "UNKNOWN" && phaseSource != "default" {
+				phaseText := sanitizeAlphanumeric(phase)
+				if phaseSource == "repo_halted_dirty" {
+					phaseText += " [inferred from uncommitted changes]"
+				}
 				resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s failed with exit code %d. Fallback to new conversation. Interrupted State: phase=%s, step=%s, story_id=%s, gate=%s. Resume execution from this checkpoint.]\n\n",
 					sanitizeAlphanumeric(resumeConvID),
 					execRes.ExitCode,
-					sanitizeAlphanumeric(phase),
+					phaseText,
 					sanitizeStep(job.InterruptedASEState["step"]),
 					sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["story_id"])),
 					sanitizeAlphanumeric(fmt.Sprintf("%v", job.InterruptedASEState["last_completed_gate"])),
@@ -825,20 +872,19 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			StoryID:      job.StoryID,
 			WorktreePath: worktree,
 			ExitCode:     execRes.ExitCode,
-			OutputText:   combinedOutput,
+			OutputText:   string(engineLogData),
 		})
 	}
 
-	// Check for quota exhaustion auto-fallback
-	isQuotaExhausted = false
-	for _, f := range diagReport.Findings {
-		if f.Code == diagnostics.CodeQuotaExhausted {
-			isQuotaExhausted = true
-			break
+	// Check for quota exhaustion auto-fallback (inspect engine log only, never spool/LLM text - Finding M3)
+	isQuotaExhausted = hasEngineQuotaExhaustedError(engineLogData)
+	if !isQuotaExhausted {
+		for _, f := range diagReport.Findings {
+			if f.Code == diagnostics.CodeQuotaExhausted {
+				isQuotaExhausted = true
+				break
+			}
 		}
-	}
-	if !isQuotaExhausted && (strings.Contains(combinedOutput, "ActionRequiredError") || strings.Contains(combinedOutput, "out of usage")) {
-		isQuotaExhausted = true
 	}
 
 	if isQuotaExhausted && engineName == "agent" && ctx.Err() == nil {
@@ -896,7 +942,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 				StoryID:      job.StoryID,
 				WorktreePath: worktree,
 				ExitCode:     execRes.ExitCode,
-				OutputText:   combinedOutput,
+				OutputText:   string(engineLogData),
 			})
 		} else {
 			warnMsg := fmt.Sprintf("[iazio-harness] Auto-fallback engine '%s' is not installed on host PATH: %v\n", fallbackEngine, checkErr)

@@ -16,6 +16,7 @@ import (
 
 	"github.com/viovy/iazio-harness/internal/idempotency"
 	"github.com/viovy/iazio-harness/internal/sandbox"
+	"github.com/viovy/iazio-harness/internal/sessionstore"
 )
 
 // KindStoryRefinement selects the docs hub as the child working directory and lock target.
@@ -311,8 +312,17 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	var scanned bool
 	var convMu sync.Mutex
 	var recentOut, recentErr string
-	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentOut, mu: &convMu}
-	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentErr, mu: &convMu}
+	var logFileHandle *os.File
+	if req.LogFile != "" {
+		_ = os.MkdirAll(filepath.Dir(req.LogFile), 0755)
+		if lf, errL := os.OpenFile(req.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); errL == nil {
+			logFileHandle = lf
+			defer logFileHandle.Close()
+		}
+	}
+
+	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentOut, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: logFileHandle}
+	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentErr, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: logFileHandle}
 
 	startTime := time.Now().Add(-2 * time.Second)
 	var logOffset int64
@@ -352,10 +362,31 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 			}
 		}
 
-		// Also scan default ~/.gemini/antigravity-cli/cli.log as eager fallback
+		// When ResumeConversationID is set, restrict discovery strictly to verifying the requested conversation:
+		// Only check if <req.ResumeConversationID>.db was updated after startTime.
+		// Never scan shared ~/.gemini/antigravity-cli/cli.log or arbitrary foreign .db files (Finding H1).
+		if req.ResumeConversationID != "" {
+			if home, errH := os.UserHomeDir(); errH == nil && home != "" {
+				targetDb := filepath.Join(home, ".gemini", "antigravity-cli", "conversations", req.ResumeConversationID+".db")
+				if fi, errStat := os.Stat(targetDb); errStat == nil && fi.ModTime().After(startTime) {
+					scanned = true
+					req.OnConversationID(req.ResumeConversationID)
+					return
+				}
+			}
+			return
+		}
+
+		// When per-job LogFile is specified or for managed harness jobs, restrict discovery strictly to req.LogFile.
+		// Shared cli.log has no per-job isolation and causes cross-job session hijacking under concurrency (Finding H1).
+		if req.LogFile != "" || req.JobID != "" {
+			return
+		}
+
+		// Fallback for unmanaged/standalone CLI invocations without a JobID:
 		if home, errH := os.UserHomeDir(); errH == nil && home != "" {
 			cliLog := filepath.Join(home, ".gemini", "antigravity-cli", "cli.log")
-			if fi, errStat := os.Stat(cliLog); errStat == nil && fi.Size() > 0 {
+			if fi, errStat := os.Stat(cliLog); errStat == nil && fi.Size() > 0 && fi.ModTime().After(startTime) {
 				if fCli, errO := os.Open(cliLog); errO == nil {
 					defer fCli.Close()
 					var seekPos int64
@@ -384,7 +415,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 					info, errI := entry.Info()
 					if errI == nil && info.ModTime().After(startTime) {
 						cid := strings.TrimSuffix(entry.Name(), ".db")
-						if len(cid) >= 32 {
+						if len(cid) >= 32 && sessionstore.IsValidConversationID(cid) {
 							scanned = true
 							req.OnConversationID(cid)
 							return
@@ -531,17 +562,22 @@ func exitCode(err error) int {
 }
 
 type rawWriter struct {
-	stream  string
-	dst     EventStream
-	onConv  func(string)
-	scanned *bool
-	recent  *string
-	mu      *sync.Mutex
+	stream       string
+	dst          EventStream
+	onConv       func(string)
+	scanned      *bool
+	recent       *string
+	mu           *sync.Mutex
+	resumeConvID string
+	logFile      *os.File
 }
 
 func (w rawWriter) Write(p []byte) (int, error) {
-	if w.dst == nil || len(p) == 0 {
-		return len(p), nil
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if w.logFile != nil {
+		_, _ = w.logFile.Write(p)
 	}
 	if w.onConv != nil && w.scanned != nil && w.mu != nil {
 		w.mu.Lock()
@@ -563,9 +599,11 @@ func (w rawWriter) Write(p []byte) (int, error) {
 		}
 		w.mu.Unlock()
 	}
-	buf := append([]byte(nil), p...)
-	if err := w.dst.AppendRaw(w.stream, buf); err != nil {
-		return 0, err
+	if w.dst != nil {
+		buf := append([]byte(nil), p...)
+		if err := w.dst.AppendRaw(w.stream, buf); err != nil {
+			return 0, err
+		}
 	}
 	return len(p), nil
 }
@@ -573,19 +611,24 @@ func (w rawWriter) Write(p []byte) (int, error) {
 func extractConversationIDFromText(sData string) string {
 	markers := []string{
 		"Created conversation ",
+		"created conversation ",
 		"Resumed conversation ",
+		"resumed conversation ",
 		"Resuming conversation ",
+		"resuming conversation ",
 		"Loaded conversation ",
+		"loaded conversation ",
 		"Active conversation ",
+		"active conversation ",
 		"Using conversation ",
+		"using conversation ",
 		"Print mode: conversation=",
-		"conversation=",
-		"conversationID=",
-		"conversation_id=",
 		"Conversation ID: ",
+		"conversation ID: ",
 		"Conversation ID=",
-		"conversation: ",
+		"conversation ID=",
 		"Streaming conversation ",
+		"streaming conversation ",
 		"GetConversationDetail: found conversation ",
 	}
 	for _, marker := range markers {
@@ -601,7 +644,8 @@ func extractConversationIDFromText(sData string) string {
 			})
 			if len(fields) > 0 {
 				candidate := strings.Trim(fields[0], " .,;:\"'")
-				if len(candidate) >= 32 {
+				candidate = strings.TrimPrefix(candidate, "--conversation=")
+				if len(candidate) >= 32 && sessionstore.IsValidConversationID(candidate) {
 					return candidate
 				}
 			}
@@ -620,7 +664,7 @@ func extractConversationID(s string) string {
 			end := strings.IndexByte(s[start:], '"')
 			if end != -1 {
 				val := strings.TrimSpace(s[start : start+end])
-				if val != "" {
+				if len(val) > 0 && sessionstore.IsValidConversationID(val) {
 					return val
 				}
 			}

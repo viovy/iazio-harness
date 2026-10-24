@@ -555,13 +555,13 @@ func TestExtractConversationIDFromText(t *testing.T) {
 	}
 
 	// Trailing punctuation should be trimmed
-	logLine3 := "Finished task in conversation=" + uuid1 + "."
+	logLine3 := "Resumed conversation " + uuid1 + "."
 	if got := extractConversationIDFromText(logLine3); got != uuid1 {
 		t.Fatalf("expected %s, got %s", uuid1, got)
 	}
 
 	// Earlier false-positive marker occurrence should not block later valid UUID
-	logLine4 := "Flags: conversation=none\nServer: conversation=" + uuid2
+	logLine4 := "Flags: Resumed conversation none\nServer: Active conversation " + uuid2
 	if got := extractConversationIDFromText(logLine4); got != uuid2 {
 		t.Fatalf("expected %s, got %s", uuid2, got)
 	}
@@ -571,16 +571,81 @@ func TestExtractConversationIDFromText(t *testing.T) {
 		t.Fatalf("expected %s from extractConversationID, got %s", uuid1, got)
 	}
 
-	// New markers test
+	// Explicit engine markers test
 	uuid3 := "b56c3691-8075-4ede-9b80-056707b0bee1"
-	if got := extractConversationIDFromText("Starting prompt: conversationID=" + uuid3); got != uuid3 {
+	if got := extractConversationIDFromText("Active conversation " + uuid3); got != uuid3 {
 		t.Fatalf("expected %s, got %s", uuid3, got)
 	}
 	if got := extractConversationIDFromText("Agent active. Conversation ID: " + uuid3); got != uuid3 {
 		t.Fatalf("expected %s, got %s", uuid3, got)
 	}
-	if got := extractConversationIDFromText("Logged: conversation_id=" + uuid3); got != uuid3 {
+	if got := extractConversationIDFromText("Engine status: Conversation ID=" + uuid3); got != uuid3 {
 		t.Fatalf("expected %s, got %s", uuid3, got)
+	}
+
+	// Bare markers in narrative / CLI flags / LLM output must be ignored (Finding H1)
+	foreignID := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+	if got := extractConversationIDFromText("User asked: agy --conversation=" + foreignID); got != "" {
+		t.Fatalf("expected bare conversation= to be ignored, got %q", got)
+	}
+	if got := extractConversationIDFromText("echo conversation=" + foreignID); got != "" {
+		t.Fatalf("expected bare conversation= to be ignored, got %q", got)
+	}
+	if got := extractConversationIDFromText("Logged: conversation_id=" + foreignID); got != "" {
+		t.Fatalf("expected bare conversation_id= to be ignored, got %q", got)
+	}
+	if got := extractConversationIDFromText("Starting prompt: conversationID=" + foreignID); got != "" {
+		t.Fatalf("expected bare conversationID= to be ignored, got %q", got)
+	}
+	if got := extractConversationIDFromText("conversation: " + foreignID); got != "" {
+		t.Fatalf("expected bare conversation: to be ignored, got %q", got)
+	}
+}
+
+type mockRawStream struct{}
+
+func (m *mockRawStream) AppendRaw(stream string, p []byte) error {
+	return nil
+}
+
+func TestRawWriter_ResumeConversationIsolation(t *testing.T) {
+	// Verify that when ResumeConversationID is set, rawWriter ignores LLM stdout containing foreign conversation IDs (Finding H1)
+	expectedID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	foreignID := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+
+	var detectedID string
+	var scanned bool
+	var mu sync.Mutex
+	var recent string
+
+	writer := rawWriter{
+		stream:       "stdout",
+		dst:          &mockRawStream{},
+		onConv:       func(cid string) { detectedID = cid },
+		scanned:      &scanned,
+		recent:       &recent,
+		mu:           &mu,
+		resumeConvID: expectedID,
+	}
+
+	// 1. LLM echoes foreign conversation ID in its response text
+	llmOutput := []byte("I noticed prior job ran with agy --conversation=" + foreignID + " which failed.\n")
+	_, err := writer.Write(llmOutput)
+	if err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	if detectedID != "" {
+		t.Fatalf("expected foreign ID to be ignored, but detected: %s", detectedID)
+	}
+
+	// 2. Real engine marker with expected ID is received
+	engineMarker := []byte("Resumed conversation " + expectedID + "\n")
+	_, err = writer.Write(engineMarker)
+	if err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	if detectedID != expectedID {
+		t.Fatalf("expected %s, got %s", expectedID, detectedID)
 	}
 }
 
