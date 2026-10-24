@@ -277,9 +277,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		engineName = "agy"
 	}
 
-	resumeConvID := job.ResumeConversationID
-	if resumeConvID == "" && job.ActiveConversationID != "" {
-		resumeConvID = job.ActiveConversationID
+	resumeConvID := job.ActiveConversationID
+	if resumeConvID == "" {
+		resumeConvID = job.ResumeConversationID
 	}
 	if resumeConvID == "" {
 		resumeConvID = job.InitialConversationID
@@ -352,6 +352,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 
 	isPreflightFallback := false
 	preflightFallbackReason := ""
+	attemptedResumeConv := resumeConvID
 	if resumeConvID != "" {
 		if !sessionstore.IsValidConversationID(resumeConvID) {
 			isPreflightFallback = true
@@ -368,7 +369,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 
 	if isPreflightFallback && job.InterruptedASEState != nil && len(job.InterruptedASEState) > 0 {
 		resumeDirective := fmt.Sprintf("\n[ASE RESUME DIRECTIVE: Prior execution on conversation %s interrupted. Fallback to new conversation. Interrupted State: phase=%v, step=%v, story_id=%v, gate=%v. Resume execution from this checkpoint.]\n\n",
-			job.InitialConversationID,
+			attemptedResumeConv,
 			job.InterruptedASEState["phase"],
 			job.InterruptedASEState["step"],
 			job.InterruptedASEState["story_id"],
@@ -554,7 +555,6 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 
 			confirmedConvID = cid
 			activeConvID = cid
-			execReq.ResumeConversationID = cid
 
 			span.AddAnnotation(fmt.Sprintf("conversation_detected:%s:fallback=%v:role=%s", cid, isFallback, role))
 			_ = lockHandle.Update(repolock.LockInfo{
@@ -647,14 +647,16 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	})
 
 	convMu.Lock()
-	sessionAttached := (confirmedConvID != "" && confirmedConvID == resumeConvID)
+	sessionConfirmed := (confirmedConvID == resumeConvID)
 	convMu.Unlock()
 
-	hasSessionError := strings.Contains(strings.ToLower(combinedOutput), "session not found") ||
-		strings.Contains(strings.ToLower(combinedOutput), "conversation not found") ||
-		strings.Contains(strings.ToLower(combinedOutput), "failed to load session") ||
-		strings.Contains(strings.ToLower(combinedOutput), "failed to resume conversation") ||
-		strings.Contains(strings.ToLower(combinedOutput), "corrupted session")
+	// Inspect engine execution log/stderr specifically (never LLM agent output or transcript) for session attach errors
+	engineLogStr := strings.ToLower(string(engineLogData))
+	hasEngineSessionError := strings.Contains(engineLogStr, "conversation not found") ||
+		strings.Contains(engineLogStr, "session not found") ||
+		strings.Contains(engineLogStr, "failed to open session") ||
+		strings.Contains(engineLogStr, "failed to attach to conversation") ||
+		strings.Contains(engineLogStr, "corrupted session database")
 
 	isQuotaExhausted := false
 	for _, f := range diagReport.Findings {
@@ -663,11 +665,13 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			break
 		}
 	}
-	if !isQuotaExhausted && (strings.Contains(combinedOutput, "ActionRequiredError") || strings.Contains(combinedOutput, "out of usage")) {
+	if !isQuotaExhausted && (strings.Contains(engineLogStr, "actionrequirederror") || strings.Contains(engineLogStr, "out of usage")) {
 		isQuotaExhausted = true
 	}
 
-	isSessionAttachFailure := (!sessionAttached || hasSessionError) && !isQuotaExhausted
+	// Stage 2 fallback ONLY triggers if the engine actively failed to attach to resumeConvID.
+	// Normal task failures (lint, tests, build) inside the session must NEVER trigger Stage 2 fallback (F1, F2).
+	isSessionAttachFailure := !sessionConfirmed && hasEngineSessionError && !isQuotaExhausted
 
 	// Check for conversation resume failure auto-fallback (Stage 2 Fallback)
 	// ONLY trigger if session could not be attached or unrecoverable session error occurred (F2)

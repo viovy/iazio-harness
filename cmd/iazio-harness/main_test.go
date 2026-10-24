@@ -702,21 +702,14 @@ func TestExecuteJob_DeterministicResume_TaskFailure_NoSecondExecution(t *testing
 	mockDir := t.TempDir()
 	countFile := filepath.Join(mockDir, "invocations.txt")
 	mockAgy := filepath.Join(mockDir, "agy")
+	// The mock engine is called with --conversation=targetConvID, prints NO session markers at all, and exits 1 due to task error
 	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
 echo "run" >> "%s"
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --log-file)
-      shift
-      echo "I1024 12:00:00.000000 1 server.go:1274] Resumed conversation %s" > "$1"
-      ;;
-  esac
-  shift
-done
-echo "Resumed conversation %s"
+echo "compiling tests..."
+echo "running suite..."
 echo "FAIL: task test assertion error" >&2
 exit 1
-`, countFile, targetConvID, targetConvID)), 0755)
+`, countFile)), 0755)
 
 	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
 
