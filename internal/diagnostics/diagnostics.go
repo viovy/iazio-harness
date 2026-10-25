@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/ase/gate"
 )
 
 // Anomaly codes.
@@ -28,6 +30,7 @@ const (
 	CodeBuildFailed           = "BUILD_FAILED"
 	CodeTestFailed            = "TEST_FAILED"
 	CodeNonZeroExit           = "NON_ZERO_EXIT"
+	CodeIncompleteASEFlow     = "incomplete_ase_flow"
 )
 
 // Finding represents one detected issue or anomaly.
@@ -480,6 +483,24 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 			Message:     fmt.Sprintf("Child engine exited with code 0 but left %d modified/untracked files in worktree without completing story.", count),
 			Remediation: "Review uncommitted changes, complete ASE Phase 4/5, or discard untracked artifacts.",
 		})
+	}
+
+	// 5b. Post-exit ASE Completion Gate
+	if input.ExitCode == 0 && input.WorktreePath != "" {
+		gateRes := gate.Verify(gate.GateOptions{
+			WorktreePath: input.WorktreePath,
+			StoryID:      input.StoryID,
+			GitRunner:    git,
+		})
+		if !gateRes.Passed {
+			report.ASEComplete = false
+			report.Findings = append(report.Findings, Finding{
+				Code:        CodeIncompleteASEFlow,
+				Severity:    "ERROR",
+				Message:     fmt.Sprintf("Child engine exited with code 0 but ASE completion gate failed: unmet gates: %v", gateRes.UnmetGates),
+				Remediation: "Continue execution on active conversation to complete remaining ASE gates: " + strings.Join(gateRes.UnmetGates, ", "),
+			})
+		}
 	}
 
 	if input.ExitCode != 0 {
