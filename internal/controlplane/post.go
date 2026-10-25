@@ -85,9 +85,18 @@ func doPostWithRetry(ctx context.Context, url, token string, raw []byte, opName 
 
 // PostChunk stores one stripped chunk. The raw spool stays on the runner.
 func PostChunk(ctx context.Context, baseURL, token, jobID, stream, text string) error {
-	raw, err := json.Marshal(map[string]string{
+	return PostChunkWithTelemetry(ctx, baseURL, token, jobID, stream, text, "")
+}
+
+// PostChunkWithTelemetry stores one stripped chunk with optional telemetry such as active child tasks.
+func PostChunkWithTelemetry(ctx context.Context, baseURL, token, jobID, stream, text, activeChildTasks string) error {
+	payload := map[string]string{
 		"type": "OUTPUT_CHUNK", "stream": stream, "text": text,
-	})
+	}
+	if activeChildTasks != "" {
+		payload["active_child_tasks"] = activeChildTasks
+	}
+	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}

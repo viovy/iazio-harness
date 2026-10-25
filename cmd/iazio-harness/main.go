@@ -1107,7 +1107,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 								summary, pids := watchdog.FormatActiveChildProcessesSummary(childProcs)
 								diag := fmt.Sprintf("[iazio-harness] Execution active (job %s, elapsed: %s); engine waiting on active child task(s): %s (pids: %v)\n",
 									jobID, elapsedStr, summary, pids)
-								_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", diag)
+								_ = controlplane.PostChunkWithTelemetry(context.Background(), api, token, jobID, "stdout", diag, summary)
 							}
 						} else if ev.SilentForMs >= 30000 && now.Sub(lastSilenceWarning) >= 30*time.Second {
 							lastSilenceWarning = now
@@ -1734,7 +1734,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			"[ASE-SUPERVISOR] Fleet Git State: %d dirty file(s) preserved\n"+
 			"[ASE-SUPERVISOR] Injecting continuation prompt into %s --conversation=%s...\n\n",
 			strings.Join(unmetGatesList, ", "),
-			autoResumeCount+1, maxAutoResumes+1,
+			autoResumeCount, maxAutoResumes,
 			resumeTargetID, triggerReason,
 			currentBoundStoryID, resolveLiveGitBranch(worktree),
 			len(dirtyFiles),
@@ -1742,7 +1742,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		)
 		_ = sp.AppendRaw("stdout", []byte(autoResumeMsg))
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", autoResumeMsg)
-		_ = controlplane.PostTurnContinued(context.Background(), api, token, jobID, autoResumeCount+1, resumeTargetID, unmetGatesList, "")
+		childProcsNow, _ := watchdog.GetDescendantProcesses(activePID)
+		activeChildSummary, _ := watchdog.FormatActiveChildProcessesSummary(childProcsNow)
+		_ = controlplane.PostTurnContinued(context.Background(), api, token, jobID, autoResumeCount, resumeTargetID, unmetGatesList, activeChildSummary)
 
 		resumeReq := execReq
 		resumeReq.Prompt = fmt.Sprintf("resume — continue autonomous story execution until all story completion gates pass.\n"+
