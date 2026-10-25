@@ -325,26 +325,71 @@ func hasRunningGitProcess(workspacePath string) bool {
 }
 
 func isLockFileHeld(lockPath string) bool {
+	cleanPath, err := filepath.Abs(lockPath)
+	if err != nil {
+		cleanPath = filepath.Clean(lockPath)
+	}
+
+	// 1. Linux /proc/*/fd scanning
+	procEntries, err := os.ReadDir("/proc")
+	if err == nil {
+		for _, entry := range procEntries {
+			if !entry.IsDir() {
+				continue
+			}
+			pidStr := entry.Name()
+			if pidStr == "self" || pidStr == "thread-self" {
+				continue
+			}
+			fdDir := filepath.Join("/proc", pidStr, "fd")
+			fds, err := os.ReadDir(fdDir)
+			if err != nil {
+				continue
+			}
+			for _, fd := range fds {
+				target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
+				if err == nil && filepath.Clean(target) == cleanPath {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// 2. lsof detection for macOS / Darwin / Unix
 	if lsofBin, err := exec.LookPath("lsof"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		out, _ := exec.CommandContext(ctx, lsofBin, lockPath, "-t").Output()
-		cancel()
+		defer cancel()
+		out, _ := exec.CommandContext(ctx, lsofBin, cleanPath, "-t").Output()
 		if len(strings.TrimSpace(string(out))) > 0 {
 			return true
 		}
+		return false
+	}
+
+	// 3. Fallback: if fuser exists
+	if fuserBin, err := exec.LookPath("fuser"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		out, _ := exec.CommandContext(ctx, fuserBin, cleanPath).Output()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return true
+		}
+		return false
+	}
+
+	// Fail closed if inspection tooling is unavailable and the file exists
+	if _, err := os.Stat(cleanPath); err == nil {
+		return true
 	}
 	return false
 }
 
-func cleanStaleGitLocks(workspacePath string) []string {
-	var removed []string
-	if hasRunningGitProcess(workspacePath) {
-		return removed
-	}
+func resolveGitDir(workspacePath string) (string, error) {
 	gitDir := filepath.Join(workspacePath, ".git")
 	fi, err := os.Stat(gitDir)
 	if err != nil {
-		return removed
+		return "", err
 	}
 	targetGitDir := gitDir
 	if !fi.IsDir() {
@@ -357,6 +402,51 @@ func cleanStaleGitLocks(workspacePath string) []string {
 				}
 			}
 		}
+	}
+	return targetGitDir, nil
+}
+
+func hasRemainingGitLocks(workspacePath string) bool {
+	targetGitDir, err := resolveGitDir(workspacePath)
+	if err != nil {
+		return false
+	}
+
+	rootLocks := []string{
+		filepath.Join(targetGitDir, "index.lock"),
+		filepath.Join(targetGitDir, "HEAD.lock"),
+		filepath.Join(targetGitDir, "config.lock"),
+	}
+	for _, l := range rootLocks {
+		if _, err := os.Stat(l); err == nil {
+			return true
+		}
+	}
+
+	modulesDir := filepath.Join(targetGitDir, "modules")
+	var foundLock bool
+	if _, err := os.Stat(modulesDir); err == nil {
+		_ = filepath.Walk(modulesDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || foundLock {
+				return nil
+			}
+			if !info.IsDir() && strings.HasSuffix(info.Name(), ".lock") {
+				foundLock = true
+			}
+			return nil
+		})
+	}
+	return foundLock
+}
+
+func cleanStaleGitLocks(workspacePath string) []string {
+	var removed []string
+	if hasRunningGitProcess(workspacePath) {
+		return removed
+	}
+	targetGitDir, err := resolveGitDir(workspacePath)
+	if err != nil {
+		return removed
 	}
 
 	rootLocks := []string{
@@ -468,7 +558,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	})
 
 	cleanedLocks := cleanStaleGitLocks(targetDir)
-	cleanLocksStatus := !hasRunningGitProcess(targetDir)
+	cleanLocksStatus := !hasRunningGitProcess(targetDir) && !hasRemainingGitLocks(targetDir)
 	manifest := map[string]any{
 		"clean_locks":         cleanLocksStatus,
 		"stale_locks_removed": len(cleanedLocks),
@@ -645,6 +735,12 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 				"turns_count":             len(bundle.LastToolActions),
 				"last_tool_actions_count": len(bundle.LastToolActions),
 				"ase_phase":               bundle.InterruptedPhase,
+			}
+		} else {
+			preflightRehydrationStatus = map[string]any{
+				"hydrated":               false,
+				"source_conversation_id": attemptedResumeConv,
+				"error":                  "empty rehydration bundle",
 			}
 		}
 		if preflightRehydrationStatus != nil {
@@ -1025,8 +1121,15 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 					"last_tool_actions_count": len(bundle.LastToolActions),
 					"ase_phase":               bundle.InterruptedPhase,
 				}
+			} else {
+				stage2RehydrationStatus = map[string]any{
+					"hydrated":               false,
+					"source_conversation_id": resumeConvID,
+					"error":                  "empty rehydration bundle",
+				}
 			}
 			if stage2RehydrationStatus != nil {
+				preflightRehydrationStatus = stage2RehydrationStatus
 				_ = controlplane.PostJobReadiness(context.Background(), api, token, jobID, nil, nil, stage2RehydrationStatus)
 			}
 		}

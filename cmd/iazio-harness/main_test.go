@@ -1781,3 +1781,35 @@ func TestCleanStaleGitLocks(t *testing.T) {
 		t.Errorf("expected submodule lock to be removed")
 	}
 }
+
+func TestCleanStaleGitLocks_PreservesHeldLock(t *testing.T) {
+	tempWorkspace := t.TempDir()
+	gitDir := filepath.Join(tempWorkspace, ".git")
+	if err := os.MkdirAll(gitDir, 0755); err != nil {
+		t.Fatalf("failed to create git dir: %v", err)
+	}
+
+	rootLock := filepath.Join(gitDir, "index.lock")
+	f, err := os.OpenFile(rootLock, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("failed to create root lock: %v", err)
+	}
+	defer f.Close()
+
+	if !isLockFileHeld(rootLock) {
+		t.Skip("environment cannot detect open file descriptor via /proc or lsof")
+	}
+
+	if !hasRemainingGitLocks(tempWorkspace) {
+		t.Fatalf("expected hasRemainingGitLocks to be true when root lock exists")
+	}
+
+	cleaned := cleanStaleGitLocks(tempWorkspace)
+	if len(cleaned) != 0 {
+		t.Fatalf("expected 0 cleaned locks for held lock, got: %v", cleaned)
+	}
+
+	if _, err := os.Stat(rootLock); err != nil {
+		t.Fatalf("expected held root lock to be preserved, got: %v", err)
+	}
+}
