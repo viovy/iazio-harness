@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -19,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/viovy/iazio-harness/internal/ase/gate"
 	"github.com/viovy/iazio-harness/internal/auth"
 	"github.com/viovy/iazio-harness/internal/checkpoint"
 	"github.com/viovy/iazio-harness/internal/controlplane"
@@ -110,6 +112,7 @@ func runJob(args []string) error {
 
 func runJobWithContext(ctx context.Context, args []string) error {
 	var api, jobID, worktree, docsHub, chunk, kind, resumeConv string
+	var attachToolPID int
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--api-url":
@@ -147,6 +150,11 @@ func runJobWithContext(ctx context.Context, args []string) error {
 			if i < len(args) {
 				resumeConv = args[i]
 			}
+		case "--attach-tool-pid":
+			i++
+			if i < len(args) {
+				attachToolPID, _ = strconv.Atoi(args[i])
+			}
 		}
 	}
 	if api == "" {
@@ -168,7 +176,7 @@ func runJobWithContext(ctx context.Context, args []string) error {
 	if chunk != "" {
 		return controlplane.PostChunk(ctx, api, "", jobID, "stdout", chunk)
 	}
-	return executeJob(ctx, api, jobID, worktree, docsHub, kind, resumeConv)
+	return executeJob(ctx, api, jobID, worktree, docsHub, kind, resumeConv, strconv.Itoa(attachToolPID))
 }
 
 // hasEngineSessionAttachError inspects engine execution log/stderr specifically for session attachment errors.
@@ -506,6 +514,118 @@ func resolveConversationFallback(worktree, storyID, engineName string) string {
 	return ""
 }
 
+func attachRunningTool(
+	ctx context.Context,
+	api, token, jobID string,
+	job controlplane.JobDetail,
+	toolPID int,
+	engineName, activeConvID, targetDir, docsHub string,
+	sp *spool.Spool,
+	lockHandle *repolock.LockHandle,
+) (engines.ExecutionResult, error) {
+	attachMsg := fmt.Sprintf("\n[ASE-SUPERVISOR] [attach_mode] iazio-harness attached to running AI engine process (ToolPID %d, engine: %s) for job %s (conversation: %s in %s)\n",
+		toolPID, engineName, jobID, activeConvID, targetDir)
+	_ = sp.AppendRaw("stdout", []byte(attachMsg))
+	_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", attachMsg)
+	_ = controlplane.PostTick(context.Background(), api, token, jobID, 0, os.Getpid(), toolPID)
+
+	if lockHandle != nil {
+		_ = lockHandle.Update(repolock.LockInfo{
+			JobID:          job.ID,
+			ScheduleID:     job.ScheduleID,
+			PID:            os.Getpid(),
+			HarnessPID:     os.Getpid(),
+			ToolPID:        toolPID,
+			Engine:         engineName,
+			ConversationID: activeConvID,
+			StoryID:        job.StoryID,
+			Prompt:         job.Prompt,
+			Status:         "RUNNING",
+		})
+	}
+
+	engineLogPath := filepath.Join(spool.DefaultDir(), jobID+".engine.log")
+	var logFile *os.File
+	var offset int64
+	if f, err := os.Open(engineLogPath); err == nil {
+		logFile = f
+		offset, _ = f.Seek(0, io.SeekEnd)
+	}
+
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	lastTickSent := time.Now()
+	startTime := time.Now()
+	buf := make([]byte, 32768)
+
+	for {
+		select {
+		case <-ctx.Done():
+			if logFile != nil {
+				_ = logFile.Close()
+			}
+			return engines.ExecutionResult{ExitCode: 130}, ctx.Err()
+		case <-ticker.C:
+			if logFile == nil {
+				if f, err := os.Open(engineLogPath); err == nil {
+					logFile = f
+					offset, _ = f.Seek(0, io.SeekEnd)
+				}
+			}
+			if logFile != nil {
+				fi, err := logFile.Stat()
+				if err == nil && fi.Size() > offset {
+					n, _ := logFile.ReadAt(buf, offset)
+					if n > 0 {
+						chunk := buf[:n]
+						offset += int64(n)
+						_ = sp.AppendRaw("stdout", chunk)
+						_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", string(chunk))
+						lastTickSent = time.Now()
+					}
+				}
+			}
+
+			now := time.Now()
+			if now.Sub(lastTickSent) >= 5*time.Second {
+				elapsedSec := int(time.Since(startTime).Seconds())
+				_ = controlplane.PostTick(context.Background(), api, token, jobID, 0, os.Getpid(), toolPID, elapsedSec)
+				lastTickSent = now
+			}
+
+			if !watchdog.IsProcessAlive(toolPID) {
+				if logFile != nil {
+					if fi, err := logFile.Stat(); err == nil && fi.Size() > offset {
+						n, _ := logFile.ReadAt(buf, offset)
+						if n > 0 {
+							chunk := buf[:n]
+							_ = sp.AppendRaw("stdout", chunk)
+							_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", string(chunk))
+						}
+					}
+					_ = logFile.Close()
+				}
+
+				exitMsg := fmt.Sprintf("\n[ASE-SUPERVISOR] [attach_mode] AI tool process (ToolPID %d) terminated. Evaluating completion gates...\n", toolPID)
+				_ = sp.AppendRaw("stdout", []byte(exitMsg))
+				_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", exitMsg)
+
+				gateRes := gate.Verify(gate.GateOptions{
+					WorktreePath: targetDir,
+					StoryID:      job.StoryID,
+				})
+				if gateRes.Passed {
+					compMsg := fmt.Sprintf("[ASE-SUPERVISOR] ASE story %s verified completed via attach supervisor!\n", job.StoryID)
+					_ = sp.AppendRaw("stdout", []byte(compMsg))
+					_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", compMsg)
+					return engines.ExecutionResult{ExitCode: 0}, nil
+				}
+				return engines.ExecutionResult{ExitCode: 1}, fmt.Errorf("tool process %d exited with incomplete gates: %v", toolPID, gateRes.UnmetGates)
+			}
+		}
+	}
+}
+
 func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
 	var spanOpts = []telemetry.SpanOption{
 		telemetry.WithKind("INTERNAL"),
@@ -516,11 +636,15 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	defer span.End()
 
 	var kindOverride, resumeConvOverride string
+	var attachToolPID int
 	if len(overrides) > 0 {
 		kindOverride = overrides[0]
 	}
 	if len(overrides) > 1 {
 		resumeConvOverride = overrides[1]
+	}
+	if len(overrides) > 2 && overrides[2] != "" {
+		attachToolPID, _ = strconv.Atoi(overrides[2])
 	}
 	token, _ := auth.Bearer(ctx)
 	job, err := controlplane.GetJob(ctx, api, token, jobID)
@@ -676,20 +800,15 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		JobID:          job.ID,
 		ScheduleID:     job.ScheduleID,
 		PID:            os.Getpid(),
+		HarnessPID:     os.Getpid(),
+		ToolPID:        attachToolPID,
 		Engine:         engineName,
 		ConversationID: resumeConvID,
 		StoryID:        job.StoryID,
 		Prompt:         job.Prompt,
 		Status:         "RUNNING",
 	}, func(pid int) bool {
-		if pid <= 0 {
-			return false
-		}
-		p, err := os.FindProcess(pid)
-		if err != nil {
-			return false
-		}
-		return p.Signal(syscall.Signal(0)) == nil
+		return watchdog.IsProcessAlive(pid)
 	})
 	if lockErr != nil {
 		_ = sp.AppendRaw("stderr", []byte(fmt.Sprintf("[iazio-harness] Repository lock failure: %v\n", lockErr)))
@@ -697,6 +816,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		return fmt.Errorf("repolock: %w", lockErr)
 	}
 	defer lockHandle.Release()
+
+	if attachToolPID <= 0 && lockHandle.Info().ToolPID > 0 && watchdog.IsProcessAlive(lockHandle.Info().ToolPID) {
+		attachToolPID = lockHandle.Info().ToolPID
+		log.Printf("[harness] [ASE-SUPERVISOR] Discovered active tool process (ToolPID: %d) from existing lock on %s", attachToolPID, worktree)
+	}
 
 	if !isControlPlaneResume && resumeConvID == "" && lockHandle.Info().ConversationID != "" && (job.Kind == "resume" || (job.StoryID != "" && lockHandle.Info().StoryID == job.StoryID && lockHandle.Info().Status != "COMPLETED")) {
 		resumeConvID = lockHandle.Info().ConversationID
@@ -860,6 +984,18 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	modelName, agentName, disableSlashCommands := resolveExecutionOptions(job, prepRes.Prompt)
 	runner := engines.CLI{Engine: engineName}
 
+	initialBanner := fmt.Sprintf("\n[ASE-SUPERVISOR] Starting execution for job %s (kind: %s, engine: %s, worktree: %s)\n"+
+		"[ASE-SUPERVISOR] Executed Prompt: %q\n",
+		jobID, job.Kind, engineName, worktree, prepRes.Prompt)
+	if resumeConvID != "" {
+		initialBanner += fmt.Sprintf("[ASE-SUPERVISOR] Resuming Conversation: %s --conversation=%s\n", engineName, resumeConvID)
+	}
+	if job.ParentJobID != "" {
+		initialBanner += fmt.Sprintf("[ASE-SUPERVISOR] Lineage: parent_job=%s, root_job=%s\n", job.ParentJobID, job.RootJobID)
+	}
+	_ = sp.AppendRaw("stdout", []byte(initialBanner))
+	_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", initialBanner)
+
 	var convWg sync.WaitGroup
 	var convMu sync.Mutex
 	var confirmedConvID string
@@ -893,19 +1029,23 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 				StoryID:        job.StoryID,
 				ConversationID: activeConvID,
 				PID:            pid,
+				HarnessPID:     os.Getpid(),
+				ToolPID:        pid,
 				Status:         watchdog.StatusRunning,
 			})
 			_ = lockHandle.Update(repolock.LockInfo{
 				JobID:          job.ID,
 				ScheduleID:     job.ScheduleID,
 				PID:            os.Getpid(),
-				HarnessPID:     pid,
+				HarnessPID:     os.Getpid(),
+				ToolPID:        pid,
 				Engine:         engineName,
 				ConversationID: activeConvID,
 				StoryID:        job.StoryID,
 				Prompt:         job.Prompt,
 				Status:         "RUNNING",
 			})
+			_ = controlplane.PostTick(ctx, api, token, job.ID, 0, os.Getpid(), pid)
 			_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
 				JobID:          job.ID,
 				ScheduleID:     job.ScheduleID,
@@ -971,7 +1111,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 				JobID:          job.ID,
 				ScheduleID:     job.ScheduleID,
 				PID:            os.Getpid(),
-				HarnessPID:     activePID,
+				HarnessPID:     os.Getpid(),
+				ToolPID:        activePID,
 				Engine:         engineName,
 				ConversationID: cid,
 				StoryID:        job.StoryID,
@@ -1032,7 +1173,14 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			}(cid, isFallback, fallbackReason, role, asePhase)
 		},
 	}
-	execRes, execErr := runner.Execute(ctx, execReq, sp)
+	var execRes engines.ExecutionResult
+	var execErr error
+	if attachToolPID > 0 && watchdog.IsProcessAlive(attachToolPID) {
+		activePID = attachToolPID
+		execRes, execErr = attachRunningTool(ctx, api, token, jobID, job, attachToolPID, engineName, activeConvID, targetDir, docsHub, sp, lockHandle)
+	} else {
+		execRes, execErr = runner.Execute(ctx, execReq, sp)
+	}
 	span.AddAnnotation(fmt.Sprintf("engine_process_exited:code=%d", execRes.ExitCode))
 	stopFlush()
 
