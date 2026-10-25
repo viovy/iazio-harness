@@ -119,11 +119,12 @@ func PostTick(ctx context.Context, baseURL, token, jobID string, silentForMs int
 // PostConversation registers an early or streamed conversation ID with the control plane.
 // PostConversationOptions specifies fallback and lineage flags when attaching a conversation.
 type PostConversationOptions struct {
-	Fallback       bool   `json:"fallback,omitempty"`
-	FallbackReason string `json:"fallback_reason,omitempty"`
-	Role           string `json:"role,omitempty"`
-	CLIArgs        string `json:"cli_args,omitempty"`
-	ASEPhase       string `json:"ase_phase,omitempty"`
+	Fallback          bool           `json:"fallback,omitempty"`
+	FallbackReason    string         `json:"fallback_reason,omitempty"`
+	Role              string         `json:"role,omitempty"`
+	CLIArgs           string         `json:"cli_args,omitempty"`
+	ASEPhase          string         `json:"ase_phase,omitempty"`
+	RehydrationStatus map[string]any `json:"rehydration_status,omitempty"`
 }
 
 func PostConversation(ctx context.Context, baseURL, token, jobID, conversationID string) error {
@@ -150,11 +151,33 @@ func PostConversationWithOptions(ctx context.Context, baseURL, token, jobID, con
 	if opt.ASEPhase != "" {
 		payload["ase_phase"] = opt.ASEPhase
 	}
+	if opt.RehydrationStatus != nil {
+		payload["rehydration_status"] = opt.RehydrationStatus
+	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/conversations", token, raw, "conversation post")
+}
+
+// PostJobReadiness reports workspace readiness, reap results, and rehydration status to iazio-harness-api.
+func PostJobReadiness(ctx context.Context, baseURL, token, jobID string, reapResult, manifest, rehydrationStatus map[string]any) error {
+	payload := map[string]any{}
+	if reapResult != nil {
+		payload["reap_result"] = reapResult
+	}
+	if manifest != nil {
+		payload["workspace_state_manifest"] = manifest
+	}
+	if rehydrationStatus != nil {
+		payload["rehydration_status"] = rehydrationStatus
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/readiness", token, raw, "readiness post")
 }
 
 // JobDetail carries the execution specification from iazio-harness-api.

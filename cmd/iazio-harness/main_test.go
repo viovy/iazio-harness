@@ -1752,3 +1752,32 @@ func TestRunVerifyReleaseCommand(t *testing.T) {
 		t.Fatal("expected error connecting to non-existent server, got nil")
 	}
 }
+
+func TestCleanStaleGitLocks(t *testing.T) {
+	tempWorkspace := t.TempDir()
+	gitDir := filepath.Join(tempWorkspace, ".git")
+	if err := os.MkdirAll(filepath.Join(gitDir, "modules", "sub1"), 0755); err != nil {
+		t.Fatalf("failed to create git dir: %v", err)
+	}
+
+	rootLock := filepath.Join(gitDir, "index.lock")
+	subLock := filepath.Join(gitDir, "modules", "sub1", "index.lock")
+	if err := os.WriteFile(rootLock, []byte("root-lock"), 0644); err != nil {
+		t.Fatalf("failed to write root lock: %v", err)
+	}
+	if err := os.WriteFile(subLock, []byte("sub-lock"), 0644); err != nil {
+		t.Fatalf("failed to write sub lock: %v", err)
+	}
+
+	cleaned := cleanStaleGitLocks(tempWorkspace)
+	if len(cleaned) != 2 {
+		t.Fatalf("expected 2 cleaned locks, got: %v", cleaned)
+	}
+
+	if _, err := os.Stat(rootLock); !os.IsNotExist(err) {
+		t.Errorf("expected root lock to be removed")
+	}
+	if _, err := os.Stat(subLock); !os.IsNotExist(err) {
+		t.Errorf("expected submodule lock to be removed")
+	}
+}

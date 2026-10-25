@@ -314,3 +314,27 @@ func TestControlplaneExtraCoverage(t *testing.T) {
 	// 6. Non-retryable GetJob on non-transient status
 	_, _ = GetJob(context.Background(), srv.URL, "tok", "fail-post")
 }
+
+func TestPostJobReadiness(t *testing.T) {
+	var receivedBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/jobs/job-readiness-test/readiness" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	reap := map[string]any{"orphans_reaped": 1}
+	manifest := map[string]any{"clean_locks": true}
+	rehyd := map[string]any{"hydrated": true, "turns_count": 15}
+	err := PostJobReadiness(context.Background(), srv.URL, "test-tok", "job-readiness-test", reap, manifest, rehyd)
+	if err != nil {
+		t.Fatalf("PostJobReadiness failed: %v", err)
+	}
+	if receivedBody["reap_result"] == nil || receivedBody["workspace_state_manifest"] == nil || receivedBody["rehydration_status"] == nil {
+		t.Fatalf("expected all 3 objects in readiness payload: %v", receivedBody)
+	}
+}
