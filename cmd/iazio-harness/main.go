@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -271,8 +272,48 @@ func sanitizeStep(v any) string {
 	return res
 }
 
+func hasRunningGitProcess(workspacePath string) bool {
+	cleanWorkspace := filepath.Clean(workspacePath)
+	if procEntries, err := os.ReadDir("/proc"); err == nil {
+		for _, entry := range procEntries {
+			if !entry.IsDir() {
+				continue
+			}
+			cmdlineBytes, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+			if err != nil || len(cmdlineBytes) == 0 {
+				continue
+			}
+			cmdline := string(bytes.ReplaceAll(cmdlineBytes, []byte{0}, []byte(" ")))
+			if strings.HasPrefix(cmdline, "git ") || strings.Contains(cmdline, "/git ") {
+				if strings.Contains(cmdline, cleanWorkspace) {
+					return true
+				}
+				if cwdLink, err := os.Readlink(filepath.Join("/proc", entry.Name(), "cwd")); err == nil {
+					if filepath.Clean(cwdLink) == cleanWorkspace {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+	out, err := exec.Command("ps", "-eo", "command").Output()
+	if err == nil {
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "git") && strings.Contains(line, cleanWorkspace) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func cleanStaleGitLocks(workspacePath string) []string {
 	var removed []string
+	if hasRunningGitProcess(workspacePath) {
+		return removed
+	}
 	gitDir := filepath.Join(workspacePath, ".git")
 	fi, err := os.Stat(gitDir)
 	if err != nil {
