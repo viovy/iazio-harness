@@ -236,7 +236,7 @@ type TaskSupervisor struct {
 
 // NewTaskSupervisor creates and starts an activity-aware background task supervisor.
 func NewTaskSupervisor(parentPID int, stream EventStream, timeout ...time.Duration) *TaskSupervisor {
-	inactTimeout := DefaultBackgroundIdleGrace
+	inactTimeout := time.Duration(0)
 	if len(timeout) > 0 && timeout[0] > 0 {
 		inactTimeout = timeout[0]
 	} else if env := os.Getenv("IAZIO_BACKGROUND_IDLE_GRACE_SEC"); env != "" {
@@ -251,21 +251,32 @@ func NewTaskSupervisor(parentPID int, stream EventStream, timeout ...time.Durati
 		}
 	}
 
-	subagentTimeout := DefaultBackgroundSubagentStall
-	if env := os.Getenv("IAZIO_BACKGROUND_SUBAGENT_STALL_SEC"); env != "" {
-		if sec, err := strconv.Atoi(env); err == nil && sec > 0 {
-			subagentTimeout = time.Duration(sec) * time.Second
+	var subagentTimeout time.Duration
+	var idleThreshold time.Duration
+	var maxWait time.Duration
+
+	if inactTimeout > 0 {
+		subagentTimeout = DefaultBackgroundSubagentStall
+		if env := os.Getenv("IAZIO_BACKGROUND_SUBAGENT_STALL_SEC"); env != "" {
+			if sec, err := strconv.Atoi(env); err == nil && sec > 0 {
+				subagentTimeout = time.Duration(sec) * time.Second
+			}
+		} else if subagentTimeout < inactTimeout {
+			subagentTimeout = inactTimeout * 2
 		}
-	}
 
-	idleThreshold := DefaultIdleTaskThreshold
-	if inactTimeout < idleThreshold {
-		idleThreshold = inactTimeout / 2
-	}
+		idleThreshold = DefaultIdleTaskThreshold
+		if inactTimeout < idleThreshold {
+			idleThreshold = inactTimeout / 2
+		}
 
-	maxWait := DefaultMaxCeilingDuration
-	if inactTimeout*2 > maxWait {
-		maxWait = inactTimeout * 2
+		maxWait = DefaultMaxCeilingDuration
+		if inactTimeout*2 > maxWait {
+			maxWait = inactTimeout * 2
+		}
+		if maxWait < 120*time.Second {
+			maxWait = 120 * time.Second
+		}
 	}
 
 	return &TaskSupervisor{
@@ -309,8 +320,14 @@ func (s *TaskSupervisor) OnOutput(p []byte) {
 		s.activeTasks = children
 
 		if s.Stream != nil {
-			headerMsg := fmt.Sprintf("[ASE-SUPERVISOR] [background_task.supervisor] Root agent idle completion barrier detected with %d background task(s). Armed active watchdog (grace: %v, idle threshold: %v, ceiling: %v).\n",
-				len(children), s.InactivityLimit, s.IdleTaskThreshold, s.MaxWaitDuration)
+			headerMsg := ""
+			if s.InactivityLimit > 0 {
+				headerMsg = fmt.Sprintf("[ASE-SUPERVISOR] [background_task.supervisor] Root agent waiting on %d background task(s) (inactivity timeout: %v, max wait: %v).\n",
+					len(children), s.InactivityLimit, s.MaxWaitDuration)
+			} else {
+				headerMsg = fmt.Sprintf("[ASE-SUPERVISOR] [background_task.supervisor] Root agent waiting on %d active background task(s) (unbounded execution).\n",
+					len(children))
+			}
 			_ = s.Stream.AppendRaw("stdout", []byte(headerMsg))
 
 			for _, ch := range children {
@@ -328,11 +345,13 @@ func (s *TaskSupervisor) OnOutput(p []byte) {
 }
 
 func (s *TaskSupervisor) supervise() {
-	tickInterval := DefaultActivityCheckInterval
-	if s.InactivityLimit < tickInterval {
+	tickInterval := 500 * time.Millisecond
+	if s.InactivityLimit > 0 {
 		tickInterval = s.InactivityLimit / 4
 		if tickInterval < 25*time.Millisecond {
 			tickInterval = 25 * time.Millisecond
+		} else if tickInterval > 2*time.Second {
+			tickInterval = 2 * time.Second
 		}
 	}
 	ticker := time.NewTicker(tickInterval)
@@ -348,19 +367,21 @@ func (s *TaskSupervisor) supervise() {
 				s.mu.Unlock()
 				return
 			}
+			if s.InactivityLimit <= 0 && s.MaxWaitDuration <= 0 {
+				s.mu.Unlock()
+				continue
+			}
 			now := time.Now().UTC()
 			inactiveDur := now.Sub(s.lastOutputAt)
 			totalIdleDur := now.Sub(s.rootIdleAt)
-
-			// Type B: Idle / daemonized background process (zero output for IdleTaskThreshold after root idle)
-			isTypeBIdle := (totalIdleDur >= s.IdleTaskThreshold) && (inactiveDur >= s.IdleTaskThreshold)
 
 			effectiveGrace := s.InactivityLimit
 			if s.hasSubagents && s.SubagentLimit > effectiveGrace {
 				effectiveGrace = s.SubagentLimit
 			}
-			isGraceExpired := inactiveDur >= effectiveGrace
-			isCeilingReached := totalIdleDur >= s.MaxWaitDuration
+			isGraceExpired := s.InactivityLimit > 0 && inactiveDur >= effectiveGrace
+			isCeilingReached := s.MaxWaitDuration > 0 && totalIdleDur >= s.MaxWaitDuration
+			isTypeBIdle := s.IdleTaskThreshold > 0 && (totalIdleDur >= s.IdleTaskThreshold) && (inactiveDur >= s.IdleTaskThreshold)
 
 			shouldReap := isTypeBIdle || isGraceExpired || isCeilingReached
 			if shouldReap {

@@ -233,3 +233,43 @@ func TestDefaultDirAndFlush(t *testing.T) {
 		t.Errorf("expected 'Hello World\\n', got %q", stripped)
 	}
 }
+
+func TestAppendRaw_FilteringAndSync(t *testing.T) {
+	sp := openTestSpool(t)
+	defer sp.Close()
+
+	if err := sp.AppendRaw("stdout", nil); err != nil {
+		t.Fatalf("expected nil for empty byte slice, got: %v", err)
+	}
+
+	idleLine := []byte("root agent idle; waiting up to 1h0m0s for 1 background task(s)\n")
+	if err := sp.AppendRaw("stdout", idleLine); err != nil {
+		t.Fatalf("AppendRaw failed: %v", err)
+	}
+
+	mixed := []byte("hello world\nroot agent idle; waiting up to 1h0m0s for 1 background task(s)\ngoodbye\n")
+	if err := sp.AppendRaw("stdout", mixed); err != nil {
+		t.Fatalf("AppendRaw failed: %v", err)
+	}
+
+	if err := sp.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	got, err := os.ReadFile(sp.LogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "root agent idle") {
+		t.Fatalf("expected filtered idle message, got log:\n%s", string(got))
+	}
+	if !strings.Contains(string(got), "hello world") || !strings.Contains(string(got), "goodbye") {
+		t.Fatalf("expected real lines preserved, got:\n%s", string(got))
+	}
+
+	emptySpool := &Spool{}
+	if err := emptySpool.Sync(); err != nil {
+		t.Fatalf("expected nil Sync on empty spool, got: %v", err)
+	}
+}
+

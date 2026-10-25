@@ -542,3 +542,37 @@ func TestExecutor_IntelligentWorkingDirResolutionAndTraceID(t *testing.T) {
 		t.Errorf("expected TraceID %q, got %q", "trace-local-111", lastOpts2.TraceID)
 	}
 }
+
+func TestValidateRelativeRepoPath_AndIsSubmoduleRegistered(t *testing.T) {
+	if err := validateRelativeRepoPath(""); err == nil {
+		t.Errorf("expected error for empty repo")
+	}
+	if err := validateRelativeRepoPath("../traversal"); err == nil {
+		t.Errorf("expected error for traversal")
+	}
+	if err := validateRelativeRepoPath("/abs/path"); err == nil {
+		t.Errorf("expected error for absolute path")
+	}
+	if err := validateRelativeRepoPath("C:\\path"); err == nil {
+		t.Errorf("expected error for volume prefix")
+	}
+	if err := validateRelativeRepoPath("valid/submodule"); err != nil {
+		t.Errorf("unexpected error for valid path: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	gm := filepath.Join(tmpDir, ".gitmodules")
+	_ = os.WriteFile(gm, []byte(`[submodule "iazio-web"]
+	path = iazio-web
+	url = https://github.com/viovy/iazio-web.git
+`), 0644)
+	reg, err := isSubmoduleRegistered(gm, "iazio-web")
+	if err != nil || !reg {
+		t.Errorf("expected true from isSubmoduleRegistered, got %v, err: %v", reg, err)
+	}
+	reg2, err := isSubmoduleRegistered(gm, "nonexistent")
+	if err != nil || reg2 {
+		t.Errorf("expected false for nonexistent submodule, got %v, err: %v", reg2, err)
+	}
+}
+

@@ -571,6 +571,11 @@ func createSIR(input DiagnosticInput, report DiagnosticReport) *SIRRecord {
 			autoHeal = true
 			remediation = "Autonomously resume execution in same conversation ID with allow_dirty to complete story flow."
 			summary = f.Message
+		} else if f.Code == CodeIncompleteASEFlow {
+			category = "INCOMPLETE_ASE_FLOW"
+			autoHeal = true
+			remediation = "Continue execution on active conversation to complete remaining ASE gates."
+			summary = f.Message
 		} else if f.Code == CodeSlashCommandIgnored {
 			category = "HARNESS_CONFIGURATION"
 			remediation = f.Remediation

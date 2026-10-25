@@ -85,9 +85,18 @@ func doPostWithRetry(ctx context.Context, url, token string, raw []byte, opName 
 
 // PostChunk stores one stripped chunk. The raw spool stays on the runner.
 func PostChunk(ctx context.Context, baseURL, token, jobID, stream, text string) error {
-	raw, err := json.Marshal(map[string]string{
+	return PostChunkWithTelemetry(ctx, baseURL, token, jobID, stream, text, "")
+}
+
+// PostChunkWithTelemetry stores one stripped chunk with optional telemetry such as active child tasks.
+func PostChunkWithTelemetry(ctx context.Context, baseURL, token, jobID, stream, text, activeChildTasks string) error {
+	payload := map[string]string{
 		"type": "OUTPUT_CHUNK", "stream": stream, "text": text,
-	})
+	}
+	if activeChildTasks != "" {
+		payload["active_child_tasks"] = activeChildTasks
+	}
+	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -356,3 +365,39 @@ func GetRehydrationBundle(ctx context.Context, baseURL, token, conversationID st
 	}
 	return bundle, nil
 }
+
+// PostStoryBinding dynamically binds an allocated story ID and metadata to a running or historical job.
+func PostStoryBinding(ctx context.Context, baseURL, token, jobID, storyID, storyTitle, storyPath string) error {
+	storyID = strings.TrimSpace(storyID)
+	if storyID == "" {
+		return errors.New("story_id is required")
+	}
+	payload := map[string]any{
+		"story_id":    storyID,
+		"story_title": storyTitle,
+		"story_path":  storyPath,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/story-binding", token, raw, "story binding post")
+}
+
+// PostTurnContinued emits a structured turn auto-continuation event to the control plane.
+func PostTurnContinued(ctx context.Context, baseURL, token, jobID string, turn int, conversationID string, unmetGates []string, activeChildSummary string) error {
+	payload := map[string]any{
+		"type":                 "TURN_AUTO_CONTINUED",
+		"continuation_turn":    turn,
+		"conversation_id":      conversationID,
+		"unmet_gates":          unmetGates,
+		"active_child_tasks":   activeChildSummary,
+		"continued_at":         time.Now().UTC(),
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/chunks", token, raw, "turn continued post")
+}
+

@@ -300,3 +300,25 @@ func TestIsValidConversationID(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionExists(t *testing.T) {
+	brainDir := t.TempDir()
+	r := &Resolver{
+		BrainDir: brainDir,
+	}
+
+	if r.SessionExists("") || r.SessionExists("../invalid") {
+		t.Errorf("expected false for invalid IDs")
+	}
+
+	convID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	if r.SessionExists(convID) {
+		t.Errorf("expected false before creation")
+	}
+
+	_ = os.MkdirAll(filepath.Join(brainDir, convID), 0755)
+	if !r.SessionExists(convID) {
+		t.Errorf("expected true after creating brainDir/convID")
+	}
+}
+

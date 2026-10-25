@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -514,6 +515,133 @@ func resolveConversationFallback(worktree, storyID, engineName string) string {
 	return ""
 }
 
+func resolveLiveGitBranch(workspacePath string) string {
+	if workspacePath == "" {
+		return ""
+	}
+	cmd := exec.Command("git", "-C", workspacePath, "branch", "--show-current")
+	out, err := cmd.Output()
+	if err == nil {
+		return strings.TrimSpace(string(out))
+	}
+	return ""
+}
+
+func resolveGitHead(workspacePath string) string {
+	if workspacePath == "" {
+		return ""
+	}
+	cmd := exec.Command("git", "-C", workspacePath, "rev-parse", "HEAD")
+	out, err := cmd.Output()
+	if err == nil {
+		return strings.TrimSpace(string(out))
+	}
+	return ""
+}
+
+func countReviewReports(workspacePath string) int {
+	if workspacePath == "" {
+		return 0
+	}
+	count := 0
+	for _, dir := range []string{filepath.Join(workspacePath, "docs", "reviews"), filepath.Join(workspacePath, "tmp", "reports")} {
+		entries, err := os.ReadDir(dir)
+		if err == nil {
+			for _, e := range entries {
+				name := strings.ToLower(e.Name())
+				if strings.Contains(name, "review") && (strings.HasSuffix(name, ".md") || strings.HasSuffix(name, ".json")) {
+					count++
+				}
+			}
+		}
+	}
+	return count
+}
+
+func resolveLiveStoryID(workspacePath string, outputText string, currentStoryID string) string {
+	// 1. From output text explicit STORY_ID bindings (e.g. STORY_ID=STORY-GOV-3691 or STORY_ID: STORY-GOV-3691)
+	storyRegex := regexp.MustCompile(`STORY_ID[=:\s]+(STORY-[A-Z]+-[0-9]+)`)
+	if matches := storyRegex.FindAllStringSubmatch(outputText, -1); len(matches) > 0 {
+		last := matches[len(matches)-1][1]
+		if last != "" {
+			return last
+		}
+	}
+
+	// 2. From story file paths in output (e.g. docs/stories/2026-10-25-gov-3691-*.story.md)
+	fileRegex := regexp.MustCompile(`docs/stories/[0-9-]+-([a-z]+)-([0-9]+)[^/\s]*\.story\.md`)
+	if matches := fileRegex.FindAllStringSubmatch(outputText, -1); len(matches) > 0 {
+		last := matches[len(matches)-1]
+		cat := strings.ToUpper(last[1])
+		num := last[2]
+		return fmt.Sprintf("STORY-%s-%s", cat, num)
+	}
+
+	// 3. From .autopilot metadata on disk
+	if workspacePath != "" {
+		for _, rel := range []string{".autopilot/active_story.json", ".autopilot/story.json", ".autopilot/state.json"} {
+			metaPath := filepath.Join(workspacePath, rel)
+			if data, err := os.ReadFile(metaPath); err == nil {
+				var parsed struct {
+					StoryID string `json:"story_id"`
+					ID      string `json:"id"`
+				}
+				if json.Unmarshal(data, &parsed) == nil {
+					if parsed.StoryID != "" && strings.HasPrefix(parsed.StoryID, "STORY-") {
+						return parsed.StoryID
+					}
+					if parsed.ID != "" && strings.HasPrefix(parsed.ID, "STORY-") {
+						return parsed.ID
+					}
+				}
+			}
+		}
+	}
+
+	// 4. From current git branch
+	branch := resolveLiveGitBranch(workspacePath)
+	if branch != "" {
+		branchRegex := regexp.MustCompile(`(?:chore|feat|fix|refactor)/(?:story-)?([a-z]+)-([0-9]+)`)
+		if m := branchRegex.FindStringSubmatch(branch); len(m) == 3 {
+			return fmt.Sprintf("STORY-%s-%s", strings.ToUpper(m[1]), m[2])
+		}
+		branchStoryRegex := regexp.MustCompile(`(STORY-[A-Z]+-[0-9]+)`)
+		if m := branchStoryRegex.FindStringSubmatch(branch); len(m) == 2 {
+			return m[1]
+		}
+	}
+
+	// 5. From recently modified story file in docs/stories
+	if workspacePath != "" {
+		storiesDir := filepath.Join(workspacePath, "docs", "stories")
+		if entries, err := os.ReadDir(storiesDir); err == nil {
+			var latestStoryID string
+			var latestModTime time.Time
+			for _, e := range entries {
+				if strings.HasSuffix(e.Name(), ".story.md") {
+					info, err := e.Info()
+					if err == nil && info.ModTime().After(latestModTime) {
+						m := regexp.MustCompile(`[0-9-]+-([a-z]+)-([0-9]+)`).FindStringSubmatch(e.Name())
+						if len(m) == 3 {
+							latestModTime = info.ModTime()
+							latestStoryID = fmt.Sprintf("STORY-%s-%s", strings.ToUpper(m[1]), m[2])
+						}
+					}
+				}
+			}
+			if latestStoryID != "" && (currentStoryID == "" || currentStoryID == "pending_harness_creation") {
+				return latestStoryID
+			}
+		}
+	}
+
+	if currentStoryID != "" && currentStoryID != "pending_harness_creation" {
+		return currentStoryID
+	}
+	return ""
+}
+
+
 func attachRunningTool(
 	ctx context.Context,
 	api, token, jobID string,
@@ -933,6 +1061,15 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	startTime := time.Now()
 	flushCtx, stopFlush := context.WithCancel(ctx)
 	defer stopFlush()
+
+	currentBoundStoryID := job.StoryID
+	if currentBoundStoryID == "" || currentBoundStoryID == "pending_harness_creation" {
+		if initResolved := resolveLiveStoryID(worktree, prepRes.Prompt, currentBoundStoryID); initResolved != "" && initResolved != "pending_harness_creation" {
+			currentBoundStoryID = initResolved
+			job.StoryID = initResolved
+		}
+	}
+
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
@@ -961,15 +1098,48 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 								lastTickSent = now
 							}
 						}
-						// If the engine has been silent for >= 30s, emit an explicit diagnostic chunk
-						// so the user in iazio-web can see the process is alive and waiting for model response
-						if ev.SilentForMs >= 30000 && now.Sub(lastSilenceWarning) >= 30*time.Second {
+						// Progress-aware liveness: check if engine has active child processes
+						childProcs, _ := watchdog.GetDescendantProcesses(activePID)
+						if len(childProcs) > 0 {
+							if now.Sub(lastSilenceWarning) >= 30*time.Second {
+								lastSilenceWarning = now
+								elapsedStr := time.Since(startTime).Truncate(time.Second).String()
+								summary, pids := watchdog.FormatActiveChildProcessesSummary(childProcs)
+								diag := fmt.Sprintf("[iazio-harness] Execution active (job %s, elapsed: %s); engine waiting on active child task(s): %s (pids: %v)\n",
+									jobID, elapsedStr, summary, pids)
+								_ = controlplane.PostChunkWithTelemetry(context.Background(), api, token, jobID, "stdout", diag, summary)
+							}
+						} else if ev.SilentForMs >= 30000 && now.Sub(lastSilenceWarning) >= 30*time.Second {
 							lastSilenceWarning = now
 							harnessPID := os.Getpid()
 							elapsedStr := time.Since(startTime).Truncate(time.Second).String()
 							diag := fmt.Sprintf("[iazio-harness] Execution active (job %s, engine: %s, harness_pid: %d, tool_pid: %d, elapsed: %s); silent for %ds (waiting for model output/response)...\n",
 								jobID, engineName, harnessPID, activePID, elapsedStr, ev.SilentForMs/1000)
 							_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", diag)
+						}
+
+						// Dynamic Story ID & Branch sync
+						if resolved := resolveLiveStoryID(worktree, "", currentBoundStoryID); resolved != "" && resolved != "pending_harness_creation" && resolved != currentBoundStoryID {
+							prevStory := currentBoundStoryID
+							currentBoundStoryID = resolved
+							job.StoryID = resolved
+							_ = lockHandle.Update(repolock.LockInfo{
+								JobID:          job.ID,
+								ScheduleID:     job.ScheduleID,
+								PID:            os.Getpid(),
+								HarnessPID:     os.Getpid(),
+								ToolPID:        activePID,
+								Engine:         engineName,
+								ConversationID: activeConvID,
+								StoryID:        resolved,
+								Prompt:         job.Prompt,
+								Status:         "RUNNING",
+							})
+							_ = controlplane.PostStoryBinding(context.Background(), api, token, jobID, resolved, "", "")
+							bindMsg := fmt.Sprintf("[iazio-harness] Bound active story ID: %s (branch: %s, previously: %s)\n",
+								resolved, resolveLiveGitBranch(worktree), prevStory)
+							_ = sp.AppendRaw("stdout", []byte(bindMsg))
+							_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", bindMsg)
 						}
 					}
 				}
@@ -978,8 +1148,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}()
 
 	printTimeout := "0"
-	if job.MaxExecutionDurationSeconds > 0 {
+	if job.MaxExecutionDurationSeconds > 0 && os.Getenv("IAZIO_ENFORCE_MAX_EXEC_TIMEOUT") == "1" {
 		printTimeout = fmt.Sprintf("%ds", job.MaxExecutionDurationSeconds)
+	}
+	if envTimeout := os.Getenv("IAZIO_PRINT_TIMEOUT"); envTimeout != "" {
+		printTimeout = envTimeout
 	}
 	modelName, agentName, disableSlashCommands := resolveExecutionOptions(job, prepRes.Prompt)
 	runner := engines.CLI{Engine: engineName}
@@ -1439,10 +1612,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 	}
 
-	// In-Place Conversational Auto-Resume Loop:
-	// If background tasks were auto-reaped or execution stalled on background tasks / timeouts,
-	// do NOT fail the job. Re-invoke the engine in-place with prompt "resume".
-	maxAutoResumes := 5
+	// In-Place Conversational Auto-Continuation Loop:
+	// If the engine turn exits while ASE completion gates (clean_working_tree, story DoD, review scheme, git-flow merge)
+	// are unmet, or background tasks were terminated on exit / print timeout, do NOT fail the job.
+	// Immediately re-invoke the engine in-place on the active conversation until all completion gates pass.
+	maxAutoResumes := 10
 	if envMax := os.Getenv("IAZIO_MAX_AUTO_RESUMES"); envMax != "" {
 		if n, err := strconv.Atoi(envMax); err == nil && n > 0 {
 			maxAutoResumes = n
@@ -1450,35 +1624,76 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 	autoResumeCount := 0
 	lastProgressFp := ""
+	consecutiveStalls := 0
 
-	isAutoResumeTrigger := func() bool {
-		if execRes.ExitCode == 0 && execErr == nil {
-			return false
+	isContinuationTrigger := func() (shouldResume bool, unmetGates []string, triggerReason string) {
+		// 1. If print timeout or background task terminated occurred
+		hasPrintTimeout := strings.Contains(combinedOutput, "print timeout after") ||
+			strings.Contains(combinedOutput, "with turn in progress; returning partial output")
+		hasTerminatedBgTasks := strings.Contains(combinedOutput, "terminating 1 background task(s) on exit") ||
+			(strings.Contains(combinedOutput, "terminating") && strings.Contains(combinedOutput, "background task(s) on exit"))
+
+		if hasPrintTimeout {
+			return true, []string{"turn_in_progress"}, "print_timeout_with_turn_in_progress"
 		}
-		if execRes.WasAutoReaped {
-			return true
+		if hasTerminatedBgTasks {
+			return true, []string{"background_tasks_interrupted"}, "background_tasks_terminated_on_exit"
+		}
+		if execRes.WasAutoReaped || strings.Contains(combinedOutput, "[background_task.auto_reaped]") {
+			return true, []string{"background_tasks_reaped"}, "hung_background_tasks_reaped"
 		}
 		if execErr != nil && (errors.Is(execErr, context.DeadlineExceeded) || strings.Contains(execErr.Error(), "timeout")) {
-			return true
+			return true, []string{"execution_timeout"}, "execution_timeout"
 		}
 		if strings.Contains(combinedOutput, "root agent idle; waiting up to") ||
-			strings.Contains(combinedOutput, "inactivity limit") ||
-			strings.Contains(combinedOutput, "background_task.auto_reaped") {
-			return true
+			strings.Contains(combinedOutput, "inactivity limit") {
+			return true, []string{"agent_idle_or_inactivity"}, "agent_idle_or_inactivity"
 		}
+
+		// 2. Unmet ASE flow gates: when child engine exited with code 0 but left an incomplete story flow or dirty worktree
+		if execRes.ExitCode == 0 && diagReport.SIR != nil && diagReport.SIR.AutoHealable {
+			var unmet []string
+			for _, f := range diagReport.Findings {
+				if f.Code == diagnostics.CodeIncompleteASEFlow {
+					unmet = append(unmet, "clean_working_tree", "story_definition_of_done")
+				} else if f.Code == diagnostics.CodeDirtyWorktreePostExit {
+					unmet = append(unmet, "clean_working_tree")
+				}
+			}
+			if len(unmet) > 0 {
+				return true, unmet, "unmet_ase_completion_gates"
+			}
+		}
+
 		if os.Getenv("IAZIO_ENABLE_IN_PLACE_AUTO_RESUME") == "1" && execRes.ExitCode != 0 && !diagReport.ASEComplete {
-			return true
+			return true, []string{"incomplete_ase_flow"}, fmt.Sprintf("exit_code_%d", execRes.ExitCode)
 		}
-		return false
+
+		return false, nil, ""
 	}
 
-	for isAutoResumeTrigger() && autoResumeCount < maxAutoResumes {
-		autoResumeCount++
-		currentFp := fmt.Sprintf("%d", len(collectWorkspaceDirtyFiles(worktree)))
-		if currentFp == lastProgressFp && autoResumeCount > 2 {
+	for {
+		shouldResume, unmetGatesList, triggerReason := isContinuationTrigger()
+		if !shouldResume || autoResumeCount >= maxAutoResumes {
 			break
 		}
-		lastProgressFp = currentFp
+
+		headSHA := resolveGitHead(worktree)
+		dirtyFiles := collectWorkspaceDirtyFiles(worktree)
+		reviewsCount := countReviewReports(worktree)
+		currentFp := fmt.Sprintf("%s:%s:%d:%d", headSHA, resolveLiveGitBranch(worktree), len(dirtyFiles), reviewsCount)
+		if currentFp != lastProgressFp {
+			consecutiveStalls = 0
+			lastProgressFp = currentFp
+		} else {
+			consecutiveStalls++
+			if consecutiveStalls >= 3 {
+				stallMsg := fmt.Sprintf("[iazio-harness] Zero forward progress observed across %d consecutive continuation turns; halting auto-continuation.\n", consecutiveStalls)
+				_ = sp.AppendRaw("stdout", []byte(stallMsg))
+				_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", stallMsg)
+				break
+			}
+		}
 
 		resumeTargetID := activeConvID
 		if resumeTargetID == "" {
@@ -1488,7 +1703,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			resumeTargetID = resumeConvID
 		}
 		if resumeTargetID == "" && !isControlPlaneResume {
-			resumeTargetID = resolveConversationFallback(worktree, job.StoryID, engineName)
+			resumeTargetID = resolveConversationFallback(worktree, currentBoundStoryID, engineName)
 		}
 		if resumeTargetID == "" {
 			break
@@ -1496,33 +1711,52 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 
 		activeConvID = resumeTargetID
 		confirmedConvID = resumeTargetID
+		autoResumeCount++
 
-		reasonDesc := "turn_interrupted"
-		if execRes.WasAutoReaped {
-			reasonDesc = "hung_background_tasks_reaped"
-		} else if execErr != nil && errors.Is(execErr, context.DeadlineExceeded) {
-			reasonDesc = "execution_timeout"
-		} else if execRes.ExitCode != 0 {
-			reasonDesc = fmt.Sprintf("exit_code_%d", execRes.ExitCode)
+		if resolved := resolveLiveStoryID(worktree, combinedOutput, currentBoundStoryID); resolved != "" && resolved != "pending_harness_creation" && resolved != currentBoundStoryID {
+			prevStory := currentBoundStoryID
+			currentBoundStoryID = resolved
+			job.StoryID = resolved
+			_ = controlplane.PostStoryBinding(context.Background(), api, token, jobID, resolved, "", "")
+			bindMsg := fmt.Sprintf("[iazio-harness] Bound active story ID: %s (branch: %s, previously: %s)\n",
+				resolved, resolveLiveGitBranch(worktree), prevStory)
+			_ = sp.AppendRaw("stdout", []byte(bindMsg))
+			_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", bindMsg)
 		}
 
-		autoResumeMsg := fmt.Sprintf("\n[ASE-SUPERVISOR] In-place auto-resume triggered (#%d/%d) for job %s (trigger: %s).\n"+
-			"[ASE-SUPERVISOR] Conversation resolved: %s --conversation=%s\n"+
-			"[ASE-SUPERVISOR] ASE State: story=%s, complete=%v\n"+
+		interruptedNotice := ""
+		if triggerReason == "background_tasks_terminated_on_exit" || triggerReason == "print_timeout_with_turn_in_progress" {
+			interruptedNotice = "Notice: A background task (such as make run-review-scheme or make validate-local) was interrupted when the previous turn exited. Immediately resume, verify or restart review/validation checks, and proceed through Phase 4 (review scheme) and Phase 5 (git-flow auto-merge) until origin/main is synced and working tree is clean.\n"
+		}
+
+		autoResumeMsg := fmt.Sprintf("\n[iazio-harness] Engine turn exited prior to full ASE completion (unmet gates: [%s]). Initiating in-job continuation turn (#%d/%d) on conversation %s (trigger: %s)...\n"+
+			"[ASE-SUPERVISOR] Active Story: %s (branch: %s)\n"+
 			"[ASE-SUPERVISOR] Fleet Git State: %d dirty file(s) preserved\n"+
-			"[ASE-SUPERVISOR] Injecting prompt \"resume\" into %s --conversation=%s...\n\n",
-			autoResumeCount, maxAutoResumes, jobID, reasonDesc,
-			engineName, resumeTargetID,
-			job.StoryID, diagReport.ASEComplete,
-			len(collectWorkspaceDirtyFiles(worktree)),
+			"[ASE-SUPERVISOR] Injecting continuation prompt into %s --conversation=%s...\n\n",
+			strings.Join(unmetGatesList, ", "),
+			autoResumeCount, maxAutoResumes,
+			resumeTargetID, triggerReason,
+			currentBoundStoryID, resolveLiveGitBranch(worktree),
+			len(dirtyFiles),
 			engineName, resumeTargetID,
 		)
 		_ = sp.AppendRaw("stdout", []byte(autoResumeMsg))
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", autoResumeMsg)
+		childProcsNow, _ := watchdog.GetDescendantProcesses(activePID)
+		activeChildSummary, _ := watchdog.FormatActiveChildProcessesSummary(childProcsNow)
+		_ = controlplane.PostTurnContinued(context.Background(), api, token, jobID, autoResumeCount, resumeTargetID, unmetGatesList, activeChildSummary)
 
 		resumeReq := execReq
-		resumeReq.Prompt = "resume — continue autonomous story execution from current ASE and git state until all story completion gates pass"
+		resumeReq.Prompt = fmt.Sprintf("resume — continue autonomous story execution until all story completion gates pass.\n"+
+			"Active Story: %s (branch: %s)\n"+
+			"Unmet ASE Gates: [%s]\n"+
+			"Working Tree: %d modified/untracked file(s) present.\n%s",
+			currentBoundStoryID, resolveLiveGitBranch(worktree),
+			strings.Join(unmetGatesList, ", "), len(dirtyFiles),
+			interruptedNotice,
+		)
 		resumeReq.ResumeConversationID = resumeTargetID
+		resumeReq.PrintTimeout = "0"
 		resumeReq.Argv = nil
 
 		execRes, execErr = runner.Execute(ctx, resumeReq, sp)
@@ -1541,21 +1775,38 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		engineLogStr = string(combinedEngineLog)
 		spoolLogData, _ = os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
 		combinedOutput = engineLogStr + "\n" + string(spoolLogData)
+
+		diagStoryID := currentBoundStoryID
+		if diagStoryID == "" || diagStoryID == "pending_harness_creation" {
+			diagStoryID = resolveLiveStoryID(worktree, combinedOutput, job.StoryID)
+		}
 		diagReport = diagnostics.Diagnose(diagnostics.DiagnosticInput{
 			JobID:        job.ID,
-			StoryID:      job.StoryID,
+			StoryID:      diagStoryID,
 			WorktreePath: worktree,
 			ExitCode:     execRes.ExitCode,
 			OutputText:   engineLogStr,
 		})
 
-		if execRes.ExitCode == 0 {
+		if execRes.ExitCode == 0 && (diagReport.ASEComplete || len(collectWorkspaceDirtyFiles(worktree)) == 0) {
 			successMsg := "[ASE-SUPERVISOR] In-place auto-resume completed successfully!\n"
 			_ = sp.AppendRaw("stdout", []byte(successMsg))
 			_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", successMsg)
 			break
 		}
 	}
+
+	diagFinalStoryID := currentBoundStoryID
+	if diagFinalStoryID == "" || diagFinalStoryID == "pending_harness_creation" {
+		diagFinalStoryID = resolveLiveStoryID(worktree, combinedOutput, job.StoryID)
+	}
+	diagReport = diagnostics.Diagnose(diagnostics.DiagnosticInput{
+		JobID:        job.ID,
+		StoryID:      diagFinalStoryID,
+		WorktreePath: worktree,
+		ExitCode:     execRes.ExitCode,
+		OutputText:   engineLogStr,
+	})
 
 	if len(diagReport.Findings) > 0 {
 		for _, f := range diagReport.Findings {

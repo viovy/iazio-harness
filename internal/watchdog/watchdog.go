@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -359,3 +360,48 @@ func (w *Watchdog) Run(ctx context.Context, interval time.Duration) error {
 		}
 	}
 }
+
+// ProcessInfo represents a running operating system process.
+type ProcessInfo struct {
+	PID     int    `json:"pid"`
+	PPID    int    `json:"ppid"`
+	Command string `json:"command"`
+	Args    string `json:"args"`
+}
+
+// GetDescendantProcesses returns all active descendant processes of rootPID.
+func GetDescendantProcesses(rootPID int) ([]ProcessInfo, error) {
+	if rootPID <= 0 {
+		return nil, nil
+	}
+	return platformGetDescendantProcesses(rootPID)
+}
+
+// FormatActiveChildProcessesSummary formats a concise summary of active child tasks.
+func FormatActiveChildProcessesSummary(procs []ProcessInfo) (summary string, pids []int) {
+	if len(procs) == 0 {
+		return "", nil
+	}
+	var pidList []int
+	var descriptions []string
+	seen := make(map[string]bool)
+
+	for _, p := range procs {
+		pidList = append(pidList, p.PID)
+		cmd := strings.TrimSpace(p.Args)
+		if cmd == "" {
+			cmd = p.Command
+		}
+		// Truncate overly long command lines
+		if len(cmd) > 70 {
+			cmd = cmd[:67] + "..."
+		}
+		desc := fmt.Sprintf("%s (pid: %d)", cmd, p.PID)
+		if !seen[desc] {
+			seen[desc] = true
+			descriptions = append(descriptions, desc)
+		}
+	}
+	return strings.Join(descriptions, ", "), pidList
+}
+

@@ -338,3 +338,39 @@ func TestPostJobReadiness(t *testing.T) {
 		t.Fatalf("expected all 3 objects in readiness payload: %v", receivedBody)
 	}
 }
+
+func TestPostStoryBinding_AndPostTurnContinued(t *testing.T) {
+	var paths []string
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		var b map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		bodies = append(bodies, b)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	if err := PostStoryBinding(context.Background(), srv.URL, "tok", "job-1", "", "title", "path"); err == nil {
+		t.Fatalf("expected error for empty storyID")
+	}
+	if err := PostStoryBinding(context.Background(), srv.URL, "tok", "job-1", "STORY-GOV-1234", "My Story", "docs/stories/1234.md"); err != nil {
+		t.Fatalf("PostStoryBinding failed: %v", err)
+	}
+
+	if err := PostTurnContinued(context.Background(), srv.URL, "tok", "job-1", 1, "conv-1234", []string{"clean_working_tree"}, "make test (pid: 123)"); err != nil {
+		t.Fatalf("PostTurnContinued failed: %v", err)
+	}
+
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(paths))
+	}
+	if paths[0] != "/v1/jobs/job-1/story-binding" {
+		t.Errorf("expected story-binding path, got %s", paths[0])
+	}
+	if paths[1] != "/v1/jobs/job-1/chunks" {
+		t.Errorf("expected chunks path, got %s", paths[1])
+	}
+}
+

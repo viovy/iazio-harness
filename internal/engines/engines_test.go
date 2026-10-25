@@ -77,7 +77,7 @@ func TestArgvOrder(t *testing.T) {
 				Engine: "agy", Prompt: "hello", Kind: "execute",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
-			want: []string{"agy", "--print", "hello", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"},
+			want: []string{"agy", "--print", "hello", "--print-timeout", "0", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"},
 			cwd:  "/repos/leaf-01",
 		},
 		{
@@ -86,7 +86,7 @@ func TestArgvOrder(t *testing.T) {
 				Engine: "", Prompt: "hello", Kind: "execute",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
-			want: []string{"agy", "--print", "hello", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"},
+			want: []string{"agy", "--print", "hello", "--print-timeout", "0", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"},
 			cwd:  "/repos/leaf-01",
 		},
 		{
@@ -106,7 +106,7 @@ func TestArgvOrder(t *testing.T) {
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 				ResumeConversationID: "conv-uuid-456",
 			},
-			want: []string{"agy", "--print", "continue work", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--conversation=conv-uuid-456", "--dangerously-skip-permissions"},
+			want: []string{"agy", "--print", "continue work", "--print-timeout", "0", "--model", "gemini-3.8-flash-high", "--conversation=conv-uuid-456", "--dangerously-skip-permissions"},
 			cwd:  "/repos/leaf-01",
 		},
 		{
@@ -116,7 +116,7 @@ func TestArgvOrder(t *testing.T) {
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 				ResumeConversationID: "conv-uuid-789",
 			},
-			want: []string{"agy", "--print", "resume", "--print-timeout", "10m", "--model", "gemini-3.8-flash-high", "--conversation=conv-uuid-789", "--dangerously-skip-permissions"},
+			want: []string{"agy", "--print", "resume", "--print-timeout", "0", "--model", "gemini-3.8-flash-high", "--conversation=conv-uuid-789", "--dangerously-skip-permissions"},
 			cwd:  "/repos/leaf-01",
 		},
 		{
@@ -1135,3 +1135,58 @@ func TestExecute_GrandchildPipeLeakResilience(t *testing.T) {
 		t.Fatalf("expected to capture 'engine-work-complete' in stream events, got: %v", stream.events)
 	}
 }
+
+func TestRawWriter_FiltersRootAgentIdleMessage(t *testing.T) {
+	stream := &testCaptureStream{}
+	w := rawWriter{
+		stream: "stdout",
+		dst:    stream,
+	}
+
+	input := "line 1\nroot agent idle; waiting up to 1h0m0s for 1 background task(s)\nline 2\n"
+	n, err := w.Write([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected write error: %v", err)
+	}
+	if n != len(input) {
+		t.Fatalf("expected n=%d, got %d", len(input), n)
+	}
+
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	combined := strings.Join(stream.events, "")
+	if strings.Contains(combined, "root agent idle; waiting up to") {
+		t.Errorf("expected 'root agent idle; waiting up to' to be filtered out, got:\n%s", combined)
+	}
+	if !strings.Contains(combined, "line 1") || !strings.Contains(combined, "line 2") {
+		t.Errorf("expected remaining lines to be preserved, got:\n%s", combined)
+	}
+}
+
+func TestProcessGroupHelpers(t *testing.T) {
+	cmd := exec.Command("sleep", "5")
+	SetProcGroup(cmd)
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
+		t.Errorf("expected Setpgid to be true")
+	}
+	PostStartProcessGroup(cmd)
+	setProcGroup(cmd)
+	postStartProcessGroup(cmd)
+
+	StopProcessGroup(nil)
+	KillProcessGroup(nil)
+	stopProcessGroup(nil)
+	killProcessGroup(nil)
+
+	cmdNil := &exec.Cmd{}
+	StopProcessGroup(cmdNil)
+	KillProcessGroup(cmdNil)
+
+	if err := cmd.Start(); err == nil {
+		StopProcessGroup(cmd)
+		KillProcessGroup(cmd)
+		_ = cmd.Wait()
+	}
+}
+
+

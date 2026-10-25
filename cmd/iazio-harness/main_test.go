@@ -2152,4 +2152,304 @@ func TestRunServiceCommand_DryRun(t *testing.T) {
 	_ = runServiceCommand([]string{"unknown-action"})
 }
 
+func TestResolveLiveStoryID_Patterns(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. Output pattern STORY_ID=...
+	out1 := "running task\nSTORY_ID=STORY-GOV-3691\nvalidating"
+	got1 := resolveLiveStoryID(tempDir, out1, "pending_harness_creation")
+	if got1 != "STORY-GOV-3691" {
+		t.Errorf("expected STORY-GOV-3691 from explicit output, got %q", got1)
+	}
+
+	// 2. Output pattern docs/stories/...
+	out2 := "created file docs/stories/2026-10-25-gov-3691-cleanup-legacy.story.md"
+	got2 := resolveLiveStoryID(tempDir, out2, "pending_harness_creation")
+	if got2 != "STORY-GOV-3691" {
+		t.Errorf("expected STORY-GOV-3691 from story path, got %q", got2)
+	}
+
+	// 3. .autopilot/active_story.json
+	apDir := filepath.Join(tempDir, ".autopilot")
+	_ = os.MkdirAll(apDir, 0755)
+	_ = os.WriteFile(filepath.Join(apDir, "active_story.json"), []byte(`{"story_id":"STORY-GOV-3691"}`), 0644)
+	got3 := resolveLiveStoryID(tempDir, "", "pending_harness_creation")
+	if got3 != "STORY-GOV-3691" {
+		t.Errorf("expected STORY-GOV-3691 from .autopilot metadata, got %q", got3)
+	}
+
+	// 4. Git branch resolution
+	gitDir := t.TempDir()
+	cmdInit := exec.Command("git", "init", gitDir)
+	_ = cmdInit.Run()
+	cmdBranch := exec.Command("git", "-C", gitDir, "checkout", "-b", "chore/gov-3691-root-hygiene-wsl-decom")
+	_ = cmdBranch.Run()
+	got4 := resolveLiveStoryID(gitDir, "", "pending_harness_creation")
+	if got4 != "STORY-GOV-3691" {
+		t.Errorf("expected STORY-GOV-3691 from git branch, got %q", got4)
+	}
+}
+
+func TestExecuteJob_AutoResume_EnginePrintTimeout(t *testing.T) {
+	mockDir := t.TempDir()
+	countFile := filepath.Join(mockDir, "invocations.txt")
+	argsFile := filepath.Join(mockDir, "args.txt")
+	mockAgy := filepath.Join(mockDir, "agy")
+
+	// Script simulates turn 1 exiting code 0 with agy print timeout and terminated background task
+	// turn 2 resuming cleanly with exit 0
+	script := fmt.Sprintf(`#!/bin/sh
+echo "run" >> "%s"
+echo "$@" >> "%s"
+RUNS=$(wc -l < "%s")
+if [ "$RUNS" -eq 1 ]; then
+  echo "Conversation ID: c0ffee00-1234-5678-9abc-def012345678"
+  echo "[agy] print timeout after 1h0m0s with turn in progress; returning partial output"
+  echo "terminating 1 background task(s) on exit"
+  exit 0
+else
+  echo "Resumed turn 2 cleanly"
+  exit 0
+fi
+`, countFile, argsFile, countFile)
+
+	_ = os.WriteFile(mockAgy, []byte(script), 0755)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	var postedExitCode int
+	var postedChunks []string
+	var postedBindings []map[string]any
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if txt, ok := body["text"].(string); ok {
+				mu.Lock()
+				postedChunks = append(postedChunks, txt)
+				mu.Unlock()
+			}
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/story-binding") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			postedBindings = append(postedBindings, body)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/exit") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if ec, ok := body["exit_code"].(float64); ok {
+				postedExitCode = int(ec)
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-print-timeout" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:           "job-print-timeout",
+				Kind:         "story",
+				Engine:       "agy",
+				Prompt:       "/autonomous-story-execution implement STORY-GOV-3691",
+				StoryID:      "STORY-GOV-3691",
+				WorktreePath: workDir,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := executeJob(context.Background(), srv.URL, "job-print-timeout", workDir, "")
+	if err != nil {
+		t.Fatalf("executeJob failed: %v", err)
+	}
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("expected count file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected exactly 2 executions (turn 1 print timeout + turn 2 auto-continuation), got %d executions", len(lines))
+	}
+
+	argsData, _ := os.ReadFile(argsFile)
+	if !strings.Contains(string(argsData), "resume") {
+		t.Fatalf("expected resume prompt in continuation turn, got args:\n%s", string(argsData))
+	}
+
+	// Verify that turn continuation banner was logged
+	foundContinuationBanner := false
+	mu.Lock()
+	for _, chunk := range postedChunks {
+		if strings.Contains(chunk, "Initiating in-job continuation turn") {
+			foundContinuationBanner = true
+			break
+		}
+	}
+	mu.Unlock()
+	if !foundContinuationBanner {
+		t.Fatalf("expected in-job continuation banner in posted chunks, got: %+v", postedChunks)
+	}
+	if postedExitCode != 0 {
+		t.Fatalf("expected final exit code 0, got %d", postedExitCode)
+	}
+}
+
+func TestExecuteJob_AutoResume_ExitCodeZeroWithUnmetGates(t *testing.T) {
+	mockHome := t.TempDir()
+	t.Setenv("HOME", mockHome)
+
+	mockDir := t.TempDir()
+	countFile := filepath.Join(mockDir, "invocations.txt")
+	argsFile := filepath.Join(mockDir, "args.txt")
+	mockAgy := filepath.Join(mockDir, "agy")
+
+	workDir := t.TempDir()
+	_ = exec.Command("git", "init", workDir).Run()
+	_ = exec.Command("git", "-C", workDir, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", workDir, "config", "user.name", "Test").Run()
+	_ = os.WriteFile(filepath.Join(workDir, ".gitignore"), []byte("tmp/\n.autopilot/\n.iazio/\ninvocations.txt\nargs.txt\n"), 0644)
+	_ = os.WriteFile(filepath.Join(workDir, "init.txt"), []byte("init"), 0644)
+	storyDir := filepath.Join(workDir, "docs", "stories")
+	_ = os.MkdirAll(storyDir, 0755)
+	storyFile := filepath.Join(storyDir, "2026-10-25-gov-99999-test.story.md")
+	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-99999\nstatus: IN_PROGRESS\n---\n"), 0644)
+	_ = exec.Command("git", "-C", workDir, "add", ".gitignore", "init.txt", "docs/").Run()
+	_ = exec.Command("git", "-C", workDir, "commit", "-m", "initial commit").Run()
+
+	dirtyFile := filepath.Join(workDir, "uncommitted.txt")
+
+	script := fmt.Sprintf(`#!/bin/sh
+echo "run" >> "%s"
+echo "$@" >> "%s"
+RUNS=$(wc -l < "%s")
+if [ "$RUNS" -eq 1 ]; then
+  echo "Conversation ID: 11112222-3333-4444-5555-666677778888"
+  echo "modified file" >> "%s"
+  exit 0
+else
+  rm -f "%s"
+  printf -- "---\nid: STORY-GOV-99999\nstatus: DONE\n---\n" > "%s"
+  git -C "%s" commit -am "mark story done" >/dev/null 2>&1
+  echo "Turn 2 completed cleanly"
+  exit 0
+fi
+`, countFile, argsFile, countFile, dirtyFile, dirtyFile, storyFile, workDir)
+
+	_ = os.WriteFile(mockAgy, []byte(script), 0755)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	var postedExitCode int
+	var postedChunks []string
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if txt, ok := body["text"].(string); ok {
+				mu.Lock()
+				postedChunks = append(postedChunks, txt)
+				mu.Unlock()
+			}
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/story-binding") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/exit") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if ec, ok := body["exit_code"].(float64); ok {
+				postedExitCode = int(ec)
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-unmet-gates" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:           "job-unmet-gates",
+				Kind:         "story",
+				Engine:       "agy",
+				Prompt:       "/autonomous-story-execution implement STORY-GOV-99999",
+				StoryID:      "STORY-GOV-99999",
+				WorktreePath: workDir,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := executeJob(context.Background(), srv.URL, "job-unmet-gates", workDir, "")
+	if err != nil {
+		t.Fatalf("executeJob failed: %v", err)
+	}
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("reading count file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 invocations (1 initial + 1 continuation), got %d: %v", len(lines), lines)
+	}
+
+	argsData, _ := os.ReadFile(argsFile)
+	if !strings.Contains(string(argsData), "--conversation=11112222-3333-4444-5555-666677778888") {
+		t.Fatalf("expected continuation invocation to bind conversation, got: %s", string(argsData))
+	}
+	if !strings.Contains(string(argsData), "resume — continue autonomous story execution") {
+		t.Fatalf("expected continuation prompt in args, got: %s", string(argsData))
+	}
+	if postedExitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", postedExitCode)
+	}
+}
+
+func TestCollectWorkspaceDirtyFiles_AndVerifyRelease(t *testing.T) {
+	if files := collectWorkspaceDirtyFiles(""); files != nil {
+		t.Errorf("expected nil for empty worktree")
+	}
+
+	tmpDir := t.TempDir()
+	_ = exec.Command("git", "init", tmpDir).Run()
+	_ = os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("data"), 0644)
+	dirty := collectWorkspaceDirtyFiles(tmpDir)
+	if len(dirty) == 0 {
+		t.Errorf("expected dirty files, got none")
+	}
+
+	err := runVerifyReleaseCommand([]string{"--api-url", "http://127.0.0.1:54321", "--token", "tok"})
+	if err == nil {
+		t.Errorf("expected error connecting to non-existent server")
+	}
+}
+
+
+
+
 
