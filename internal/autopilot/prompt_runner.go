@@ -44,6 +44,9 @@ type PromptResult struct {
 	PromptID      string   `json:"prompt_id"`
 	Repo          string   `json:"repo"`
 	TargetAgent   string   `json:"target_agent"`
+	StoryID       string   `json:"story_id,omitempty"`
+	StoryTitle    string   `json:"story_title,omitempty"`
+	StoryPath     string   `json:"story_path,omitempty"`
 	Status        string   `json:"status"`
 	ExitCode      int      `json:"exit_code"`
 	GitHeadSHA    string   `json:"git_head_sha"`
@@ -285,10 +288,38 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 	summary = redact.Egress(strings.TrimSpace(summary))
 
+	detectedStoryID := storyID
+	var detectedStoryPath string
+	var detectedStoryTitle string
+
+	for _, f := range modified {
+		if strings.HasPrefix(f, "docs/stories/") && strings.HasSuffix(f, ".story.md") {
+			detectedStoryPath = f
+			if detectedStoryID == "" {
+				if m := storyIDRegex.FindStringSubmatch(f); len(m) > 1 {
+					detectedStoryID = m[1]
+				}
+			}
+			break
+		}
+	}
+
+	if detectedStoryID == "" {
+		if m := storyIDRegex.FindStringSubmatch(summary); len(m) > 1 {
+			detectedStoryID = m[1]
+		}
+	}
+	if opts.Title != "" {
+		detectedStoryTitle = opts.Title
+	}
+
 	result := &PromptResult{
 		PromptID:      opts.PromptID,
 		Repo:          opts.Repo,
 		TargetAgent:   targetAgent,
+		StoryID:       detectedStoryID,
+		StoryTitle:    detectedStoryTitle,
+		StoryPath:     detectedStoryPath,
 		Status:        execStatus,
 		ExitCode:      exitCode,
 		GitHeadSHA:    headSHA,
