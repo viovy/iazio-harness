@@ -2182,7 +2182,7 @@ func TestResolveLiveStoryID_Patterns(t *testing.T) {
 	gitDir := t.TempDir()
 	cmdInit := exec.Command("git", "init", gitDir)
 	_ = cmdInit.Run()
-	cmdBranch := exec.Command("git", "-C", gitDir, "checkout", "-b", "chore/gov-3691-meta-repo-root-hygiene")
+	cmdBranch := exec.Command("git", "-C", gitDir, "checkout", "-b", "chore/gov-3691-root-hygiene-wsl-decom")
 	_ = cmdBranch.Run()
 	got4 := resolveLiveStoryID(gitDir, "", "pending_harness_creation")
 	if got4 != "STORY-GOV-3691" {
