@@ -74,12 +74,14 @@ type DiagnosticReport struct {
 
 // DiagnosticInput provides context for execution diagnosis.
 type DiagnosticInput struct {
-	JobID        string
-	StoryID      string
-	WorktreePath string
-	ExitCode     int
-	OutputText   string
-	GitRunner    func(args ...string) (string, error)
+	JobID                  string
+	StoryID                string
+	WorktreePath           string
+	ExitCode               int
+	OutputText             string
+	GitRunner              func(args ...string) (string, error)
+	RequireTestsPassed     bool
+	RequireReleaseVerified bool
 }
 
 var alreadyDoneRegexes = []*regexp.Regexp{
@@ -488,9 +490,11 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 	// 5b. Post-exit ASE Completion Gate
 	if input.ExitCode == 0 && input.WorktreePath != "" {
 		gateRes := gate.Verify(gate.GateOptions{
-			WorktreePath: input.WorktreePath,
-			StoryID:      input.StoryID,
-			GitRunner:    git,
+			WorktreePath:           input.WorktreePath,
+			StoryID:                input.StoryID,
+			RequireTestsPassed:     input.RequireTestsPassed,
+			RequireReleaseVerified: input.RequireReleaseVerified,
+			GitRunner:              git,
 		})
 		if !gateRes.Passed {
 			report.ASEComplete = false
