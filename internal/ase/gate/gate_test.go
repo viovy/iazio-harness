@@ -41,6 +41,82 @@ func TestVerify_AllClean(t *testing.T) {
 	}
 }
 
+func TestVerify_EmptyWorktree(t *testing.T) {
+	res := Verify(GateOptions{StoryID: "STORY-1"})
+	if res.Passed {
+		t.Errorf("expected false for empty worktree with story ID")
+	}
+
+	res2 := Verify(GateOptions{})
+	if !res2.Passed {
+		t.Errorf("expected true for empty worktree without story ID")
+	}
+}
+
+func TestVerify_DetachedBranchAndSubmodules(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	mockGit := func(args ...string) (string, error) {
+		cmd := args[0]
+		switch cmd {
+		case "status":
+			return "", nil
+		case "rev-parse":
+			return "HEAD", nil
+		case "submodule":
+			return "+abcdef0 submod1\nU123456 submod2", nil
+		default:
+			return "", nil
+		}
+	}
+
+	res := Verify(GateOptions{
+		WorktreePath: tmpDir,
+		GitRunner:    mockGit,
+	})
+	if res.BranchClean {
+		t.Errorf("expected BranchClean=false for detached HEAD")
+	}
+	if res.SubmodulesClean {
+		t.Errorf("expected SubmodulesClean=false for dirty submodules")
+	}
+}
+
+func TestVerify_RequiredStamps(t *testing.T) {
+	tmpDir := t.TempDir()
+	reportsDir := filepath.Join(tmpDir, "tmp", "reports")
+	_ = os.MkdirAll(reportsDir, 0755)
+
+	mockGit := func(args ...string) (string, error) {
+		return "", nil
+	}
+
+	// Stamps missing
+	res := Verify(GateOptions{
+		WorktreePath:           tmpDir,
+		RequireTestsPassed:     true,
+		RequireReleaseVerified: true,
+		GitRunner:              mockGit,
+	})
+	if res.TestsPassed || res.ReleaseVerified {
+		t.Errorf("expected false for missing stamps")
+	}
+
+	// Stamps present
+	_ = os.WriteFile(filepath.Join(reportsDir, "validate-local-ok.stamp"), []byte("ok"), 0644)
+	_ = os.WriteFile(filepath.Join(reportsDir, "verify-live-release-ok.stamp"), []byte("ok"), 0644)
+
+	res2 := Verify(GateOptions{
+		WorktreePath:           tmpDir,
+		RequireTestsPassed:     true,
+		RequireReleaseVerified: true,
+		GitRunner:              mockGit,
+	})
+	if !res2.TestsPassed || !res2.ReleaseVerified {
+		t.Errorf("expected true for present stamps")
+	}
+}
+
 func TestVerify_DirtyTree(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -125,8 +201,6 @@ func TestVerify_StoryNotDone_EvenWithGitCommit(t *testing.T) {
 	storyFile := filepath.Join(storiesDir, "2026-10-25-gov-3684-test.story.md")
 	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3684\nstatus: IN_PROGRESS\n---\n"), 0644)
 
-	// Even if git log returns commits on HEAD matching the story ID,
-	// the story file is still IN_PROGRESS and must NOT be considered complete!
 	mockGit := func(args ...string) (string, error) {
 		cmd := args[0]
 		switch cmd {
@@ -156,4 +230,9 @@ func TestVerify_StoryNotDone_EvenWithGitCommit(t *testing.T) {
 	if res.StoryDone {
 		t.Errorf("expected StoryDone=false when story markdown status is IN_PROGRESS")
 	}
+}
+
+func TestDefaultGitRunner(t *testing.T) {
+	runner := DefaultGitRunner(t.TempDir())
+	_, _ = runner("version")
 }
