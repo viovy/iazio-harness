@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -201,20 +200,7 @@ func KillChildProcess(pid int) error {
 	if pid <= 0 {
 		return nil
 	}
-	if runtime.GOOS == "windows" {
-		return exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
-	}
-
-	// Unix: SIGTERM then SIGKILL
-	_ = syscall.Kill(pid, syscall.SIGTERM)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); err != nil {
-			return nil // Process exited
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return syscall.Kill(pid, syscall.SIGKILL)
+	return killProcessPlatform(pid)
 }
 
 // TaskSupervisor monitors engine output for root agent idle states and supervises background tasks.
