@@ -35,6 +35,8 @@ type TrackedJob struct {
 	StoryID        string    `json:"story_id,omitempty"`
 	ConversationID string    `json:"conversation_id,omitempty"`
 	PID            int       `json:"pid"`
+	HarnessPID     int       `json:"harness_pid,omitempty"`
+	ToolPID        int       `json:"tool_pid,omitempty"`
 	StartedAt      time.Time `json:"started_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 	Status         string    `json:"status"`
@@ -106,6 +108,11 @@ func New(opts Options) *Watchdog {
 	}
 	w.loadState()
 	return w
+}
+
+// IsProcessAlive tests whether a process with the given PID is actively running.
+func IsProcessAlive(pid int) bool {
+	return defaultIsProcessAlive(pid)
 }
 
 func (w *Watchdog) loadState() {

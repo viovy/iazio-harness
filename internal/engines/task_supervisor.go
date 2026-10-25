@@ -224,7 +224,7 @@ type TaskSupervisor struct {
 
 // NewTaskSupervisor creates and starts an activity-aware background task supervisor.
 func NewTaskSupervisor(parentPID int, stream EventStream, timeout ...time.Duration) *TaskSupervisor {
-	inactTimeout := 90 * time.Second
+	inactTimeout := 60 * time.Second
 	if len(timeout) > 0 && timeout[0] > 0 {
 		inactTimeout = timeout[0]
 	} else if env := os.Getenv("IAZIO_ROOT_IDLE_TASK_TIMEOUT"); env != "" {
@@ -235,7 +235,7 @@ func NewTaskSupervisor(parentPID int, stream EventStream, timeout ...time.Durati
 		}
 	}
 
-	maxWait := 180 * time.Second
+	maxWait := 120 * time.Second
 	if inactTimeout*2 > maxWait {
 		maxWait = inactTimeout * 2
 	}
@@ -274,7 +274,7 @@ func (s *TaskSupervisor) OnOutput(p []byte) {
 		s.activeTasks = children
 
 		if s.Stream != nil {
-			headerMsg := fmt.Sprintf("[iazio-harness] [background_task.supervisor] Root agent idle completion barrier detected with %d background task(s). Armed activity watchdog (inactivity timeout: %v, max wait: %v).\n",
+			headerMsg := fmt.Sprintf("[ASE-SUPERVISOR] [background_task.supervisor] Root agent idle completion barrier detected with %d background task(s). Armed activity watchdog (inactivity timeout: %v, max wait: %v).\n",
 				len(children), s.InactivityLimit, s.MaxWaitDuration)
 			_ = s.Stream.AppendRaw("stdout", []byte(headerMsg))
 
@@ -283,7 +283,7 @@ func (s *TaskSupervisor) OnOutput(p []byte) {
 				if len(cmdPreview) > 80 {
 					cmdPreview = cmdPreview[:77] + "..."
 				}
-				taskMsg := fmt.Sprintf("[iazio-harness] [background_task.active] Tracked child PID %d: %s\n", ch.PID, cmdPreview)
+				taskMsg := fmt.Sprintf("[ASE-SUPERVISOR] [background_task.active] Tracked child PID %d: %s\n", ch.PID, cmdPreview)
 				_ = s.Stream.AppendRaw("stdout", []byte(taskMsg))
 			}
 		}
@@ -336,7 +336,7 @@ func (s *TaskSupervisor) supervise() {
 
 func (s *TaskSupervisor) executeReap(tasks []BackgroundTaskInfo, idleDur time.Duration) {
 	if s.Stream != nil {
-		reapMsg := fmt.Sprintf("[iazio-harness] [background_task.auto_reaped] Inactivity limit (%v) exceeded while root agent is idle. Terminating %d background task(s) to unblock job completion...\n",
+		reapMsg := fmt.Sprintf("[ASE-SUPERVISOR] [background_task.auto_reaped] Inactivity limit (%v) exceeded while root agent is idle. Terminating %d background task(s) to unblock resume cycle...\n",
 			idleDur.Round(time.Second), len(tasks))
 		_ = s.Stream.AppendRaw("stdout", []byte(reapMsg))
 	}
@@ -344,7 +344,7 @@ func (s *TaskSupervisor) executeReap(tasks []BackgroundTaskInfo, idleDur time.Du
 	for _, task := range tasks {
 		_ = KillChildProcess(task.PID)
 		if s.Stream != nil {
-			_ = s.Stream.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] [background_task.auto_reaped] Terminated background task PID %d (%s)\n", task.PID, task.Command)))
+			_ = s.Stream.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] [background_task.auto_reaped] Reaped hung background task PID %d (%s)\n", task.PID, task.Command)))
 		}
 	}
 
@@ -352,10 +352,10 @@ func (s *TaskSupervisor) executeReap(tasks []BackgroundTaskInfo, idleDur time.Du
 		s.OnTasksReaped(tasks)
 	}
 
-	// Sleep 2 seconds to allow parent process to see child termination and unblock
-	time.Sleep(2 * time.Second)
+	// Sleep 1 second to allow parent process to see child termination and unblock
+	time.Sleep(1 * time.Second)
 
-	// If parent process is still alive after terminating children, send SIGTERM so it completes
+	// If parent process is still alive after terminating children, send SIGTERM so it completes turn
 	if s.ParentPID > 0 {
 		_ = KillChildProcess(s.ParentPID)
 	}

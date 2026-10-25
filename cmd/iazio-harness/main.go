@@ -5,18 +5,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/viovy/iazio-harness/internal/ase/gate"
 	"github.com/viovy/iazio-harness/internal/auth"
 	"github.com/viovy/iazio-harness/internal/checkpoint"
 	"github.com/viovy/iazio-harness/internal/controlplane"
@@ -108,6 +112,7 @@ func runJob(args []string) error {
 
 func runJobWithContext(ctx context.Context, args []string) error {
 	var api, jobID, worktree, docsHub, chunk, kind, resumeConv string
+	var attachToolPID int
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--api-url":
@@ -145,6 +150,11 @@ func runJobWithContext(ctx context.Context, args []string) error {
 			if i < len(args) {
 				resumeConv = args[i]
 			}
+		case "--attach-tool-pid":
+			i++
+			if i < len(args) {
+				attachToolPID, _ = strconv.Atoi(args[i])
+			}
 		}
 	}
 	if api == "" {
@@ -166,7 +176,7 @@ func runJobWithContext(ctx context.Context, args []string) error {
 	if chunk != "" {
 		return controlplane.PostChunk(ctx, api, "", jobID, "stdout", chunk)
 	}
-	return executeJob(ctx, api, jobID, worktree, docsHub, kind, resumeConv)
+	return executeJob(ctx, api, jobID, worktree, docsHub, kind, resumeConv, strconv.Itoa(attachToolPID))
 }
 
 // hasEngineSessionAttachError inspects engine execution log/stderr specifically for session attachment errors.
@@ -483,6 +493,139 @@ func cleanStaleGitLocks(workspacePath string) []string {
 	return removed
 }
 
+// resolveConversationFallback discovers an active or recent conversation ID on disk or in the worktree.
+func resolveConversationFallback(worktree, storyID, engineName string) string {
+	if worktree == "" {
+		return ""
+	}
+	resolver := sessionstore.DefaultResolver()
+	dCtx := resolver.DetectDirtyWorktreeContext(worktree)
+	if dCtx.ConversationID != "" && sessionstore.IsValidConversationID(dCtx.ConversationID) {
+		return dCtx.ConversationID
+	}
+	if storyID != "" {
+		if sess, err := resolver.ResolveForStory(worktree, storyID); err == nil && sess != nil && sessionstore.IsValidConversationID(sess.ConversationID) {
+			return sess.ConversationID
+		}
+	}
+	if sess, err := resolver.ResolveLatest(worktree); err == nil && sess != nil && sessionstore.IsValidConversationID(sess.ConversationID) {
+		return sess.ConversationID
+	}
+	return ""
+}
+
+func attachRunningTool(
+	ctx context.Context,
+	api, token, jobID string,
+	job controlplane.JobDetail,
+	toolPID int,
+	engineName, activeConvID, targetDir, docsHub string,
+	sp *spool.Spool,
+	lockHandle *repolock.LockHandle,
+) (engines.ExecutionResult, error) {
+	attachMsg := fmt.Sprintf("\n[ASE-SUPERVISOR] [attach_mode] iazio-harness attached to running AI engine process (ToolPID %d, engine: %s) for job %s (conversation: %s in %s)\n",
+		toolPID, engineName, jobID, activeConvID, targetDir)
+	_ = sp.AppendRaw("stdout", []byte(attachMsg))
+	_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", attachMsg)
+	_ = controlplane.PostTick(context.Background(), api, token, jobID, 0, os.Getpid(), toolPID)
+
+	if lockHandle != nil {
+		_ = lockHandle.Update(repolock.LockInfo{
+			JobID:          job.ID,
+			ScheduleID:     job.ScheduleID,
+			PID:            os.Getpid(),
+			HarnessPID:     os.Getpid(),
+			ToolPID:        toolPID,
+			Engine:         engineName,
+			ConversationID: activeConvID,
+			StoryID:        job.StoryID,
+			Prompt:         job.Prompt,
+			Status:         "RUNNING",
+		})
+	}
+
+	engineLogPath := filepath.Join(spool.DefaultDir(), jobID+".engine.log")
+	var logFile *os.File
+	var offset int64
+	if f, err := os.Open(engineLogPath); err == nil {
+		logFile = f
+		offset, _ = f.Seek(0, io.SeekEnd)
+	}
+
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	lastTickSent := time.Now()
+	startTime := time.Now()
+	buf := make([]byte, 32768)
+
+	for {
+		select {
+		case <-ctx.Done():
+			if logFile != nil {
+				_ = logFile.Close()
+			}
+			return engines.ExecutionResult{ExitCode: 130}, ctx.Err()
+		case <-ticker.C:
+			if logFile == nil {
+				if f, err := os.Open(engineLogPath); err == nil {
+					logFile = f
+					offset, _ = f.Seek(0, io.SeekEnd)
+				}
+			}
+			if logFile != nil {
+				fi, err := logFile.Stat()
+				if err == nil && fi.Size() > offset {
+					n, _ := logFile.ReadAt(buf, offset)
+					if n > 0 {
+						chunk := buf[:n]
+						offset += int64(n)
+						_ = sp.AppendRaw("stdout", chunk)
+						_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", string(chunk))
+						lastTickSent = time.Now()
+					}
+				}
+			}
+
+			now := time.Now()
+			if now.Sub(lastTickSent) >= 5*time.Second {
+				elapsedSec := int(time.Since(startTime).Seconds())
+				_ = controlplane.PostTick(context.Background(), api, token, jobID, 0, os.Getpid(), toolPID, elapsedSec)
+				lastTickSent = now
+			}
+
+			if !watchdog.IsProcessAlive(toolPID) {
+				if logFile != nil {
+					if fi, err := logFile.Stat(); err == nil && fi.Size() > offset {
+						n, _ := logFile.ReadAt(buf, offset)
+						if n > 0 {
+							chunk := buf[:n]
+							_ = sp.AppendRaw("stdout", chunk)
+							_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", string(chunk))
+						}
+					}
+					_ = logFile.Close()
+				}
+
+				exitMsg := fmt.Sprintf("\n[ASE-SUPERVISOR] [attach_mode] AI tool process (ToolPID %d) terminated. Evaluating completion gates...\n", toolPID)
+				_ = sp.AppendRaw("stdout", []byte(exitMsg))
+				_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", exitMsg)
+
+				gateRes := gate.Verify(gate.GateOptions{
+					WorktreePath: targetDir,
+					StoryID:      job.StoryID,
+				})
+				if gateRes.Passed {
+					compMsg := fmt.Sprintf("[ASE-SUPERVISOR] ASE story %s verified completed via attach supervisor!\n", job.StoryID)
+					_ = sp.AppendRaw("stdout", []byte(compMsg))
+					_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", compMsg)
+					return engines.ExecutionResult{ExitCode: 0}, nil
+				}
+				return engines.ExecutionResult{ExitCode: 1}, fmt.Errorf("tool process %d exited with incomplete gates: %v", toolPID, gateRes.UnmetGates)
+			}
+		}
+	}
+}
+
 func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
 	var spanOpts = []telemetry.SpanOption{
 		telemetry.WithKind("INTERNAL"),
@@ -493,11 +636,15 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	defer span.End()
 
 	var kindOverride, resumeConvOverride string
+	var attachToolPID int
 	if len(overrides) > 0 {
 		kindOverride = overrides[0]
 	}
 	if len(overrides) > 1 {
 		resumeConvOverride = overrides[1]
+	}
+	if len(overrides) > 2 && overrides[2] != "" {
+		attachToolPID, _ = strconv.Atoi(overrides[2])
 	}
 	token, _ := auth.Bearer(ctx)
 	job, err := controlplane.GetJob(ctx, api, token, jobID)
@@ -643,48 +790,25 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 		log.Printf("[harness] [job.resume.conversation_fallback] resume_mode=fallback_new_conversation reason=%q", preflightFallbackReason)
 	}
-	if job.Kind == "resume" && !isControlPlaneResume {
-		resolver := sessionstore.DefaultResolver()
-		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
-		if (job.StoryID == "" || strings.EqualFold(job.StoryID, fallbackResumeStoryID) || strings.EqualFold(job.StoryID, "resume complete current ase flow")) && dCtx.StoryID != "" {
-			job.StoryID = dCtx.StoryID
-		}
-		if resumeConvID == "" {
-			if dCtx.ConversationID != "" {
-				resumeConvID = dCtx.ConversationID
-				log.Printf("[harness] Discovered prior conversation %s from dirty context (review: %s, verdict: %s)", resumeConvID, dCtx.ReviewFile, dCtx.Verdict)
-			} else if job.StoryID != "" {
-				if sess, err := resolver.ResolveForStory(worktree, job.StoryID); err == nil && sess != nil {
-					resumeConvID = sess.ConversationID
-				}
-			} else {
-				if sess, err := resolver.ResolveLatest(worktree); err == nil && sess != nil {
-					resumeConvID = sess.ConversationID
-				}
-			}
-		}
+	if resumeConvID == "" && !isControlPlaneResume {
+		resumeConvID = resolveConversationFallback(worktree, job.StoryID, engineName)
 		if resumeConvID != "" {
-			log.Printf("[harness] Standalone resume discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
+			log.Printf("[harness] [ASE-SUPERVISOR] Discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
 		}
 	}
 	lockHandle, lockErr := repolock.Acquire(worktree, repolock.LockInfo{
 		JobID:          job.ID,
 		ScheduleID:     job.ScheduleID,
 		PID:            os.Getpid(),
+		HarnessPID:     os.Getpid(),
+		ToolPID:        attachToolPID,
 		Engine:         engineName,
 		ConversationID: resumeConvID,
 		StoryID:        job.StoryID,
 		Prompt:         job.Prompt,
 		Status:         "RUNNING",
 	}, func(pid int) bool {
-		if pid <= 0 {
-			return false
-		}
-		p, err := os.FindProcess(pid)
-		if err != nil {
-			return false
-		}
-		return p.Signal(syscall.Signal(0)) == nil
+		return watchdog.IsProcessAlive(pid)
 	})
 	if lockErr != nil {
 		_ = sp.AppendRaw("stderr", []byte(fmt.Sprintf("[iazio-harness] Repository lock failure: %v\n", lockErr)))
@@ -692,6 +816,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		return fmt.Errorf("repolock: %w", lockErr)
 	}
 	defer lockHandle.Release()
+
+	if attachToolPID <= 0 && lockHandle.Info().ToolPID > 0 && watchdog.IsProcessAlive(lockHandle.Info().ToolPID) {
+		attachToolPID = lockHandle.Info().ToolPID
+		log.Printf("[harness] [ASE-SUPERVISOR] Discovered active tool process (ToolPID: %d) from existing lock on %s", attachToolPID, worktree)
+	}
 
 	if !isControlPlaneResume && resumeConvID == "" && lockHandle.Info().ConversationID != "" && (job.Kind == "resume" || (job.StoryID != "" && lockHandle.Info().StoryID == job.StoryID && lockHandle.Info().Status != "COMPLETED")) {
 		resumeConvID = lockHandle.Info().ConversationID
@@ -771,10 +900,24 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	activeConvID := resumeConvID
 
 	// Immediately post startup diagnostic chunk so UI never sits on blank "Waiting for output..."
-	_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Initializing execution for job %s on %s (engine: %s, kind: %s)\n", jobID, worktree, engineName, job.Kind)))
+	_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] Initializing execution for job %s on %s (engine: %s, kind: %s)\n", jobID, worktree, engineName, job.Kind)))
 	if resumeConvID != "" {
-		_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Resuming execution: conversation %s (story: %s, engine: %s)\n", resumeConvID, job.StoryID, engineName)))
+		_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] Conversation resolved: %s --conversation=%s (source: sessionstore/metadata)\n", engineName, resumeConvID)))
+	} else {
+		_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] Starting new conversation session for story %s...\n", storyID)))
 	}
+	initAsePhase := "START"
+	if job.InterruptedASEState != nil {
+		if p, ok := job.InterruptedASEState["phase"].(string); ok && p != "" {
+			initAsePhase = p
+		}
+	}
+	_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] ASE State: story=%s, phase=%s\n", storyID, initAsePhase)))
+	initDirtySummary := "clean"
+	if dFiles := collectWorkspaceDirtyFiles(worktree); len(dFiles) > 0 {
+		initDirtySummary = fmt.Sprintf("dirty (%d files modified/untracked)", len(dFiles))
+	}
+	_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] Fleet Git State: %s\n", initDirtySummary)))
 	_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
 		JobID:          job.ID,
 		ScheduleID:     job.ScheduleID,
@@ -841,6 +984,18 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	modelName, agentName, disableSlashCommands := resolveExecutionOptions(job, prepRes.Prompt)
 	runner := engines.CLI{Engine: engineName}
 
+	initialBanner := fmt.Sprintf("\n[ASE-SUPERVISOR] Starting execution for job %s (kind: %s, engine: %s, worktree: %s)\n"+
+		"[ASE-SUPERVISOR] Executed Prompt: %q\n",
+		jobID, job.Kind, engineName, worktree, prepRes.Prompt)
+	if resumeConvID != "" {
+		initialBanner += fmt.Sprintf("[ASE-SUPERVISOR] Resuming Conversation: %s --conversation=%s\n", engineName, resumeConvID)
+	}
+	if job.ParentJobID != "" {
+		initialBanner += fmt.Sprintf("[ASE-SUPERVISOR] Lineage: parent_job=%s, root_job=%s\n", job.ParentJobID, job.RootJobID)
+	}
+	_ = sp.AppendRaw("stdout", []byte(initialBanner))
+	_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", initialBanner)
+
 	var convWg sync.WaitGroup
 	var convMu sync.Mutex
 	var confirmedConvID string
@@ -874,19 +1029,23 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 				StoryID:        job.StoryID,
 				ConversationID: activeConvID,
 				PID:            pid,
+				HarnessPID:     os.Getpid(),
+				ToolPID:        pid,
 				Status:         watchdog.StatusRunning,
 			})
 			_ = lockHandle.Update(repolock.LockInfo{
 				JobID:          job.ID,
 				ScheduleID:     job.ScheduleID,
 				PID:            os.Getpid(),
-				HarnessPID:     pid,
+				HarnessPID:     os.Getpid(),
+				ToolPID:        pid,
 				Engine:         engineName,
 				ConversationID: activeConvID,
 				StoryID:        job.StoryID,
 				Prompt:         job.Prompt,
 				Status:         "RUNNING",
 			})
+			_ = controlplane.PostTick(ctx, api, token, job.ID, 0, os.Getpid(), pid)
 			_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
 				JobID:          job.ID,
 				ScheduleID:     job.ScheduleID,
@@ -952,7 +1111,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 				JobID:          job.ID,
 				ScheduleID:     job.ScheduleID,
 				PID:            os.Getpid(),
-				HarnessPID:     activePID,
+				HarnessPID:     os.Getpid(),
+				ToolPID:        activePID,
 				Engine:         engineName,
 				ConversationID: cid,
 				StoryID:        job.StoryID,
@@ -1013,7 +1173,14 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			}(cid, isFallback, fallbackReason, role, asePhase)
 		},
 	}
-	execRes, execErr := runner.Execute(ctx, execReq, sp)
+	var execRes engines.ExecutionResult
+	var execErr error
+	if attachToolPID > 0 && watchdog.IsProcessAlive(attachToolPID) {
+		activePID = attachToolPID
+		execRes, execErr = attachRunningTool(ctx, api, token, jobID, job, attachToolPID, engineName, activeConvID, targetDir, docsHub, sp, lockHandle)
+	} else {
+		execRes, execErr = runner.Execute(ctx, execReq, sp)
+	}
 	span.AddAnnotation(fmt.Sprintf("engine_process_exited:code=%d", execRes.ExitCode))
 	stopFlush()
 
@@ -1272,6 +1439,124 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 	}
 
+	// In-Place Conversational Auto-Resume Loop:
+	// If background tasks were auto-reaped or execution stalled on background tasks / timeouts,
+	// do NOT fail the job. Re-invoke the engine in-place with prompt "resume".
+	maxAutoResumes := 5
+	if envMax := os.Getenv("IAZIO_MAX_AUTO_RESUMES"); envMax != "" {
+		if n, err := strconv.Atoi(envMax); err == nil && n > 0 {
+			maxAutoResumes = n
+		}
+	}
+	autoResumeCount := 0
+	lastProgressFp := ""
+
+	isAutoResumeTrigger := func() bool {
+		if execRes.ExitCode == 0 && execErr == nil {
+			return false
+		}
+		if execRes.WasAutoReaped {
+			return true
+		}
+		if execErr != nil && (errors.Is(execErr, context.DeadlineExceeded) || strings.Contains(execErr.Error(), "timeout")) {
+			return true
+		}
+		if strings.Contains(combinedOutput, "root agent idle; waiting up to") ||
+			strings.Contains(combinedOutput, "inactivity limit") ||
+			strings.Contains(combinedOutput, "background_task.auto_reaped") {
+			return true
+		}
+		if os.Getenv("IAZIO_ENABLE_IN_PLACE_AUTO_RESUME") == "1" && execRes.ExitCode != 0 && !diagReport.ASEComplete {
+			return true
+		}
+		return false
+	}
+
+	for isAutoResumeTrigger() && autoResumeCount < maxAutoResumes {
+		autoResumeCount++
+		currentFp := fmt.Sprintf("%d", len(collectWorkspaceDirtyFiles(worktree)))
+		if currentFp == lastProgressFp && autoResumeCount > 2 {
+			break
+		}
+		lastProgressFp = currentFp
+
+		resumeTargetID := activeConvID
+		if resumeTargetID == "" {
+			resumeTargetID = confirmedConvID
+		}
+		if resumeTargetID == "" {
+			resumeTargetID = resumeConvID
+		}
+		if resumeTargetID == "" && !isControlPlaneResume {
+			resumeTargetID = resolveConversationFallback(worktree, job.StoryID, engineName)
+		}
+		if resumeTargetID == "" {
+			break
+		}
+
+		activeConvID = resumeTargetID
+		confirmedConvID = resumeTargetID
+
+		reasonDesc := "turn_interrupted"
+		if execRes.WasAutoReaped {
+			reasonDesc = "hung_background_tasks_reaped"
+		} else if execErr != nil && errors.Is(execErr, context.DeadlineExceeded) {
+			reasonDesc = "execution_timeout"
+		} else if execRes.ExitCode != 0 {
+			reasonDesc = fmt.Sprintf("exit_code_%d", execRes.ExitCode)
+		}
+
+		autoResumeMsg := fmt.Sprintf("\n[ASE-SUPERVISOR] In-place auto-resume triggered (#%d/%d) for job %s (trigger: %s).\n"+
+			"[ASE-SUPERVISOR] Conversation resolved: %s --conversation=%s\n"+
+			"[ASE-SUPERVISOR] ASE State: story=%s, complete=%v\n"+
+			"[ASE-SUPERVISOR] Fleet Git State: %d dirty file(s) preserved\n"+
+			"[ASE-SUPERVISOR] Injecting prompt \"resume\" into %s --conversation=%s...\n\n",
+			autoResumeCount, maxAutoResumes, jobID, reasonDesc,
+			engineName, resumeTargetID,
+			job.StoryID, diagReport.ASEComplete,
+			len(collectWorkspaceDirtyFiles(worktree)),
+			engineName, resumeTargetID,
+		)
+		_ = sp.AppendRaw("stdout", []byte(autoResumeMsg))
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", autoResumeMsg)
+
+		resumeReq := execReq
+		resumeReq.Prompt = "resume — continue autonomous story execution from current ASE and git state until all story completion gates pass"
+		resumeReq.ResumeConversationID = resumeTargetID
+		resumeReq.Argv = nil
+
+		execRes, execErr = runner.Execute(ctx, resumeReq, sp)
+
+		// Flush spool
+		for _, ev := range sp.Flush() {
+			if ev.Type == spool.EventOutputChunk {
+				_ = controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text)
+			}
+		}
+
+		_ = sp.Sync()
+		engineLogData, _ = os.ReadFile(resumeReq.LogFile)
+		stderrLogData, _ = os.ReadFile(strings.TrimSuffix(resumeReq.LogFile, ".log") + ".stderr.log")
+		combinedEngineLog = append(append([]byte(nil), engineLogData...), stderrLogData...)
+		engineLogStr = string(combinedEngineLog)
+		spoolLogData, _ = os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
+		combinedOutput = engineLogStr + "\n" + string(spoolLogData)
+		diagReport = diagnostics.Diagnose(diagnostics.DiagnosticInput{
+			JobID:        job.ID,
+			StoryID:      job.StoryID,
+			WorktreePath: worktree,
+			ExitCode:     execRes.ExitCode,
+			OutputText:   engineLogStr,
+		})
+
+		if execRes.ExitCode == 0 {
+			successMsg := "[ASE-SUPERVISOR] In-place auto-resume completed successfully!\n"
+			_ = sp.AppendRaw("stdout", []byte(successMsg))
+			_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", successMsg)
+			break
+		}
+	}
+
 	if len(diagReport.Findings) > 0 {
 		for _, f := range diagReport.Findings {
 			diagMsg := fmt.Sprintf("[iazio-harness] Anomaly detected: [%s] (%s): %s Remediation: %s\n", f.Code, f.Severity, f.Message, f.Remediation)
@@ -1332,7 +1617,17 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 
 	dirtyFiles := collectWorkspaceDirtyFiles(worktree)
+	if activeConvID == "" && !isControlPlaneResume {
+		activeConvID = resolveConversationFallback(worktree, job.StoryID, engineName)
+		if activeConvID != "" {
+			confirmedConvID = activeConvID
+		}
+	}
 	resumable := (activeConvID != "" || confirmedConvID != "" || resumeConvID != "")
+	if !resumable && (len(job.ConversationIDs) > 0 || job.StoryID != "") {
+		// In-progress story executions and jobs with recorded conversations are always resumable
+		resumable = true
+	}
 	nonResumableReason := ""
 	if !resumable {
 		nonResumableReason = "No conversation session established before termination"

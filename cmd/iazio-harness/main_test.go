@@ -10,9 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/viovy/iazio-harness/internal/checkpoint"
 	"github.com/viovy/iazio-harness/internal/controlplane"
@@ -1909,3 +1911,245 @@ func TestRunServiceCommand(t *testing.T) {
 		t.Fatalf("expected error for unknown action, got nil")
 	}
 }
+
+func TestExecuteJob_AutoResume_HungBackgroundTask(t *testing.T) {
+	mockDir := t.TempDir()
+	countFile := filepath.Join(mockDir, "invocations.txt")
+	argsFile := filepath.Join(mockDir, "args.txt")
+	mockAgy := filepath.Join(mockDir, "agy")
+
+	// Script simulates turn 1 hanging/reaped (outputs [background_task.auto_reaped] and exits 143),
+	// and turn 2 resuming cleanly with exit 0.
+	script := fmt.Sprintf(`#!/bin/sh
+echo "run" >> "%s"
+echo "$@" >> "%s"
+RUNS=$(wc -l < "%s")
+if [ "$RUNS" -eq 1 ]; then
+  echo "Conversation ID: c0ffee00-1234-5678-9abc-def012345678"
+  echo "[ASE-SUPERVISOR] [background_task.auto_reaped] Inactivity limit (60s) exceeded while root agent is idle. Terminating 1 background task(s) to unblock resume cycle..."
+  exit 143
+else
+  echo "Resumed successfully and completed story flow."
+  exit 0
+fi
+`, countFile, argsFile, countFile)
+
+	_ = os.WriteFile(mockAgy, []byte(script), 0755)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	var postedExitCode int
+	var postedChunks []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if txt, ok := body["text"].(string); ok {
+				postedChunks = append(postedChunks, txt)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/exit") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if ec, ok := body["exit_code"].(float64); ok {
+				postedExitCode = int(ec)
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-reap-autoresume" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:           "job-reap-autoresume",
+				Kind:         "ordinary",
+				Engine:       "agy",
+				Prompt:       "execute story flow",
+				StoryID:      "STORY-REAP-001",
+				WorktreePath: workDir,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := executeJob(context.Background(), srv.URL, "job-reap-autoresume", workDir, "")
+	if err != nil {
+		t.Fatalf("executeJob failed: %v", err)
+	}
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("expected count file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected exactly 2 executions (1 failed/reaped + 1 auto-resume), got %d executions", len(lines))
+	}
+
+	argsData, _ := os.ReadFile(argsFile)
+	if !strings.Contains(string(argsData), "resume") {
+		t.Fatalf("expected resume prompt in second invocation, got args:\n%s", string(argsData))
+	}
+	if postedExitCode != 0 {
+		t.Fatalf("expected final posted exit code 0, got %d", postedExitCode)
+	}
+}
+
+func TestExecuteJob_AttachRunningTool(t *testing.T) {
+	workDir := t.TempDir()
+	jobID := "job-attach-test"
+
+	var postedChunks []string
+	var postedExitCode int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if txt, ok := body["text"].(string); ok {
+				postedChunks = append(postedChunks, txt)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/ticks") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/exit") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if ec, ok := body["exit_code"].(float64); ok {
+				postedExitCode = int(ec)
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/"+jobID {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:           jobID,
+				Kind:         "ordinary",
+				Engine:       "agy",
+				Prompt:       "test prompt",
+				StoryID:      "STORY-ATTACH-001",
+				WorktreePath: workDir,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cmd := exec.Command("sleep", "0.4")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start mock tool process: %v", err)
+	}
+	go func() {
+		_ = cmd.Wait()
+	}()
+
+	engineLogPath := filepath.Join(spool.DefaultDir(), jobID+".engine.log")
+	_ = os.WriteFile(engineLogPath, []byte("Attached engine output line\n"), 0644)
+	defer os.Remove(engineLogPath)
+
+	err := executeJob(context.Background(), srv.URL, jobID, workDir, "", "ordinary", "c0ffee-attach", strconv.Itoa(cmd.Process.Pid))
+	if err != nil {
+		t.Fatalf("executeJob failed: %v", err)
+	}
+
+	var foundAttachMsg bool
+	for _, chunk := range postedChunks {
+		if strings.Contains(chunk, "[attach_mode]") {
+			foundAttachMsg = true
+			break
+		}
+	}
+	if !foundAttachMsg {
+		t.Fatalf("expected [attach_mode] chunk in postedChunks, got: %v", postedChunks)
+	}
+	_ = postedExitCode
+}
+
+func TestExecuteJob_AttachRunningTool_ContextCanceled(t *testing.T) {
+	workDir := t.TempDir()
+	jobID := "job-attach-cancel"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") || strings.HasSuffix(r.URL.Path, "/ticks") || strings.HasSuffix(r.URL.Path, "/conversations") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/"+jobID {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:           jobID,
+				Kind:         "ordinary",
+				Engine:       "agy",
+				Prompt:       "test prompt",
+				StoryID:      "STORY-ATTACH-002",
+				WorktreePath: workDir,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cmd := exec.Command("sleep", "2")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start mock tool process: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(150*time.Millisecond, cancel)
+
+	_ = executeJob(ctx, srv.URL, jobID, workDir, "", "ordinary", "c0ffee-cancel", strconv.Itoa(cmd.Process.Pid))
+}
+
+func TestRunJobWithContext_AttachToolPIDFlag(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	args := []string{"--api-url", "http://127.0.0.1:9999", "--job-id", "job-flag-test", "--attach-tool-pid", "12345"}
+	_ = runJobWithContext(ctx, args)
+}
+
+func TestRunJobWithContext_Chunk(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+	args := []string{"--api-url", srv.URL, "--job-id", "job-chunk", "--chunk", "hello world"}
+	if err := runJobWithContext(context.Background(), args); err != nil {
+		t.Fatalf("expected nil err, got %v", err)
+	}
+}
+
+func TestRunServiceCommand_DryRun(t *testing.T) {
+	_ = runServiceCommand([]string{"install", "--dry-run"})
+	_ = runServiceCommand([]string{"dev-install", "--dry-run"})
+	_ = runServiceCommand([]string{"pause", "--dry-run"})
+	_ = runServiceCommand([]string{"resume", "--dry-run"})
+	_ = runServiceCommand([]string{"revive", "--dry-run"})
+	_ = runServiceCommand([]string{"uninstall", "--dry-run"})
+	_ = runServiceCommand([]string{"unknown-action"})
+}
+
+
