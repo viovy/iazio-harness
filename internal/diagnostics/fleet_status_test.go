@@ -108,6 +108,21 @@ func TestInspectRepoFleetStatus_DirtyAndLocked(t *testing.T) {
 	}
 }
 
+func TestParseSubmoduleStatus_Variants(t *testing.T) {
+	res := &RepoFleetStatusResult{}
+	cleanPath := t.TempDir()
+
+	subOut := "+1234567 sub1 (heads/main)\n-abcdef0 sub2\nU0000000 sub3\n"
+	parseSubmoduleStatus(context.Background(), cleanPath, subOut, res)
+
+	if len(res.SubmoduleDrift) != 1 || res.SubmoduleDrift[0] != "sub1" {
+		t.Errorf("expected sub1 in drift, got: %v", res.SubmoduleDrift)
+	}
+	if len(res.DirtySubmodules) != 2 {
+		t.Errorf("expected 2 dirty submodules (sub2, sub3), got: %v", res.DirtySubmodules)
+	}
+}
+
 func TestSubmoduleDriftClassification(t *testing.T) {
 	// Porcelain v2 output with clean submodule commit drift (SC..)
 	driftOut := `# branch.oid 1111111111111111111111111111111111111111

@@ -119,11 +119,12 @@ func PostTick(ctx context.Context, baseURL, token, jobID string, silentForMs int
 // PostConversation registers an early or streamed conversation ID with the control plane.
 // PostConversationOptions specifies fallback and lineage flags when attaching a conversation.
 type PostConversationOptions struct {
-	Fallback       bool   `json:"fallback,omitempty"`
-	FallbackReason string `json:"fallback_reason,omitempty"`
-	Role           string `json:"role,omitempty"`
-	CLIArgs        string `json:"cli_args,omitempty"`
-	ASEPhase       string `json:"ase_phase,omitempty"`
+	Fallback          bool           `json:"fallback,omitempty"`
+	FallbackReason    string         `json:"fallback_reason,omitempty"`
+	Role              string         `json:"role,omitempty"`
+	CLIArgs           string         `json:"cli_args,omitempty"`
+	ASEPhase          string         `json:"ase_phase,omitempty"`
+	RehydrationStatus map[string]any `json:"rehydration_status,omitempty"`
 }
 
 func PostConversation(ctx context.Context, baseURL, token, jobID, conversationID string) error {
@@ -150,11 +151,33 @@ func PostConversationWithOptions(ctx context.Context, baseURL, token, jobID, con
 	if opt.ASEPhase != "" {
 		payload["ase_phase"] = opt.ASEPhase
 	}
+	if opt.RehydrationStatus != nil {
+		payload["rehydration_status"] = opt.RehydrationStatus
+	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/conversations", token, raw, "conversation post")
+}
+
+// PostJobReadiness reports workspace readiness, reap results, and rehydration status to iazio-harness-api.
+func PostJobReadiness(ctx context.Context, baseURL, token, jobID string, reapResult, manifest, rehydrationStatus map[string]any) error {
+	payload := map[string]any{}
+	if reapResult != nil {
+		payload["reap_result"] = reapResult
+	}
+	if manifest != nil {
+		payload["workspace_state_manifest"] = manifest
+	}
+	if rehydrationStatus != nil {
+		payload["rehydration_status"] = rehydrationStatus
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/readiness", token, raw, "readiness post")
 }
 
 // JobDetail carries the execution specification from iazio-harness-api.
@@ -277,4 +300,59 @@ func PostStoryDraft(ctx context.Context, baseURL, token, jobID, storyID, body st
 		return err
 	}
 	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/story-draft", token, raw, "story draft post")
+}
+
+// ToolActionSummary captures a structured action/outcome from the prior conversation.
+type ToolActionSummary struct {
+	Step    int    `json:"step"`
+	Tool    string `json:"tool"`
+	Action  string `json:"action"`
+	Summary string `json:"summary"`
+	Status  string `json:"status"`
+}
+
+// RehydrationBundle contains the synthesized context necessary to bootstrap a fallback conversation.
+type RehydrationBundle struct {
+	ConversationID         string              `json:"conversation_id"`
+	JobID                  string              `json:"job_id,omitempty"`
+	StoryID                string              `json:"story_id,omitempty"`
+	StorySpecification     string              `json:"story_specification,omitempty"`
+	AcceptanceCriteria     []string            `json:"acceptance_criteria,omitempty"`
+	CompletedPhases        []string            `json:"completed_phases,omitempty"`
+	InterruptedPhase       string              `json:"interrupted_phase,omitempty"`
+	InterruptedStep        string              `json:"interrupted_step,omitempty"`
+	RemainingChecklist     []string            `json:"remaining_checklist,omitempty"`
+	LastToolActions        []ToolActionSummary `json:"last_tool_actions,omitempty"`
+	WorkspaceStateManifest map[string]any      `json:"workspace_state_manifest,omitempty"`
+	BootstrapPrompt        string              `json:"bootstrap_prompt"`
+	GeneratedAt            time.Time           `json:"generated_at"`
+}
+
+// GetRehydrationBundle fetches the canonical transcript recovery bundle for a conversation from the control plane.
+func GetRehydrationBundle(ctx context.Context, baseURL, token, conversationID string) (RehydrationBundle, error) {
+	var bundle RehydrationBundle
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" {
+		return bundle, fmt.Errorf("conversationID is required")
+	}
+	url := strings.TrimRight(baseURL, "/") + "/api/v1/conversations/" + conversationID + "/rehydration-bundle"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return bundle, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return bundle, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return bundle, fmt.Errorf("get rehydration bundle status: %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&bundle); err != nil {
+		return bundle, fmt.Errorf("decode rehydration bundle: %w", err)
+	}
+	return bundle, nil
 }

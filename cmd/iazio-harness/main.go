@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -271,6 +272,217 @@ func sanitizeStep(v any) string {
 	return res
 }
 
+func hasRunningGitProcess(workspacePath string) bool {
+	cleanWorkspace := filepath.Clean(workspacePath)
+
+	// 1. Linux /proc scanning
+	if procEntries, err := os.ReadDir("/proc"); err == nil {
+		for _, entry := range procEntries {
+			if !entry.IsDir() {
+				continue
+			}
+			cmdlineBytes, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+			if err != nil || len(cmdlineBytes) == 0 {
+				continue
+			}
+			cmdline := string(bytes.ReplaceAll(cmdlineBytes, []byte{0}, []byte(" ")))
+			if strings.HasPrefix(cmdline, "git ") || strings.Contains(cmdline, "/git ") {
+				if strings.Contains(cmdline, cleanWorkspace) {
+					return true
+				}
+				if cwdLink, err := os.Readlink(filepath.Join("/proc", entry.Name(), "cwd")); err == nil {
+					cleanCwd := filepath.Clean(cwdLink)
+					if cleanCwd == cleanWorkspace || strings.HasPrefix(cleanCwd, cleanWorkspace+string(filepath.Separator)) {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	// 2. lsof detection for macOS/Darwin (and BSD)
+	if lsofBin, err := exec.LookPath("lsof"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		out, _ := exec.CommandContext(ctx, lsofBin, "-a", "-c", "git", "+D", cleanWorkspace, "-t").Output()
+		cancel()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return true
+		}
+	}
+
+	// 3. Fallback using ps
+	out, err := exec.Command("ps", "-eo", "command").Output()
+	if err == nil {
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "git") && strings.Contains(line, cleanWorkspace) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isLockFileHeld(lockPath string) bool {
+	cleanPath, err := filepath.Abs(lockPath)
+	if err != nil {
+		cleanPath = filepath.Clean(lockPath)
+	}
+
+	// 1. Linux /proc/*/fd scanning
+	procEntries, err := os.ReadDir("/proc")
+	if err == nil {
+		for _, entry := range procEntries {
+			if !entry.IsDir() {
+				continue
+			}
+			pidStr := entry.Name()
+			if pidStr == "self" || pidStr == "thread-self" {
+				continue
+			}
+			fdDir := filepath.Join("/proc", pidStr, "fd")
+			fds, err := os.ReadDir(fdDir)
+			if err != nil {
+				continue
+			}
+			for _, fd := range fds {
+				target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
+				if err == nil && filepath.Clean(target) == cleanPath {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// 2. lsof detection for macOS / Darwin / Unix
+	if lsofBin, err := exec.LookPath("lsof"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		out, _ := exec.CommandContext(ctx, lsofBin, cleanPath, "-t").Output()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return true
+		}
+		return false
+	}
+
+	// 3. Fallback: if fuser exists
+	if fuserBin, err := exec.LookPath("fuser"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		out, _ := exec.CommandContext(ctx, fuserBin, cleanPath).Output()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return true
+		}
+		return false
+	}
+
+	// Fail closed if inspection tooling is unavailable and the file exists
+	if _, err := os.Stat(cleanPath); err == nil {
+		return true
+	}
+	return false
+}
+
+func resolveGitDir(workspacePath string) (string, error) {
+	gitDir := filepath.Join(workspacePath, ".git")
+	fi, err := os.Stat(gitDir)
+	if err != nil {
+		return "", err
+	}
+	targetGitDir := gitDir
+	if !fi.IsDir() {
+		if data, err := os.ReadFile(gitDir); err == nil {
+			content := strings.TrimSpace(string(data))
+			if strings.HasPrefix(content, "gitdir:") {
+				targetGitDir = strings.TrimSpace(strings.TrimPrefix(content, "gitdir:"))
+				if !filepath.IsAbs(targetGitDir) {
+					targetGitDir = filepath.Join(workspacePath, targetGitDir)
+				}
+			}
+		}
+	}
+	return targetGitDir, nil
+}
+
+func hasRemainingGitLocks(workspacePath string) bool {
+	targetGitDir, err := resolveGitDir(workspacePath)
+	if err != nil {
+		return false
+	}
+
+	rootLocks := []string{
+		filepath.Join(targetGitDir, "index.lock"),
+		filepath.Join(targetGitDir, "HEAD.lock"),
+		filepath.Join(targetGitDir, "config.lock"),
+	}
+	for _, l := range rootLocks {
+		if _, err := os.Stat(l); err == nil {
+			return true
+		}
+	}
+
+	modulesDir := filepath.Join(targetGitDir, "modules")
+	var foundLock bool
+	if _, err := os.Stat(modulesDir); err == nil {
+		_ = filepath.Walk(modulesDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || foundLock {
+				return nil
+			}
+			if !info.IsDir() && strings.HasSuffix(info.Name(), ".lock") {
+				foundLock = true
+			}
+			return nil
+		})
+	}
+	return foundLock
+}
+
+func cleanStaleGitLocks(workspacePath string) []string {
+	var removed []string
+	if hasRunningGitProcess(workspacePath) {
+		return removed
+	}
+	targetGitDir, err := resolveGitDir(workspacePath)
+	if err != nil {
+		return removed
+	}
+
+	rootLocks := []string{
+		filepath.Join(targetGitDir, "index.lock"),
+		filepath.Join(targetGitDir, "HEAD.lock"),
+		filepath.Join(targetGitDir, "config.lock"),
+	}
+	for _, l := range rootLocks {
+		if _, err := os.Stat(l); err == nil {
+			if !isLockFileHeld(l) {
+				if err := os.Remove(l); err == nil {
+					removed = append(removed, l)
+				}
+			}
+		}
+	}
+
+	modulesDir := filepath.Join(targetGitDir, "modules")
+	if _, err := os.Stat(modulesDir); err == nil {
+		_ = filepath.Walk(modulesDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil {
+				return nil
+			}
+			if !info.IsDir() && strings.HasSuffix(info.Name(), ".lock") {
+				if !isLockFileHeld(path) {
+					if err := os.Remove(path); err == nil {
+						removed = append(removed, path)
+					}
+				}
+			}
+			return nil
+		})
+	}
+	return removed
+}
+
 func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
 	var spanOpts = []telemetry.SpanOption{
 		telemetry.WithKind("INTERNAL"),
@@ -344,6 +556,17 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		PID:          os.Getpid(),
 		Status:       watchdog.StatusRunning,
 	})
+
+	cleanedLocks := cleanStaleGitLocks(targetDir)
+	cleanLocksStatus := !hasRunningGitProcess(targetDir) && !hasRemainingGitLocks(targetDir)
+	manifest := map[string]any{
+		"clean_locks":         cleanLocksStatus,
+		"stale_locks_removed": len(cleanedLocks),
+	}
+	_ = controlplane.PostJobReadiness(context.Background(), api, token, jobID, nil, manifest, nil)
+	if len(cleanedLocks) > 0 {
+		log.Printf("[harness] Pre-execution workspace check: removed %d stale git lock files in %s", len(cleanedLocks), targetDir)
+	}
 
 	lock, err := engines.Hold(targetDir, "")
 	if err != nil {
@@ -486,6 +709,42 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			// C6: SessionExists is advisory; do not abort attach since agy state may reside in non-standard/relocated data dirs.
 			// Stage 2 fallback handles real attachment failures safely.
 			log.Printf("[harness] advisory: initial conversation %s not found in standard brain directories; attempting attach with engine %s anyway (Stage 2 fallback armed)", resumeConvID, engineName)
+		}
+	}
+
+	var preflightRehydrationStatus map[string]any
+	if isPreflightFallback && attemptedResumeConv != "" {
+		bundle, bundleErr := controlplane.GetRehydrationBundle(ctx, api, token, attemptedResumeConv)
+		if bundleErr != nil {
+			warnMsg := fmt.Sprintf("[iazio-harness] Warning: Failed to fetch canonical rehydration bundle for %s: %v\n", attemptedResumeConv, bundleErr)
+			_ = sp.AppendRaw("stderr", []byte(warnMsg))
+			_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", warnMsg)
+			preflightRehydrationStatus = map[string]any{
+				"hydrated":               false,
+				"source_conversation_id": attemptedResumeConv,
+				"error":                  bundleErr.Error(),
+			}
+		} else if bundle.BootstrapPrompt != "" {
+			prepRes.Prompt = bundle.BootstrapPrompt + "\n\n" + prepRes.Prompt
+			diagMsg := fmt.Sprintf("[iazio-harness] Injected canonical rehydration bundle from %s (interrupted phase: %s)\n",
+				attemptedResumeConv, bundle.InterruptedPhase)
+			_ = sp.AppendRaw("stdout", []byte(diagMsg))
+			preflightRehydrationStatus = map[string]any{
+				"hydrated":                true,
+				"source_conversation_id":  attemptedResumeConv,
+				"turns_count":             len(bundle.LastToolActions),
+				"last_tool_actions_count": len(bundle.LastToolActions),
+				"ase_phase":               bundle.InterruptedPhase,
+			}
+		} else {
+			preflightRehydrationStatus = map[string]any{
+				"hydrated":               false,
+				"source_conversation_id": attemptedResumeConv,
+				"error":                  "empty rehydration bundle",
+			}
+		}
+		if preflightRehydrationStatus != nil {
+			_ = controlplane.PostJobReadiness(context.Background(), api, token, jobID, nil, nil, preflightRehydrationStatus)
 		}
 	}
 
@@ -731,11 +990,12 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 					}
 				}
 				opt := controlplane.PostConversationOptions{
-					Fallback:       fb,
-					FallbackReason: fbReason,
-					Role:           r,
-					CLIArgs:        actualCLIArgs,
-					ASEPhase:       phase,
+					Fallback:          fb,
+					FallbackReason:    fbReason,
+					Role:              r,
+					CLIArgs:           actualCLIArgs,
+					ASEPhase:          phase,
+					RehydrationStatus: preflightRehydrationStatus,
 				}
 				for attempt := 1; attempt <= 10; attempt++ {
 					err = controlplane.PostConversationWithOptions(context.Background(), api, token, jobID, c, opt)
@@ -834,6 +1094,45 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		isPreflightFallback = true
 		preflightFallbackReason = fallbackReason
 		convMu.Unlock()
+
+		// Fetch Canonical Rehydration Bundle from control plane
+		var stage2RehydrationStatus map[string]any
+		if resumeConvID != "" {
+			bundle, bundleErr := controlplane.GetRehydrationBundle(ctx, api, token, resumeConvID)
+			if bundleErr != nil {
+				warnMsg := fmt.Sprintf("[iazio-harness] Warning: Failed to fetch canonical rehydration bundle for %s: %v\n", resumeConvID, bundleErr)
+				_ = sp.AppendRaw("stderr", []byte(warnMsg))
+				_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", warnMsg)
+				stage2RehydrationStatus = map[string]any{
+					"hydrated":               false,
+					"source_conversation_id": resumeConvID,
+					"error":                  bundleErr.Error(),
+				}
+			} else if bundle.BootstrapPrompt != "" {
+				fallbackReq.Prompt = bundle.BootstrapPrompt + "\n\n" + fallbackReq.Prompt
+				diagMsg := fmt.Sprintf("[iazio-harness] Injected canonical rehydration bundle from %s into fallback conversation (interrupted phase: %s, completed phases: %v)\n",
+					resumeConvID, bundle.InterruptedPhase, bundle.CompletedPhases)
+				_ = sp.AppendRaw("stdout", []byte(diagMsg))
+				_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", diagMsg)
+				stage2RehydrationStatus = map[string]any{
+					"hydrated":                true,
+					"source_conversation_id":  resumeConvID,
+					"turns_count":             len(bundle.LastToolActions),
+					"last_tool_actions_count": len(bundle.LastToolActions),
+					"ase_phase":               bundle.InterruptedPhase,
+				}
+			} else {
+				stage2RehydrationStatus = map[string]any{
+					"hydrated":               false,
+					"source_conversation_id": resumeConvID,
+					"error":                  "empty rehydration bundle",
+				}
+			}
+			if stage2RehydrationStatus != nil {
+				preflightRehydrationStatus = stage2RehydrationStatus
+				_ = controlplane.PostJobReadiness(context.Background(), api, token, jobID, nil, nil, stage2RehydrationStatus)
+			}
+		}
 
 		if job.InterruptedASEState != nil && len(job.InterruptedASEState) > 0 {
 			phase, _ := job.InterruptedASEState["phase"].(string)

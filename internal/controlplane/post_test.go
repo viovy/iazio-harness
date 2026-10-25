@@ -49,6 +49,40 @@ func TestPostTick(t *testing.T) {
 	}
 }
 
+func TestGetRehydrationBundle(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/conversations/conv-test-999/rehydration-bundle" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer test-tok" {
+			t.Fatalf("expected Bearer test-tok, got: %s", r.Header.Get("Authorization"))
+		}
+		_ = json.NewEncoder(w).Encode(RehydrationBundle{
+			ConversationID:     "conv-test-999",
+			InterruptedPhase:   "IMPLEMENTATION",
+			BootstrapPrompt:    "BOOTSTRAP CONTENT",
+			AcceptanceCriteria: []string{"- [ ] AC1"},
+		})
+	}))
+	defer srv.Close()
+
+	bundle, err := GetRehydrationBundle(context.Background(), srv.URL, "test-tok", "conv-test-999")
+	if err != nil {
+		t.Fatalf("GetRehydrationBundle failed: %v", err)
+	}
+	if bundle.ConversationID != "conv-test-999" {
+		t.Errorf("expected conv-test-999, got: %s", bundle.ConversationID)
+	}
+	if bundle.BootstrapPrompt != "BOOTSTRAP CONTENT" {
+		t.Errorf("expected BOOTSTRAP CONTENT, got: %s", bundle.BootstrapPrompt)
+	}
+
+	// Empty conversation ID should fail
+	if _, err := GetRehydrationBundle(context.Background(), srv.URL, "test-tok", ""); err == nil {
+		t.Errorf("expected error for empty conversation id")
+	}
+}
+
 func TestGetJob(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/jobs/job-123" {
@@ -279,4 +313,28 @@ func TestControlplaneExtraCoverage(t *testing.T) {
 
 	// 6. Non-retryable GetJob on non-transient status
 	_, _ = GetJob(context.Background(), srv.URL, "tok", "fail-post")
+}
+
+func TestPostJobReadiness(t *testing.T) {
+	var receivedBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/jobs/job-readiness-test/readiness" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	reap := map[string]any{"orphans_reaped": 1}
+	manifest := map[string]any{"clean_locks": true}
+	rehyd := map[string]any{"hydrated": true, "turns_count": 15}
+	err := PostJobReadiness(context.Background(), srv.URL, "test-tok", "job-readiness-test", reap, manifest, rehyd)
+	if err != nil {
+		t.Fatalf("PostJobReadiness failed: %v", err)
+	}
+	if receivedBody["reap_result"] == nil || receivedBody["workspace_state_manifest"] == nil || receivedBody["rehydration_status"] == nil {
+		t.Fatalf("expected all 3 objects in readiness payload: %v", receivedBody)
+	}
 }
