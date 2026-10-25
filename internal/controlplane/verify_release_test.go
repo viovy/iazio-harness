@@ -39,7 +39,7 @@ func TestVerifyLiveRelease_Success(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	mux.HandleFunc("GET /api/v1/agents/mac-mini/meta-repo-03/jobs/job-1311", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v1/jobs/job-1311", func(w http.ResponseWriter, r *http.Request) {
 		resp := map[string]any{
 			"id":                      "job-1311",
 			"initial_conversation_id": "aad902c8-bda6-44c7-8a68-c468a1562399",
@@ -48,7 +48,7 @@ func TestVerifyLiveRelease_Success(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	mux.HandleFunc("GET /api/v1/agents/mac-mini/meta-repo-03/jobs/job-1313", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v1/jobs/job-1313", func(w http.ResponseWriter, r *http.Request) {
 		resp := map[string]any{
 			"id":                      "job-1313",
 			"parent_job_id":           "job-1311",
@@ -150,7 +150,7 @@ func TestVerifyLiveRelease_Job1311Mismatch(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
-	mux.HandleFunc("GET /api/v1/agents/mac-mini/meta-repo-03/jobs/job-1311", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v1/jobs/job-1311", func(w http.ResponseWriter, r *http.Request) {
 		resp := map[string]any{"id": "job-1311", "initial_conversation_id": "wrong-uuid"}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -176,11 +176,11 @@ func TestVerifyLiveRelease_Job1313Mismatch(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
-	mux.HandleFunc("GET /api/v1/agents/mac-mini/meta-repo-03/jobs/job-1311", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v1/jobs/job-1311", func(w http.ResponseWriter, r *http.Request) {
 		resp := map[string]any{"id": "job-1311", "initial_conversation_id": "aad902c8-bda6-44c7-8a68-c468a1562399"}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
-	mux.HandleFunc("GET /api/v1/agents/mac-mini/meta-repo-03/jobs/job-1313", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v1/jobs/job-1313", func(w http.ResponseWriter, r *http.Request) {
 		resp := map[string]any{
 			"id":                      "job-1313",
 			"parent_job_id":           "job-wrong",
