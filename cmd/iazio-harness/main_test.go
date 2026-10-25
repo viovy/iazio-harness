@@ -2311,6 +2311,9 @@ fi
 }
 
 func TestExecuteJob_AutoResume_ExitCodeZeroWithUnmetGates(t *testing.T) {
+	mockHome := t.TempDir()
+	t.Setenv("HOME", mockHome)
+
 	mockDir := t.TempDir()
 	countFile := filepath.Join(mockDir, "invocations.txt")
 	argsFile := filepath.Join(mockDir, "args.txt")
@@ -2324,8 +2327,8 @@ func TestExecuteJob_AutoResume_ExitCodeZeroWithUnmetGates(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(workDir, "init.txt"), []byte("init"), 0644)
 	storyDir := filepath.Join(workDir, "docs", "stories")
 	_ = os.MkdirAll(storyDir, 0755)
-	storyFile := filepath.Join(storyDir, "2026-10-25-gov-3693-test.story.md")
-	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3693\nstatus: IN_PROGRESS\n---\n"), 0644)
+	storyFile := filepath.Join(storyDir, "2026-10-25-gov-99999-test.story.md")
+	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-99999\nstatus: IN_PROGRESS\n---\n"), 0644)
 	_ = exec.Command("git", "-C", workDir, "add", ".gitignore", "init.txt", "docs/").Run()
 	_ = exec.Command("git", "-C", workDir, "commit", "-m", "initial commit").Run()
 
@@ -2336,12 +2339,12 @@ echo "run" >> "%s"
 echo "$@" >> "%s"
 RUNS=$(wc -l < "%s")
 if [ "$RUNS" -eq 1 ]; then
-  echo "Conversation ID: turn0-unmet-gates-12345678"
+  echo "Conversation ID: 11112222-3333-4444-5555-666677778888"
   echo "modified file" >> "%s"
   exit 0
 else
   rm -f "%s"
-  printf -- "---\nid: STORY-GOV-3693\nstatus: DONE\n---\n" > "%s"
+  printf -- "---\nid: STORY-GOV-99999\nstatus: DONE\n---\n" > "%s"
   git -C "%s" commit -am "mark story done" >/dev/null 2>&1
   echo "Turn 2 completed cleanly"
   exit 0
@@ -2391,8 +2394,8 @@ fi
 				ID:           "job-unmet-gates",
 				Kind:         "story",
 				Engine:       "agy",
-				Prompt:       "/autonomous-story-execution implement STORY-GOV-3693",
-				StoryID:      "STORY-GOV-3693",
+				Prompt:       "/autonomous-story-execution implement STORY-GOV-99999",
+				StoryID:      "STORY-GOV-99999",
 				WorktreePath: workDir,
 			})
 			return
@@ -2416,7 +2419,7 @@ fi
 	}
 
 	argsData, _ := os.ReadFile(argsFile)
-	if !strings.Contains(string(argsData), "--conversation=") {
+	if !strings.Contains(string(argsData), "--conversation=11112222-3333-4444-5555-666677778888") {
 		t.Fatalf("expected continuation invocation to bind conversation, got: %s", string(argsData))
 	}
 	if !strings.Contains(string(argsData), "resume — continue autonomous story execution") {

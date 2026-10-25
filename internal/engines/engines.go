@@ -634,7 +634,11 @@ func (w rawWriter) Write(p []byte) (int, error) {
 			} else {
 				combined = string(p)
 			}
-			if cid := extractConversationID(combined, w.resumeConvID); cid != "" {
+			cid := extractConversationID(combined, w.resumeConvID)
+			if cid == "" {
+				cid = extractConversationIDFromText(combined, w.resumeConvID)
+			}
+			if cid != "" {
 				if w.resumeConvID != "" && cid != w.resumeConvID {
 					// Ignore foreign conversation ID emitted on stdout/stderr during a resume run (Finding M1)
 				} else {
