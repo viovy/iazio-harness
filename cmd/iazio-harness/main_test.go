@@ -2310,5 +2310,123 @@ fi
 	}
 }
 
+func TestExecuteJob_AutoResume_ExitCodeZeroWithUnmetGates(t *testing.T) {
+	mockDir := t.TempDir()
+	countFile := filepath.Join(mockDir, "invocations.txt")
+	argsFile := filepath.Join(mockDir, "args.txt")
+	mockAgy := filepath.Join(mockDir, "agy")
+
+	workDir := t.TempDir()
+	_ = exec.Command("git", "init", workDir).Run()
+	_ = exec.Command("git", "-C", workDir, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", workDir, "config", "user.name", "Test").Run()
+	_ = os.WriteFile(filepath.Join(workDir, ".gitignore"), []byte("tmp/\n.autopilot/\n.iazio/\ninvocations.txt\nargs.txt\n"), 0644)
+	_ = os.WriteFile(filepath.Join(workDir, "init.txt"), []byte("init"), 0644)
+	storyDir := filepath.Join(workDir, "docs", "stories")
+	_ = os.MkdirAll(storyDir, 0755)
+	storyFile := filepath.Join(storyDir, "2026-10-25-gov-3693-test.story.md")
+	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3693\nstatus: IN_PROGRESS\n---\n"), 0644)
+	_ = exec.Command("git", "-C", workDir, "add", ".gitignore", "init.txt", "docs/").Run()
+	_ = exec.Command("git", "-C", workDir, "commit", "-m", "initial commit").Run()
+
+	dirtyFile := filepath.Join(workDir, "uncommitted.txt")
+
+	script := fmt.Sprintf(`#!/bin/sh
+echo "run" >> "%s"
+echo "$@" >> "%s"
+RUNS=$(wc -l < "%s")
+if [ "$RUNS" -eq 1 ]; then
+  echo "Conversation ID: turn0-unmet-gates-12345678"
+  echo "modified file" >> "%s"
+  exit 0
+else
+  rm -f "%s"
+  printf -- "---\nid: STORY-GOV-3693\nstatus: DONE\n---\n" > "%s"
+  git -C "%s" commit -am "mark story done" >/dev/null 2>&1
+  echo "Turn 2 completed cleanly"
+  exit 0
+fi
+`, countFile, argsFile, countFile, dirtyFile, dirtyFile, storyFile, workDir)
+
+	_ = os.WriteFile(mockAgy, []byte(script), 0755)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	var postedExitCode int
+	var postedChunks []string
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if txt, ok := body["text"].(string); ok {
+				mu.Lock()
+				postedChunks = append(postedChunks, txt)
+				mu.Unlock()
+			}
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/story-binding") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/exit") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if ec, ok := body["exit_code"].(float64); ok {
+				postedExitCode = int(ec)
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-unmet-gates" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:           "job-unmet-gates",
+				Kind:         "story",
+				Engine:       "agy",
+				Prompt:       "/autonomous-story-execution implement STORY-GOV-3693",
+				StoryID:      "STORY-GOV-3693",
+				WorktreePath: workDir,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := executeJob(context.Background(), srv.URL, "job-unmet-gates", workDir, "")
+	if err != nil {
+		t.Fatalf("executeJob failed: %v", err)
+	}
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("reading count file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 invocations (1 initial + 1 continuation), got %d: %v", len(lines), lines)
+	}
+
+	argsData, _ := os.ReadFile(argsFile)
+	if !strings.Contains(string(argsData), "--conversation=") {
+		t.Fatalf("expected continuation invocation to bind conversation, got: %s", string(argsData))
+	}
+	if !strings.Contains(string(argsData), "resume — continue autonomous story execution") {
+		t.Fatalf("expected continuation prompt in args, got: %s", string(argsData))
+	}
+	if postedExitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", postedExitCode)
+	}
+}
+
+
 
 
