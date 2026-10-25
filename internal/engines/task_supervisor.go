@@ -236,7 +236,7 @@ type TaskSupervisor struct {
 
 // NewTaskSupervisor creates and starts an activity-aware background task supervisor.
 func NewTaskSupervisor(parentPID int, stream EventStream, timeout ...time.Duration) *TaskSupervisor {
-	inactTimeout := time.Duration(0)
+	inactTimeout := DefaultBackgroundIdleGrace
 	if len(timeout) > 0 && timeout[0] > 0 {
 		inactTimeout = timeout[0]
 	} else if env := os.Getenv("IAZIO_BACKGROUND_IDLE_GRACE_SEC"); env != "" {
