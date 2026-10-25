@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1811,5 +1812,100 @@ func TestCleanStaleGitLocks_PreservesHeldLock(t *testing.T) {
 
 	if _, err := os.Stat(rootLock); err != nil {
 		t.Fatalf("expected held root lock to be preserved, got: %v", err)
+	}
+}
+
+func TestSanitizeAlphanumeric_And_SanitizeStep(t *testing.T) {
+	if got := sanitizeAlphanumeric("hello_WORLD-123.test !@#$%^&*()"); got != "hello_WORLD-123.test" {
+		t.Fatalf("expected hello_WORLD-123.test, got: %s", got)
+	}
+	if got := sanitizeStep(nil); got != "0" {
+		t.Fatalf("expected 0 for nil, got: %s", got)
+	}
+	if got := sanitizeStep("abc"); got != "0" {
+		t.Fatalf("expected 0 for abc, got: %s", got)
+	}
+	if got := sanitizeStep("Phase 2: Step 4"); got != "24" {
+		t.Fatalf("expected 24 for digits, got: %s", got)
+	}
+	if got := sanitizeStep(42); got != "42" {
+		t.Fatalf("expected 42, got: %s", got)
+	}
+}
+
+func TestCollectWorkspaceDirtyFiles(t *testing.T) {
+	if got := collectWorkspaceDirtyFiles(""); got != nil {
+		t.Fatalf("expected nil for empty worktree, got: %v", got)
+	}
+	if got := collectWorkspaceDirtyFiles("/non-existent-directory-xyz"); got != nil {
+		t.Fatalf("expected nil for non-existent dir, got: %v", got)
+	}
+
+	tempDir := t.TempDir()
+	cmd := exec.Command("git", "init", tempDir)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to git init: %v", err)
+	}
+
+	untracked := filepath.Join(tempDir, "dirty.txt")
+	if err := os.WriteFile(untracked, []byte("dirty content"), 0644); err != nil {
+		t.Fatalf("failed to write dirty file: %v", err)
+	}
+
+	files := collectWorkspaceDirtyFiles(tempDir)
+	if len(files) == 0 {
+		t.Fatalf("expected dirty files, got empty list")
+	}
+}
+
+func TestResolveGitDir_And_SubmoduleGitDir(t *testing.T) {
+	tempDir := t.TempDir()
+	gitDirFile := filepath.Join(tempDir, ".git")
+	modulesDir := filepath.Join(tempDir, "sub_git_dir")
+	if err := os.MkdirAll(modulesDir, 0755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+
+	if err := os.WriteFile(gitDirFile, []byte("gitdir: sub_git_dir\n"), 0644); err != nil {
+		t.Fatalf("failed to write gitdir file: %v", err)
+	}
+
+	resolved, err := resolveGitDir(tempDir)
+	if err != nil {
+		t.Fatalf("resolveGitDir failed: %v", err)
+	}
+	if resolved != modulesDir {
+		t.Fatalf("expected %s, got: %s", modulesDir, resolved)
+	}
+
+	// Test with remaining locks
+	configLock := filepath.Join(modulesDir, "config.lock")
+	if err := os.WriteFile(configLock, []byte("lock"), 0644); err != nil {
+		t.Fatalf("failed to write lock: %v", err)
+	}
+	if !hasRemainingGitLocks(tempDir) {
+		t.Fatalf("expected hasRemainingGitLocks to be true with config.lock")
+	}
+}
+
+func TestHasRunningGitProcess(t *testing.T) {
+	tempDir := t.TempDir()
+	if hasRunningGitProcess(tempDir) {
+		t.Fatalf("expected false for tempDir without git processes")
+	}
+}
+
+func TestRunServiceCommand(t *testing.T) {
+	// Status
+	if err := runServiceCommand([]string{"status"}); err != nil {
+		t.Fatalf("unexpected error running service status: %v", err)
+	}
+
+	// Dry run install
+	_ = runServiceCommand([]string{"install", "--dry-run"})
+
+	// Unknown action
+	if err := runServiceCommand([]string{"unknown-action-xyz"}); err == nil {
+		t.Fatalf("expected error for unknown action, got nil")
 	}
 }

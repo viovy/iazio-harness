@@ -706,3 +706,12 @@ func TestDevInstall_ErrorsAndStartDaemonErrors(t *testing.T) {
 		t.Error("expected error for missing runner script")
 	}
 }
+
+func TestInstallDarwin_And_InstallWindows(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	t.Setenv("WINDIR", tempHome)
+
+	_ = InstallDarwin("/usr/local/bin/iazio-harness")
+	_ = InstallWindows("/usr/local/bin/iazio-harness.exe")
+}
