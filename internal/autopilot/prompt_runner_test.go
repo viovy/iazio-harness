@@ -328,3 +328,25 @@ func TestCLIPromptRunner_PreFlightHookMaterialization(t *testing.T) {
 		t.Fatalf("expected completed status, got %s", res.Status)
 	}
 }
+
+func TestPromptRunner_RunPrompt_DetectsStoryID(t *testing.T) {
+	fakeBin := makeFakeAutopilot(t)
+	repoDir := initTestGitRepo(t)
+
+	runner := NewPromptRunner(fakeBin)
+	opts := RunPromptOptions{
+		PromptID:   "test-prompt-detect-story",
+		Repo:       "test-submodule",
+		Prompt:     "Please implement STORY-GOV-3688 now",
+		WorkingDir: repoDir,
+		Timeout:    5 * time.Second,
+	}
+
+	res, err := runner.RunPrompt(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("unexpected RunPrompt error: %v", err)
+	}
+	if res.StoryID != "STORY-GOV-3688" {
+		t.Errorf("expected detected StoryID STORY-GOV-3688, got %s", res.StoryID)
+	}
+}
