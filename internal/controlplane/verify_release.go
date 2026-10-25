@@ -88,14 +88,10 @@ func VerifyLiveRelease(ctx context.Context, apiURL, token string) (VerificationR
 
 	// 2. Host mac-mini Lineage & Resume Gate
 	const canonicalInitialConv = "aad902c8-bda6-44c7-8a68-c468a1562399"
-	job1311URL := apiURL + "/api/v1/agents/mac-mini/meta-repo-03/jobs/job-1311"
+	job1311URL := apiURL + "/v1/jobs/job-1311"
 	job1311Body, err := httpGet(ctx, job1311URL, token)
 	if err != nil {
-		job1311URL = apiURL + "/v1/jobs/job-1311"
-		job1311Body, err = httpGet(ctx, job1311URL, token)
-		if err != nil {
-			return res, fmt.Errorf("job-1311 fetch failed: %w", err)
-		}
+		return res, fmt.Errorf("job-1311 fetch failed: %w", err)
 	}
 
 	var j1311 struct {
@@ -109,14 +105,10 @@ func VerifyLiveRelease(ctx context.Context, apiURL, token string) (VerificationR
 		return res, fmt.Errorf("job-1311 initial_conversation_id = %q, want %q", j1311.InitialConversationID, canonicalInitialConv)
 	}
 
-	job1313URL := apiURL + "/api/v1/agents/mac-mini/meta-repo-03/jobs/job-1313"
+	job1313URL := apiURL + "/v1/jobs/job-1313"
 	job1313Body, err := httpGet(ctx, job1313URL, token)
 	if err != nil {
-		job1313URL = apiURL + "/v1/jobs/job-1313"
-		job1313Body, err = httpGet(ctx, job1313URL, token)
-		if err != nil {
-			return res, fmt.Errorf("job-1313 fetch failed: %w", err)
-		}
+		return res, fmt.Errorf("job-1313 fetch failed: %w", err)
 	}
 
 	var j1313 struct {

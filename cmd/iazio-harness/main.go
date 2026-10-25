@@ -1370,7 +1370,7 @@ func runVerifyReleaseCommand(args []string) error {
 		}
 	}
 	if api == "" {
-		api = "https://tian.go.ro"
+		api = "http://127.0.0.1:8080"
 	}
 	if token == "" {
 		if t, err := auth.Bearer(context.Background()); err == nil && t != "" {
