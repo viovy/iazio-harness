@@ -414,3 +414,21 @@ func TestMaterializeLiveStory(t *testing.T) {
 		t.Fatalf("MaterializePendingStories live failed: %v", err)
 	}
 }
+
+func TestIsSubmoduleInGitmodules(t *testing.T) {
+	tmpDir := t.TempDir()
+	gm := filepath.Join(tmpDir, ".gitmodules")
+	_ = os.WriteFile(gm, []byte(`[submodule "iazio-web"]
+	path = iazio-web
+	url = https://github.com/viovy/iazio-web.git
+`), 0644)
+	reg, err := isSubmoduleInGitmodules(gm, "iazio-web")
+	if err != nil || !reg {
+		t.Errorf("expected true from isSubmoduleInGitmodules, got %v, err: %v", reg, err)
+	}
+	reg2, err := isSubmoduleInGitmodules(gm, "nonexistent")
+	if err != nil || reg2 {
+		t.Errorf("expected false for nonexistent submodule, got %v, err: %v", reg2, err)
+	}
+}
+

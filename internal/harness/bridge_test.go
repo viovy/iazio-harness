@@ -275,3 +275,23 @@ func TestContextBudgetExceeded(t *testing.T) {
 		t.Fatalf("expected ErrContextBudgetExceeded, got: %v", err)
 	}
 }
+
+func TestParseSIREnvelope(t *testing.T) {
+	if env, err := ParseSIREnvelope("normal output"); err != nil || env != nil {
+		t.Fatalf("expected nil for normal output")
+	}
+	raw := `prefix {"status": "SIR_BOUNDARY_HALT", "story_id": "test"} suffix`
+	env, err := ParseSIREnvelope(raw)
+	if err != nil || env == nil || env.StoryID != "test" {
+		t.Fatalf("expected parsed envelope, got: %+v, err: %v", env, err)
+	}
+	invalidJSON := `prefix {"status": "SIR_BOUNDARY_HALT", broken json`
+	if _, err := ParseSIREnvelope(invalidJSON); err == nil {
+		t.Fatalf("expected error for broken JSON")
+	}
+	notHalt := `{"status": "OK"}`
+	if env, err := ParseSIREnvelope(notHalt); err != nil || env != nil {
+		t.Fatalf("expected nil for status!=SIR_BOUNDARY_HALT")
+	}
+}
+

@@ -253,3 +253,27 @@ func TestFleetStatus_NonMainSubmoduleAndBranchCleanliness(t *testing.T) {
 		t.Errorf("expected WorktreeState=SUBMODULES_NOT_MAIN, got %s", resSub.WorktreeState)
 	}
 }
+
+func TestDiscoverAgentProcessesFallback_AndReap(t *testing.T) {
+	res := &RepoFleetStatusResult{
+		LockDetails: "lock",
+	}
+	discoverAgentProcessesFallback("/nonexistent/repo/path", res)
+	if res.ToolLiveness != "KILLED" || res.ASEState != "ORPHANED" {
+		t.Errorf("expected KILLED and ORPHANED, got %s and %s", res.ToolLiveness, res.ASEState)
+	}
+
+	res2 := &RepoFleetStatusResult{
+		ASEState: "FAILED_DIRTY",
+	}
+	discoverAgentProcessesFallback("/nonexistent/repo/path", res2)
+	if res2.ToolLiveness != "TERMINATED" {
+		t.Errorf("expected TERMINATED, got %s", res2.ToolLiveness)
+	}
+
+	tmpDir := t.TempDir()
+	if err := ReapOrphanedProcesses(context.Background(), tmpDir); err != nil {
+		t.Errorf("ReapOrphanedProcesses failed: %v", err)
+	}
+}
+

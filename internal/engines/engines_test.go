@@ -1163,3 +1163,30 @@ func TestRawWriter_FiltersRootAgentIdleMessage(t *testing.T) {
 	}
 }
 
+func TestProcessGroupHelpers(t *testing.T) {
+	cmd := exec.Command("sleep", "5")
+	SetProcGroup(cmd)
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
+		t.Errorf("expected Setpgid to be true")
+	}
+	PostStartProcessGroup(cmd)
+	setProcGroup(cmd)
+	postStartProcessGroup(cmd)
+
+	StopProcessGroup(nil)
+	KillProcessGroup(nil)
+	stopProcessGroup(nil)
+	killProcessGroup(nil)
+
+	cmdNil := &exec.Cmd{}
+	StopProcessGroup(cmdNil)
+	KillProcessGroup(cmdNil)
+
+	if err := cmd.Start(); err == nil {
+		StopProcessGroup(cmd)
+		KillProcessGroup(cmd)
+		_ = cmd.Wait()
+	}
+}
+
+

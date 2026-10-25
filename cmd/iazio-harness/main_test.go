@@ -2430,6 +2430,26 @@ fi
 	}
 }
 
+func TestCollectWorkspaceDirtyFiles_AndVerifyRelease(t *testing.T) {
+	if files := collectWorkspaceDirtyFiles(""); files != nil {
+		t.Errorf("expected nil for empty worktree")
+	}
+
+	tmpDir := t.TempDir()
+	_ = exec.Command("git", "init", tmpDir).Run()
+	_ = os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("data"), 0644)
+	dirty := collectWorkspaceDirtyFiles(tmpDir)
+	if len(dirty) == 0 {
+		t.Errorf("expected dirty files, got none")
+	}
+
+	err := runVerifyReleaseCommand([]string{"--api-url", "http://127.0.0.1:54321", "--token", "tok"})
+	if err == nil {
+		t.Errorf("expected error connecting to non-existent server")
+	}
+}
+
+
 
 
 

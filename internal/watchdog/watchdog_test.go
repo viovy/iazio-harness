@@ -240,3 +240,25 @@ func TestFormatActiveChildProcessesSummary(t *testing.T) {
 		t.Errorf("expected summary to contain python3 command and pid, got: %s", summary)
 	}
 }
+
+func TestIsProcessAlive_AndScanPSDescendants(t *testing.T) {
+	myPid := os.Getpid()
+	if !IsProcessAlive(myPid) {
+		t.Fatalf("expected current PID %d to be alive", myPid)
+	}
+	if IsProcessAlive(-1) || IsProcessAlive(0) {
+		t.Fatalf("expected non-positive PID to be dead")
+	}
+
+	cmd := exec.Command("sleep", "2")
+	if err := cmd.Start(); err == nil {
+		defer cmd.Process.Kill()
+		procs, err := scanPSDescendants(myPid)
+		if err != nil {
+			t.Logf("scanPSDescendants returned err: %v", err)
+		} else {
+			t.Logf("scanPSDescendants found %d procs", len(procs))
+		}
+	}
+}
+

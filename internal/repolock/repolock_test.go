@@ -21,6 +21,9 @@ func TestAcquireAndRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Acquire failed: %v", err)
 	}
+	if handle.Worktree() != wt {
+		t.Errorf("expected %s, got %s", wt, handle.Worktree())
+	}
 
 	readInfo, err := Read(wt)
 	if err != nil {
