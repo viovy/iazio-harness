@@ -49,6 +49,40 @@ func TestPostTick(t *testing.T) {
 	}
 }
 
+func TestGetRehydrationBundle(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/conversations/conv-test-999/rehydration-bundle" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer test-tok" {
+			t.Fatalf("expected Bearer test-tok, got: %s", r.Header.Get("Authorization"))
+		}
+		_ = json.NewEncoder(w).Encode(RehydrationBundle{
+			ConversationID:     "conv-test-999",
+			InterruptedPhase:   "IMPLEMENTATION",
+			BootstrapPrompt:    "BOOTSTRAP CONTENT",
+			AcceptanceCriteria: []string{"- [ ] AC1"},
+		})
+	}))
+	defer srv.Close()
+
+	bundle, err := GetRehydrationBundle(context.Background(), srv.URL, "test-tok", "conv-test-999")
+	if err != nil {
+		t.Fatalf("GetRehydrationBundle failed: %v", err)
+	}
+	if bundle.ConversationID != "conv-test-999" {
+		t.Errorf("expected conv-test-999, got: %s", bundle.ConversationID)
+	}
+	if bundle.BootstrapPrompt != "BOOTSTRAP CONTENT" {
+		t.Errorf("expected BOOTSTRAP CONTENT, got: %s", bundle.BootstrapPrompt)
+	}
+
+	// Empty conversation ID should fail
+	if _, err := GetRehydrationBundle(context.Background(), srv.URL, "test-tok", ""); err == nil {
+		t.Errorf("expected error for empty conversation id")
+	}
+}
+
 func TestGetJob(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/jobs/job-123" {

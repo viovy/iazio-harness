@@ -271,6 +271,56 @@ func sanitizeStep(v any) string {
 	return res
 }
 
+func cleanStaleGitLocks(workspacePath string) []string {
+	var removed []string
+	gitDir := filepath.Join(workspacePath, ".git")
+	fi, err := os.Stat(gitDir)
+	if err != nil {
+		return removed
+	}
+	targetGitDir := gitDir
+	if !fi.IsDir() {
+		if data, err := os.ReadFile(gitDir); err == nil {
+			content := strings.TrimSpace(string(data))
+			if strings.HasPrefix(content, "gitdir:") {
+				targetGitDir = strings.TrimSpace(strings.TrimPrefix(content, "gitdir:"))
+				if !filepath.IsAbs(targetGitDir) {
+					targetGitDir = filepath.Join(workspacePath, targetGitDir)
+				}
+			}
+		}
+	}
+
+	rootLocks := []string{
+		filepath.Join(targetGitDir, "index.lock"),
+		filepath.Join(targetGitDir, "HEAD.lock"),
+		filepath.Join(targetGitDir, "config.lock"),
+	}
+	for _, l := range rootLocks {
+		if _, err := os.Stat(l); err == nil {
+			if err := os.Remove(l); err == nil {
+				removed = append(removed, l)
+			}
+		}
+	}
+
+	modulesDir := filepath.Join(targetGitDir, "modules")
+	if _, err := os.Stat(modulesDir); err == nil {
+		_ = filepath.Walk(modulesDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil {
+				return nil
+			}
+			if !info.IsDir() && strings.HasSuffix(info.Name(), ".lock") {
+				if err := os.Remove(path); err == nil {
+					removed = append(removed, path)
+				}
+			}
+			return nil
+		})
+	}
+	return removed
+}
+
 func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
 	var spanOpts = []telemetry.SpanOption{
 		telemetry.WithKind("INTERNAL"),
@@ -344,6 +394,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		PID:          os.Getpid(),
 		Status:       watchdog.StatusRunning,
 	})
+
+	cleanedLocks := cleanStaleGitLocks(targetDir)
+	if len(cleanedLocks) > 0 {
+		log.Printf("[harness] Pre-execution workspace check: removed %d stale git lock files in %s", len(cleanedLocks), targetDir)
+	}
 
 	lock, err := engines.Hold(targetDir, "")
 	if err != nil {
@@ -486,6 +541,16 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			// C6: SessionExists is advisory; do not abort attach since agy state may reside in non-standard/relocated data dirs.
 			// Stage 2 fallback handles real attachment failures safely.
 			log.Printf("[harness] advisory: initial conversation %s not found in standard brain directories; attempting attach with engine %s anyway (Stage 2 fallback armed)", resumeConvID, engineName)
+		}
+	}
+
+	if isPreflightFallback && attemptedResumeConv != "" {
+		bundle, bundleErr := controlplane.GetRehydrationBundle(ctx, api, token, attemptedResumeConv)
+		if bundleErr == nil && bundle.BootstrapPrompt != "" {
+			prepRes.Prompt = bundle.BootstrapPrompt + "\n\n" + prepRes.Prompt
+			diagMsg := fmt.Sprintf("[iazio-harness] Injected canonical rehydration bundle from %s (interrupted phase: %s)\n",
+				attemptedResumeConv, bundle.InterruptedPhase)
+			_ = sp.AppendRaw("stdout", []byte(diagMsg))
 		}
 	}
 
@@ -834,6 +899,18 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		isPreflightFallback = true
 		preflightFallbackReason = fallbackReason
 		convMu.Unlock()
+
+		// Fetch Canonical Rehydration Bundle from control plane
+		if resumeConvID != "" {
+			bundle, bundleErr := controlplane.GetRehydrationBundle(ctx, api, token, resumeConvID)
+			if bundleErr == nil && bundle.BootstrapPrompt != "" {
+				fallbackReq.Prompt = bundle.BootstrapPrompt + "\n\n" + fallbackReq.Prompt
+				diagMsg := fmt.Sprintf("[iazio-harness] Injected canonical rehydration bundle from %s into fallback conversation (interrupted phase: %s, completed phases: %v)\n",
+					resumeConvID, bundle.InterruptedPhase, bundle.CompletedPhases)
+				_ = sp.AppendRaw("stdout", []byte(diagMsg))
+				_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", diagMsg)
+			}
+		}
 
 		if job.InterruptedASEState != nil && len(job.InterruptedASEState) > 0 {
 			phase, _ := job.InterruptedASEState["phase"].(string)
