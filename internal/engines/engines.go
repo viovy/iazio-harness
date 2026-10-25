@@ -2,6 +2,7 @@
 package engines
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -627,9 +628,22 @@ func (w rawWriter) Write(p []byte) (int, error) {
 		w.mu.Unlock()
 	}
 	if w.dst != nil {
-		buf := append([]byte(nil), p...)
-		if err := w.dst.AppendRaw(w.stream, buf); err != nil {
-			return 0, err
+		cleaned := p
+		if bytes.Contains(cleaned, []byte("root agent idle; waiting up to")) {
+			lines := bytes.Split(cleaned, []byte("\n"))
+			var filtered [][]byte
+			for _, l := range lines {
+				if !bytes.Contains(l, []byte("root agent idle; waiting up to")) {
+					filtered = append(filtered, l)
+				}
+			}
+			cleaned = bytes.Join(filtered, []byte("\n"))
+		}
+		if len(cleaned) > 0 {
+			buf := append([]byte(nil), cleaned...)
+			if err := w.dst.AppendRaw(w.stream, buf); err != nil {
+				return 0, err
+			}
 		}
 	}
 	return len(p), nil
@@ -822,7 +836,7 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		timeout := req.PrintTimeout
 		if timeout == "" {
 			timeout = "10m"
-		} else if timeout == "0" || timeout == "0s" {
+		} else if timeout == "0" || timeout == "0s" || timeout == "none" || timeout == "unbounded" {
 			timeout = "0"
 		}
 		model := req.Model

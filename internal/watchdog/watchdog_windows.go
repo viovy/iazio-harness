@@ -35,3 +35,12 @@ func defaultIsProcessAlive(pid int) bool {
 	}
 	return exitCode == stillActive
 }
+
+func platformGetDescendantProcesses(rootPID int) ([]ProcessInfo, error) {
+	// On Windows, return empty slice if rootPID <= 0
+	if rootPID <= 0 {
+		return nil, nil
+	}
+	// Windows WMI / tasklist fallback can be added if needed, otherwise return empty
+	return nil, nil
+}

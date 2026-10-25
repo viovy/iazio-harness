@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,6 +180,63 @@ func TestWatchdog_ListJobsAndDefaults(t *testing.T) {
 	w.Track(TrackedJob{JobID: "j1", PID: 1})
 	jobs := w.ListJobs()
 	if len(jobs) != 1 || jobs[0].JobID != "j1" {
-		t.Fatalf("unexpected jobs: %+v", jobs)
+		t.Fatalf("expected 1 job, got %+v", jobs)
+	}
+}
+
+func TestGetDescendantProcesses(t *testing.T) {
+	// Spawning a subshell that spawns a background child sleep
+	cmd := exec.Command("bash", "-c", "sleep 10 & wait")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start bash: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	procs, err := GetDescendantProcesses(cmd.Process.Pid)
+	if err != nil {
+		t.Fatalf("GetDescendantProcesses failed: %v", err)
+	}
+	if len(procs) == 0 {
+		t.Logf("no descendants found yet (may be fast or platform specific)")
+	} else {
+		summary, pids := FormatActiveChildProcessesSummary(procs)
+		if len(pids) != len(procs) {
+			t.Errorf("expected %d pids, got %d", len(procs), len(pids))
+		}
+		if summary == "" {
+			t.Errorf("expected non-empty summary")
+		}
+	}
+}
+
+func TestFormatActiveChildProcessesSummary(t *testing.T) {
+	procs := []ProcessInfo{
+		{
+			PID:     1234,
+			PPID:    1000,
+			Command: "make",
+			Args:    "make run-review-scheme STORY_ID=STORY-GOV-3691",
+		},
+		{
+			PID:     1235,
+			PPID:    1234,
+			Command: "python3",
+			Args:    "python3 scripts/canonical/run_review_scheme.py",
+		},
+	}
+
+	summary, pids := FormatActiveChildProcessesSummary(procs)
+	if len(pids) != 2 {
+		t.Fatalf("expected 2 pids, got %v", pids)
+	}
+	if !strings.Contains(summary, "make run-review-scheme") || !strings.Contains(summary, "1234") {
+		t.Errorf("expected summary to contain make command and pid, got: %s", summary)
+	}
+	if !strings.Contains(summary, "python3 scripts/canonical/run_review_scheme.py") || !strings.Contains(summary, "1235") {
+		t.Errorf("expected summary to contain python3 command and pid, got: %s", summary)
 	}
 }

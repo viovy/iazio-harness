@@ -1135,3 +1135,31 @@ func TestExecute_GrandchildPipeLeakResilience(t *testing.T) {
 		t.Fatalf("expected to capture 'engine-work-complete' in stream events, got: %v", stream.events)
 	}
 }
+
+func TestRawWriter_FiltersRootAgentIdleMessage(t *testing.T) {
+	stream := &testCaptureStream{}
+	w := rawWriter{
+		stream: "stdout",
+		dst:    stream,
+	}
+
+	input := "line 1\nroot agent idle; waiting up to 1h0m0s for 1 background task(s)\nline 2\n"
+	n, err := w.Write([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected write error: %v", err)
+	}
+	if n != len(input) {
+		t.Fatalf("expected n=%d, got %d", len(input), n)
+	}
+
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	combined := strings.Join(stream.events, "")
+	if strings.Contains(combined, "root agent idle; waiting up to") {
+		t.Errorf("expected 'root agent idle; waiting up to' to be filtered out, got:\n%s", combined)
+	}
+	if !strings.Contains(combined, "line 1") || !strings.Contains(combined, "line 2") {
+		t.Errorf("expected remaining lines to be preserved, got:\n%s", combined)
+	}
+}
+
