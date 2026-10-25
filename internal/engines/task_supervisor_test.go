@@ -3,6 +3,7 @@ package engines
 import (
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -134,5 +135,45 @@ func TestFindChildProcesses_FindsSpawnedChildren(t *testing.T) {
 	empty := FindChildProcesses(99999999)
 	if len(empty) != 0 {
 		t.Errorf("expected 0 children for non-existent parent")
+	}
+}
+
+func TestTaskSupervisor_TypeB_IdleDaemonReap(t *testing.T) {
+	dummyParent := exec.Command("sleep", "30")
+	if err := dummyParent.Start(); err != nil {
+		t.Fatalf("failed to start dummy parent: %v", err)
+	}
+	defer func() {
+		if dummyParent.Process != nil {
+			_ = dummyParent.Process.Kill()
+		}
+	}()
+
+	stream := &mockStream{}
+	// Set very short grace & idle threshold for fast unit test
+	sup := NewTaskSupervisor(dummyParent.Process.Pid, stream, 80*time.Millisecond)
+	sup.IdleTaskThreshold = 40 * time.Millisecond
+	sup.MaxWaitDuration = 200 * time.Millisecond
+	defer sup.Stop()
+
+	// Simulate root agent idle wait message (as emitted by agy or opencode)
+	sup.OnOutput([]byte("root agent idle; waiting up to 1h0m0s for 2 background task(s)"))
+
+	// Wait enough for the 40ms Type B idle threshold to trip, well under 45s and never 1 hour
+	time.Sleep(2500 * time.Millisecond)
+
+	if !sup.WasAutoReaped() {
+		t.Fatalf("expected supervisor to have auto-reaped Type B idle background tasks")
+	}
+
+	foundDrainedMsg := false
+	for _, chunk := range stream.chunks {
+		if len(chunk) > 0 && (strings.Contains(chunk, "background_task.drained_on_root_idle") || strings.Contains(chunk, "releasing workspace slot")) {
+			foundDrainedMsg = true
+			break
+		}
+	}
+	if !foundDrainedMsg {
+		t.Errorf("expected drained_on_root_idle stream event, got: %v", stream.chunks)
 	}
 }

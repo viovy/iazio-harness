@@ -203,16 +203,28 @@ func KillChildProcess(pid int) error {
 	return killProcessPlatform(pid)
 }
 
+// Background task activity defaults.
+const (
+	DefaultBackgroundIdleGrace     = 45 * time.Second
+	DefaultBackgroundSubagentStall = 90 * time.Second
+	DefaultIdleTaskThreshold       = 15 * time.Second
+	DefaultMaxCeilingDuration      = 5 * time.Minute
+	DefaultActivityCheckInterval   = 5 * time.Second
+)
+
 // TaskSupervisor monitors engine output for root agent idle states and supervises background tasks.
 type TaskSupervisor struct {
-	ParentPID        int
-	InactivityLimit  time.Duration
-	MaxWaitDuration  time.Duration
-	Stream           EventStream
-	OnTasksReaped    func(tasks []BackgroundTaskInfo)
+	ParentPID         int
+	InactivityLimit   time.Duration
+	SubagentLimit     time.Duration
+	IdleTaskThreshold time.Duration
+	MaxWaitDuration   time.Duration
+	Stream            EventStream
+	OnTasksReaped     func(tasks []BackgroundTaskInfo)
 
 	mu               sync.Mutex
 	rootIdleDetected bool
+	hasSubagents     bool
 	rootIdleAt       time.Time
 	lastOutputAt     time.Time
 	activeTasks      []BackgroundTaskInfo
@@ -224,9 +236,13 @@ type TaskSupervisor struct {
 
 // NewTaskSupervisor creates and starts an activity-aware background task supervisor.
 func NewTaskSupervisor(parentPID int, stream EventStream, timeout ...time.Duration) *TaskSupervisor {
-	inactTimeout := 60 * time.Second
+	inactTimeout := DefaultBackgroundIdleGrace
 	if len(timeout) > 0 && timeout[0] > 0 {
 		inactTimeout = timeout[0]
+	} else if env := os.Getenv("IAZIO_BACKGROUND_IDLE_GRACE_SEC"); env != "" {
+		if sec, err := strconv.Atoi(env); err == nil && sec > 0 {
+			inactTimeout = time.Duration(sec) * time.Second
+		}
 	} else if env := os.Getenv("IAZIO_ROOT_IDLE_TASK_TIMEOUT"); env != "" {
 		if d, err := time.ParseDuration(env); err == nil && d > 0 {
 			inactTimeout = d
@@ -235,18 +251,32 @@ func NewTaskSupervisor(parentPID int, stream EventStream, timeout ...time.Durati
 		}
 	}
 
-	maxWait := 120 * time.Second
+	subagentTimeout := DefaultBackgroundSubagentStall
+	if env := os.Getenv("IAZIO_BACKGROUND_SUBAGENT_STALL_SEC"); env != "" {
+		if sec, err := strconv.Atoi(env); err == nil && sec > 0 {
+			subagentTimeout = time.Duration(sec) * time.Second
+		}
+	}
+
+	idleThreshold := DefaultIdleTaskThreshold
+	if inactTimeout < idleThreshold {
+		idleThreshold = inactTimeout / 2
+	}
+
+	maxWait := DefaultMaxCeilingDuration
 	if inactTimeout*2 > maxWait {
 		maxWait = inactTimeout * 2
 	}
 
 	return &TaskSupervisor{
-		ParentPID:       parentPID,
-		InactivityLimit: inactTimeout,
-		MaxWaitDuration: maxWait,
-		Stream:          stream,
-		lastOutputAt:    time.Now().UTC(),
-		done:            make(chan struct{}),
+		ParentPID:         parentPID,
+		InactivityLimit:   inactTimeout,
+		SubagentLimit:     subagentTimeout,
+		IdleTaskThreshold: idleThreshold,
+		MaxWaitDuration:   maxWait,
+		Stream:            stream,
+		lastOutputAt:      time.Now().UTC(),
+		done:              make(chan struct{}),
 	}
 }
 
@@ -261,6 +291,11 @@ func (s *TaskSupervisor) OnOutput(p []byte) {
 	s.lastOutputAt = time.Now().UTC()
 	text := string(p)
 
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "subagent") || strings.Contains(lower, "sub-agent") {
+		s.hasSubagents = true
+	}
+
 	// Detect root agent idle completion barrier pattern
 	isRootIdleMessage := strings.Contains(text, "root agent idle; waiting up to") ||
 		strings.Contains(text, "WaitForConversationFullyIdle: root agent idle") ||
@@ -274,8 +309,8 @@ func (s *TaskSupervisor) OnOutput(p []byte) {
 		s.activeTasks = children
 
 		if s.Stream != nil {
-			headerMsg := fmt.Sprintf("[ASE-SUPERVISOR] [background_task.supervisor] Root agent idle completion barrier detected with %d background task(s). Armed activity watchdog (inactivity timeout: %v, max wait: %v).\n",
-				len(children), s.InactivityLimit, s.MaxWaitDuration)
+			headerMsg := fmt.Sprintf("[ASE-SUPERVISOR] [background_task.supervisor] Root agent idle completion barrier detected with %d background task(s). Armed active watchdog (grace: %v, idle threshold: %v, ceiling: %v).\n",
+				len(children), s.InactivityLimit, s.IdleTaskThreshold, s.MaxWaitDuration)
 			_ = s.Stream.AppendRaw("stdout", []byte(headerMsg))
 
 			for _, ch := range children {
@@ -293,11 +328,12 @@ func (s *TaskSupervisor) OnOutput(p []byte) {
 }
 
 func (s *TaskSupervisor) supervise() {
-	tickInterval := s.InactivityLimit / 4
-	if tickInterval < 25*time.Millisecond {
-		tickInterval = 25 * time.Millisecond
-	} else if tickInterval > 2*time.Second {
-		tickInterval = 2 * time.Second
+	tickInterval := DefaultActivityCheckInterval
+	if s.InactivityLimit < tickInterval {
+		tickInterval = s.InactivityLimit / 4
+		if tickInterval < 25*time.Millisecond {
+			tickInterval = 25 * time.Millisecond
+		}
 	}
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
@@ -316,7 +352,17 @@ func (s *TaskSupervisor) supervise() {
 			inactiveDur := now.Sub(s.lastOutputAt)
 			totalIdleDur := now.Sub(s.rootIdleAt)
 
-			shouldReap := (inactiveDur >= s.InactivityLimit) || (totalIdleDur >= s.MaxWaitDuration)
+			// Type B: Idle / daemonized background process (zero output for IdleTaskThreshold after root idle)
+			isTypeBIdle := (totalIdleDur >= s.IdleTaskThreshold) && (inactiveDur >= s.IdleTaskThreshold)
+
+			effectiveGrace := s.InactivityLimit
+			if s.hasSubagents && s.SubagentLimit > effectiveGrace {
+				effectiveGrace = s.SubagentLimit
+			}
+			isGraceExpired := inactiveDur >= effectiveGrace
+			isCeilingReached := totalIdleDur >= s.MaxWaitDuration
+
+			shouldReap := isTypeBIdle || isGraceExpired || isCeilingReached
 			if shouldReap {
 				s.wasAutoReaped = true
 				children := FindChildProcesses(s.ParentPID)
@@ -326,7 +372,7 @@ func (s *TaskSupervisor) supervise() {
 				s.reapedTasks = children
 				s.mu.Unlock()
 
-				s.executeReap(children, inactiveDur)
+				s.executeReap(children, inactiveDur, totalIdleDur, isTypeBIdle)
 				return
 			}
 			s.mu.Unlock()
@@ -334,17 +380,21 @@ func (s *TaskSupervisor) supervise() {
 	}
 }
 
-func (s *TaskSupervisor) executeReap(tasks []BackgroundTaskInfo, idleDur time.Duration) {
+func (s *TaskSupervisor) executeReap(tasks []BackgroundTaskInfo, inactiveDur, totalIdleDur time.Duration, isTypeB bool) {
+	classification := "grace_expired"
+	if isTypeB {
+		classification = "idle_daemon_stall"
+	}
 	if s.Stream != nil {
-		reapMsg := fmt.Sprintf("[ASE-SUPERVISOR] [background_task.auto_reaped] Inactivity limit (%v) exceeded while root agent is idle. Terminating %d background task(s) to unblock resume cycle...\n",
-			idleDur.Round(time.Second), len(tasks))
+		reapMsg := fmt.Sprintf("[ASE-SUPERVISOR] [background_task.drained_on_root_idle] Root agent idle drain completed (%s, idle: %v, inactive: %v). Terminating %d background task(s) to release workspace slot...\n",
+			classification, totalIdleDur.Round(time.Millisecond), inactiveDur.Round(time.Millisecond), len(tasks))
 		_ = s.Stream.AppendRaw("stdout", []byte(reapMsg))
 	}
 
 	for _, task := range tasks {
 		_ = KillChildProcess(task.PID)
 		if s.Stream != nil {
-			_ = s.Stream.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] [background_task.auto_reaped] Reaped hung background task PID %d (%s)\n", task.PID, task.Command)))
+			_ = s.Stream.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] [background_task.drained_on_root_idle] Reaped background task PID %d (%s)\n", task.PID, task.Command)))
 		}
 	}
 
@@ -352,10 +402,10 @@ func (s *TaskSupervisor) executeReap(tasks []BackgroundTaskInfo, idleDur time.Du
 		s.OnTasksReaped(tasks)
 	}
 
-	// Sleep 1 second to allow parent process to see child termination and unblock
-	time.Sleep(1 * time.Second)
+	// Sleep 500ms to allow parent process to notice child exit
+	time.Sleep(500 * time.Millisecond)
 
-	// If parent process is still alive after terminating children, send SIGTERM so it completes turn
+	// If parent process is still alive waiting on background barrier, signal it to complete turn
 	if s.ParentPID > 0 {
 		_ = KillChildProcess(s.ParentPID)
 	}
