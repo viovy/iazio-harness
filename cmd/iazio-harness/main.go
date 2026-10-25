@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -483,6 +485,27 @@ func cleanStaleGitLocks(workspacePath string) []string {
 	return removed
 }
 
+// resolveConversationFallback discovers an active or recent conversation ID on disk or in the worktree.
+func resolveConversationFallback(worktree, storyID, engineName string) string {
+	if worktree == "" {
+		return ""
+	}
+	resolver := sessionstore.DefaultResolver()
+	dCtx := resolver.DetectDirtyWorktreeContext(worktree)
+	if dCtx.ConversationID != "" && sessionstore.IsValidConversationID(dCtx.ConversationID) {
+		return dCtx.ConversationID
+	}
+	if storyID != "" {
+		if sess, err := resolver.ResolveForStory(worktree, storyID); err == nil && sess != nil && sessionstore.IsValidConversationID(sess.ConversationID) {
+			return sess.ConversationID
+		}
+	}
+	if sess, err := resolver.ResolveLatest(worktree); err == nil && sess != nil && sessionstore.IsValidConversationID(sess.ConversationID) {
+		return sess.ConversationID
+	}
+	return ""
+}
+
 func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overrides ...string) error {
 	var spanOpts = []telemetry.SpanOption{
 		telemetry.WithKind("INTERNAL"),
@@ -643,28 +666,10 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 		log.Printf("[harness] [job.resume.conversation_fallback] resume_mode=fallback_new_conversation reason=%q", preflightFallbackReason)
 	}
-	if job.Kind == "resume" && !isControlPlaneResume {
-		resolver := sessionstore.DefaultResolver()
-		dCtx := resolver.DetectDirtyWorktreeContext(worktree)
-		if (job.StoryID == "" || strings.EqualFold(job.StoryID, fallbackResumeStoryID) || strings.EqualFold(job.StoryID, "resume complete current ase flow")) && dCtx.StoryID != "" {
-			job.StoryID = dCtx.StoryID
-		}
-		if resumeConvID == "" {
-			if dCtx.ConversationID != "" {
-				resumeConvID = dCtx.ConversationID
-				log.Printf("[harness] Discovered prior conversation %s from dirty context (review: %s, verdict: %s)", resumeConvID, dCtx.ReviewFile, dCtx.Verdict)
-			} else if job.StoryID != "" {
-				if sess, err := resolver.ResolveForStory(worktree, job.StoryID); err == nil && sess != nil {
-					resumeConvID = sess.ConversationID
-				}
-			} else {
-				if sess, err := resolver.ResolveLatest(worktree); err == nil && sess != nil {
-					resumeConvID = sess.ConversationID
-				}
-			}
-		}
+	if resumeConvID == "" && !isControlPlaneResume {
+		resumeConvID = resolveConversationFallback(worktree, job.StoryID, engineName)
 		if resumeConvID != "" {
-			log.Printf("[harness] Standalone resume discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
+			log.Printf("[harness] [ASE-SUPERVISOR] Discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
 		}
 	}
 	lockHandle, lockErr := repolock.Acquire(worktree, repolock.LockInfo{
@@ -771,10 +776,24 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	activeConvID := resumeConvID
 
 	// Immediately post startup diagnostic chunk so UI never sits on blank "Waiting for output..."
-	_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Initializing execution for job %s on %s (engine: %s, kind: %s)\n", jobID, worktree, engineName, job.Kind)))
+	_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] Initializing execution for job %s on %s (engine: %s, kind: %s)\n", jobID, worktree, engineName, job.Kind)))
 	if resumeConvID != "" {
-		_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[iazio-harness] Resuming execution: conversation %s (story: %s, engine: %s)\n", resumeConvID, job.StoryID, engineName)))
+		_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] Conversation resolved: %s --conversation=%s (source: sessionstore/metadata)\n", engineName, resumeConvID)))
+	} else {
+		_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] Starting new conversation session for story %s...\n", storyID)))
 	}
+	initAsePhase := "START"
+	if job.InterruptedASEState != nil {
+		if p, ok := job.InterruptedASEState["phase"].(string); ok && p != "" {
+			initAsePhase = p
+		}
+	}
+	_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] ASE State: story=%s, phase=%s\n", storyID, initAsePhase)))
+	initDirtySummary := "clean"
+	if dFiles := collectWorkspaceDirtyFiles(worktree); len(dFiles) > 0 {
+		initDirtySummary = fmt.Sprintf("dirty (%d files modified/untracked)", len(dFiles))
+	}
+	_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] Fleet Git State: %s\n", initDirtySummary)))
 	_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
 		JobID:          job.ID,
 		ScheduleID:     job.ScheduleID,
@@ -1272,6 +1291,124 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 	}
 
+	// In-Place Conversational Auto-Resume Loop:
+	// If background tasks were auto-reaped or execution stalled on background tasks / timeouts,
+	// do NOT fail the job. Re-invoke the engine in-place with prompt "resume".
+	maxAutoResumes := 5
+	if envMax := os.Getenv("IAZIO_MAX_AUTO_RESUMES"); envMax != "" {
+		if n, err := strconv.Atoi(envMax); err == nil && n > 0 {
+			maxAutoResumes = n
+		}
+	}
+	autoResumeCount := 0
+	lastProgressFp := ""
+
+	isAutoResumeTrigger := func() bool {
+		if execRes.ExitCode == 0 && execErr == nil {
+			return false
+		}
+		if execRes.WasAutoReaped {
+			return true
+		}
+		if execErr != nil && (errors.Is(execErr, context.DeadlineExceeded) || strings.Contains(execErr.Error(), "timeout")) {
+			return true
+		}
+		if strings.Contains(combinedOutput, "root agent idle; waiting up to") ||
+			strings.Contains(combinedOutput, "inactivity limit") ||
+			strings.Contains(combinedOutput, "background_task.auto_reaped") {
+			return true
+		}
+		if os.Getenv("IAZIO_ENABLE_IN_PLACE_AUTO_RESUME") == "1" && execRes.ExitCode != 0 && !diagReport.ASEComplete {
+			return true
+		}
+		return false
+	}
+
+	for isAutoResumeTrigger() && autoResumeCount < maxAutoResumes {
+		autoResumeCount++
+		currentFp := fmt.Sprintf("%d", len(collectWorkspaceDirtyFiles(worktree)))
+		if currentFp == lastProgressFp && autoResumeCount > 2 {
+			break
+		}
+		lastProgressFp = currentFp
+
+		resumeTargetID := activeConvID
+		if resumeTargetID == "" {
+			resumeTargetID = confirmedConvID
+		}
+		if resumeTargetID == "" {
+			resumeTargetID = resumeConvID
+		}
+		if resumeTargetID == "" && !isControlPlaneResume {
+			resumeTargetID = resolveConversationFallback(worktree, job.StoryID, engineName)
+		}
+		if resumeTargetID == "" {
+			break
+		}
+
+		activeConvID = resumeTargetID
+		confirmedConvID = resumeTargetID
+
+		reasonDesc := "turn_interrupted"
+		if execRes.WasAutoReaped {
+			reasonDesc = "hung_background_tasks_reaped"
+		} else if execErr != nil && errors.Is(execErr, context.DeadlineExceeded) {
+			reasonDesc = "execution_timeout"
+		} else if execRes.ExitCode != 0 {
+			reasonDesc = fmt.Sprintf("exit_code_%d", execRes.ExitCode)
+		}
+
+		autoResumeMsg := fmt.Sprintf("\n[ASE-SUPERVISOR] In-place auto-resume triggered (#%d/%d) for job %s (trigger: %s).\n"+
+			"[ASE-SUPERVISOR] Conversation resolved: %s --conversation=%s\n"+
+			"[ASE-SUPERVISOR] ASE State: story=%s, complete=%v\n"+
+			"[ASE-SUPERVISOR] Fleet Git State: %d dirty file(s) preserved\n"+
+			"[ASE-SUPERVISOR] Injecting prompt \"resume\" into %s --conversation=%s...\n\n",
+			autoResumeCount, maxAutoResumes, jobID, reasonDesc,
+			engineName, resumeTargetID,
+			job.StoryID, diagReport.ASEComplete,
+			len(collectWorkspaceDirtyFiles(worktree)),
+			engineName, resumeTargetID,
+		)
+		_ = sp.AppendRaw("stdout", []byte(autoResumeMsg))
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", autoResumeMsg)
+
+		resumeReq := execReq
+		resumeReq.Prompt = "resume — continue autonomous story execution from current ASE and git state until all story completion gates pass"
+		resumeReq.ResumeConversationID = resumeTargetID
+		resumeReq.Argv = nil
+
+		execRes, execErr = runner.Execute(ctx, resumeReq, sp)
+
+		// Flush spool
+		for _, ev := range sp.Flush() {
+			if ev.Type == spool.EventOutputChunk {
+				_ = controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text)
+			}
+		}
+
+		_ = sp.Sync()
+		engineLogData, _ = os.ReadFile(resumeReq.LogFile)
+		stderrLogData, _ = os.ReadFile(strings.TrimSuffix(resumeReq.LogFile, ".log") + ".stderr.log")
+		combinedEngineLog = append(append([]byte(nil), engineLogData...), stderrLogData...)
+		engineLogStr = string(combinedEngineLog)
+		spoolLogData, _ = os.ReadFile(filepath.Join(spool.DefaultDir(), job.ID+".log"))
+		combinedOutput = engineLogStr + "\n" + string(spoolLogData)
+		diagReport = diagnostics.Diagnose(diagnostics.DiagnosticInput{
+			JobID:        job.ID,
+			StoryID:      job.StoryID,
+			WorktreePath: worktree,
+			ExitCode:     execRes.ExitCode,
+			OutputText:   engineLogStr,
+		})
+
+		if execRes.ExitCode == 0 {
+			successMsg := "[ASE-SUPERVISOR] In-place auto-resume completed successfully!\n"
+			_ = sp.AppendRaw("stdout", []byte(successMsg))
+			_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", successMsg)
+			break
+		}
+	}
+
 	if len(diagReport.Findings) > 0 {
 		for _, f := range diagReport.Findings {
 			diagMsg := fmt.Sprintf("[iazio-harness] Anomaly detected: [%s] (%s): %s Remediation: %s\n", f.Code, f.Severity, f.Message, f.Remediation)
@@ -1332,7 +1469,17 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 
 	dirtyFiles := collectWorkspaceDirtyFiles(worktree)
+	if activeConvID == "" && !isControlPlaneResume {
+		activeConvID = resolveConversationFallback(worktree, job.StoryID, engineName)
+		if activeConvID != "" {
+			confirmedConvID = activeConvID
+		}
+	}
 	resumable := (activeConvID != "" || confirmedConvID != "" || resumeConvID != "")
+	if !resumable && (len(job.ConversationIDs) > 0 || job.StoryID != "") {
+		// In-progress story executions and jobs with recorded conversations are always resumable
+		resumable = true
+	}
 	nonResumableReason := ""
 	if !resumable {
 		nonResumableReason = "No conversation session established before termination"

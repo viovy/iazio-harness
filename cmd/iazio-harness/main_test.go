@@ -1909,3 +1909,94 @@ func TestRunServiceCommand(t *testing.T) {
 		t.Fatalf("expected error for unknown action, got nil")
 	}
 }
+
+func TestExecuteJob_AutoResume_HungBackgroundTask(t *testing.T) {
+	mockDir := t.TempDir()
+	countFile := filepath.Join(mockDir, "invocations.txt")
+	argsFile := filepath.Join(mockDir, "args.txt")
+	mockAgy := filepath.Join(mockDir, "agy")
+
+	// Script simulates turn 1 hanging/reaped (outputs [background_task.auto_reaped] and exits 143),
+	// and turn 2 resuming cleanly with exit 0.
+	script := fmt.Sprintf(`#!/bin/sh
+echo "run" >> "%s"
+echo "$@" >> "%s"
+RUNS=$(wc -l < "%s")
+if [ "$RUNS" -eq 1 ]; then
+  echo "Conversation ID: c0ffee00-1234-5678-9abc-def012345678"
+  echo "[ASE-SUPERVISOR] [background_task.auto_reaped] Inactivity limit (60s) exceeded while root agent is idle. Terminating 1 background task(s) to unblock resume cycle..."
+  exit 143
+else
+  echo "Resumed successfully and completed story flow."
+  exit 0
+fi
+`, countFile, argsFile, countFile)
+
+	_ = os.WriteFile(mockAgy, []byte(script), 0755)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	var postedExitCode int
+	var postedChunks []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if txt, ok := body["text"].(string); ok {
+				postedChunks = append(postedChunks, txt)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/exit") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if ec, ok := body["exit_code"].(float64); ok {
+				postedExitCode = int(ec)
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-reap-autoresume" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:           "job-reap-autoresume",
+				Kind:         "ordinary",
+				Engine:       "agy",
+				Prompt:       "execute story flow",
+				StoryID:      "STORY-REAP-001",
+				WorktreePath: workDir,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := executeJob(context.Background(), srv.URL, "job-reap-autoresume", workDir, "")
+	if err != nil {
+		t.Fatalf("executeJob failed: %v", err)
+	}
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("expected count file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected exactly 2 executions (1 failed/reaped + 1 auto-resume), got %d executions", len(lines))
+	}
+
+	argsData, _ := os.ReadFile(argsFile)
+	if !strings.Contains(string(argsData), "resume") {
+		t.Fatalf("expected resume prompt in second invocation, got args:\n%s", string(argsData))
+	}
+	if postedExitCode != 0 {
+		t.Fatalf("expected final posted exit code 0, got %d", postedExitCode)
+	}
+}
