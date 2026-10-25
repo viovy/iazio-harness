@@ -77,7 +77,9 @@ type ExecutionRequest struct {
 
 // ExecutionResult is the child exit state.
 type ExecutionResult struct {
-	ExitCode int
+	ExitCode        int
+	BackgroundTasks []BackgroundTaskInfo
+	WasAutoReaped   bool
 }
 
 // CLI runs agent, agy, or opencode.
@@ -322,8 +324,14 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		}
 	}
 
-	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentOut, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: nil}
-	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentErr, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: stderrLogFile}
+	var supervisor *TaskSupervisor
+	if cmd.Process != nil && cmd.Process.Pid > 0 {
+		supervisor = NewTaskSupervisor(cmd.Process.Pid, stream)
+		defer supervisor.Stop()
+	}
+
+	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentOut, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: nil, supervisor: supervisor}
+	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentErr, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: stderrLogFile, supervisor: supervisor}
 
 	startTime := time.Now().Add(-2 * time.Second)
 	var logOffset int64
@@ -508,16 +516,26 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	if req.LogFile != "" && req.OnConversationID != nil {
 		scanLogFile()
 	}
+	var bgTasks []BackgroundTaskInfo
+	var wasReaped bool
+	if supervisor != nil {
+		bgTasks = supervisor.ActiveTasks()
+		if len(bgTasks) == 0 {
+			bgTasks = supervisor.ReapedTasks()
+		}
+		wasReaped = supervisor.WasAutoReaped()
+	}
+
 	code := exitCode(waitErr)
 	if ctx.Err() != nil {
-		return ExecutionResult{ExitCode: code}, ctx.Err()
+		return ExecutionResult{ExitCode: code, BackgroundTasks: bgTasks, WasAutoReaped: wasReaped}, ctx.Err()
 	}
 	if waitErr != nil {
 		var ee *exec.ExitError
 		if errors.As(waitErr, &ee) {
-			return ExecutionResult{ExitCode: code}, nil
+			return ExecutionResult{ExitCode: code, BackgroundTasks: bgTasks, WasAutoReaped: wasReaped}, nil
 		}
-		return ExecutionResult{ExitCode: code}, waitErr
+		return ExecutionResult{ExitCode: code, BackgroundTasks: bgTasks, WasAutoReaped: wasReaped}, waitErr
 	}
 	if code == 0 && req.IdempotencyClient != nil && req.ResumeConversationID != "" {
 		commandStr := strings.Join(argv, " ")
@@ -529,7 +547,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 			Status:         "completed",
 		})
 	}
-	return ExecutionResult{ExitCode: code}, nil
+	return ExecutionResult{ExitCode: code, BackgroundTasks: bgTasks, WasAutoReaped: wasReaped}, nil
 }
 
 func watchCancel(ctx context.Context, cmd *exec.Cmd, done <-chan struct{}) {
@@ -571,11 +589,15 @@ type rawWriter struct {
 	mu           *sync.Mutex
 	resumeConvID string
 	logFile      *os.File
+	supervisor   *TaskSupervisor
 }
 
 func (w rawWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
+	}
+	if w.supervisor != nil {
+		w.supervisor.OnOutput(p)
 	}
 	if w.logFile != nil {
 		_, _ = w.logFile.Write(p)

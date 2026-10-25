@@ -10,19 +10,25 @@ import (
 
 // State represents the saved execution state of a prompt run.
 type State struct {
-	JobID          string `json:"job_id"`
-	ScheduleID     string `json:"schedule_id"`
-	Engine         string `json:"engine"`
-	WorktreePath   string `json:"worktree_path"`
-	ConversationID string `json:"conversation_id,omitempty"`
-	StoryID        string `json:"story_id,omitempty"`
-	StepIndex      int    `json:"step_index,omitempty"`
-	StartedAt      string `json:"started_at"`
-	UpdatedAt      string `json:"updated_at"`
-	Status         string `json:"status"` // "RUNNING", "COMPLETED", "FAILED"
-	ExitCode       int    `json:"exit_code"`
-	PID            int    `json:"pid,omitempty"`
-	ASEComplete    bool   `json:"ase_complete,omitempty"`
+	JobID                    string   `json:"job_id"`
+	ScheduleID               string   `json:"schedule_id"`
+	Engine                   string   `json:"engine"`
+	WorktreePath             string   `json:"worktree_path"`
+	ConversationID           string   `json:"conversation_id,omitempty"`
+	StoryID                  string   `json:"story_id,omitempty"`
+	StepIndex                int      `json:"step_index,omitempty"`
+	StartedAt                string   `json:"started_at"`
+	UpdatedAt                string   `json:"updated_at"`
+	Status                   string   `json:"status"` // "RUNNING", "COMPLETED", "FAILED"
+	ExitCode                 int      `json:"exit_code"`
+	PID                      int      `json:"pid,omitempty"`
+	ASEComplete              bool     `json:"ase_complete,omitempty"`
+	TerminationReasonCode    string   `json:"termination_reason_code,omitempty"`
+	TerminationReasonMessage string   `json:"termination_reason_message,omitempty"`
+	Resumable                bool     `json:"resumable"`
+	NonResumableReason       string   `json:"non_resumable_reason,omitempty"`
+	WorkspaceDirtyFiles      []string `json:"workspace_dirty_files,omitempty"`
+	BackgroundTasks          any      `json:"background_tasks,omitempty"`
 }
 
 // CheckpointFileName is the file name stored under .iazio/ in the worktree.

@@ -12,16 +12,20 @@ func TestSaveAndReadCheckpoint(t *testing.T) {
 	tempSpool := t.TempDir()
 
 	state := State{
-		JobID:          "job-test-123",
-		ScheduleID:     "sch-456",
-		Engine:         "agy",
-		WorktreePath:   tempWorktree,
-		ConversationID: "conv-abc-789",
-		StoryID:        "STORY-TEST-001",
-		StepIndex:      2,
-		StartedAt:      time.Now().UTC().Format(time.RFC3339),
-		Status:         "RUNNING",
-		PID:            4242,
+		JobID:                    "job-test-123",
+		ScheduleID:               "sch-456",
+		Engine:                   "agy",
+		WorktreePath:             tempWorktree,
+		ConversationID:           "conv-abc-789",
+		StoryID:                  "STORY-TEST-001",
+		StepIndex:                2,
+		StartedAt:                time.Now().UTC().Format(time.RFC3339),
+		Status:                   "RUNNING",
+		PID:                      4242,
+		TerminationReasonCode:    "BACKGROUND_TASK_HANG",
+		TerminationReasonMessage: "hung",
+		Resumable:                true,
+		WorkspaceDirtyFiles:      []string{"file1.go"},
 	}
 
 	if err := Save(tempWorktree, tempSpool, state); err != nil {
@@ -48,6 +52,9 @@ func TestSaveAndReadCheckpoint(t *testing.T) {
 	if loaded.PID != 4242 {
 		t.Errorf("expected PID 4242, got %d", loaded.PID)
 	}
+	if !loaded.Resumable {
+		t.Errorf("expected resumable true")
+	}
 
 	// Verify reading from spool
 	spoolFile := filepath.Join(tempSpool, "job-test-123.checkpoint.json")
@@ -67,5 +74,26 @@ func TestSaveAndReadCheckpoint(t *testing.T) {
 	}
 	if string(rawGi) != "*\n" {
 		t.Errorf("expected .iazio/.gitignore to contain '*\\n', got %q", string(rawGi))
+	}
+}
+
+func TestReadFile_Errors(t *testing.T) {
+	_, err := ReadFile("/nonexistent/path/ckpt.json")
+	if err == nil {
+		t.Errorf("expected error for nonexistent file")
+	}
+
+	badFile := filepath.Join(t.TempDir(), "bad.json")
+	_ = os.WriteFile(badFile, []byte("invalid json"), 0o644)
+	_, err = ReadFile(badFile)
+	if err == nil {
+		t.Errorf("expected error for invalid json")
+	}
+}
+
+func TestSave_EmptyTargets(t *testing.T) {
+	state := State{JobID: "j-1"}
+	if err := Save("", "", state); err != nil {
+		t.Errorf("expected nil error for empty targets, got %v", err)
 	}
 }
