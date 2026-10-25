@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -1002,29 +1003,6 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		execRes.ExitCode = 1
 	}
 
-	// Save terminal execution checkpoint
-	finalStatus := "COMPLETED"
-	if execErr != nil || execRes.ExitCode != 0 {
-		finalStatus = "FAILED"
-	}
-	_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
-		JobID:          job.ID,
-		ScheduleID:     job.ScheduleID,
-		Engine:         engineName,
-		WorktreePath:   worktree,
-		ConversationID: activeConvID,
-		StoryID:        job.StoryID,
-		StepIndex:      3,
-		StartedAt:      time.Now().UTC().Format(time.RFC3339),
-		Status:         finalStatus,
-		ExitCode:       execRes.ExitCode,
-		ASEComplete:    diagReport.ASEComplete,
-	})
-
-	// Explicitly release checkout file lock before posting exit to control plane,
-	// ensuring subsequent jobs can immediately acquire the lock without race or contention.
-	_ = lock.Release()
-
 	exitOpts := controlplane.ExitOptions{
 		ExitCode:    execRes.ExitCode,
 		Engine:      engineName,
@@ -1053,6 +1031,69 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			exitOpts.Reason = "NON_ZERO_EXIT"
 		}
 	}
+
+	dirtyFiles := collectWorkspaceDirtyFiles(worktree)
+	resumable := (activeConvID != "" || confirmedConvID != "" || resumeConvID != "")
+	nonResumableReason := ""
+	if !resumable {
+		nonResumableReason = "No conversation session established before termination"
+	}
+	terminationCode := "COMPLETED_SUCCESS"
+	terminationMessage := "Job execution completed successfully."
+	if execRes.WasAutoReaped {
+		terminationCode = "BACKGROUND_TASK_AUTO_REAPED"
+		terminationMessage = fmt.Sprintf("Auto-reaped %d background task(s) after inactivity while root agent was idle", len(execRes.BackgroundTasks))
+		resumable = true
+		nonResumableReason = ""
+	} else if execRes.ExitCode != 0 || execErr != nil {
+		terminationCode = "EXIT_CODE_NONZERO"
+		if exitOpts.Reason != "" {
+			terminationCode = exitOpts.Reason
+		}
+		if exitOpts.ErrorMessage != "" {
+			terminationMessage = exitOpts.ErrorMessage
+		} else if execErr != nil {
+			terminationMessage = execErr.Error()
+		} else {
+			terminationMessage = fmt.Sprintf("Engine process exited with non-zero exit code %d", execRes.ExitCode)
+		}
+	}
+
+	exitOpts.TerminationReasonCode = terminationCode
+	exitOpts.TerminationReasonMessage = terminationMessage
+	exitOpts.Resumable = resumable
+	exitOpts.NonResumableReason = nonResumableReason
+	exitOpts.WorkspaceDirtyFiles = dirtyFiles
+	exitOpts.BackgroundTasks = execRes.BackgroundTasks
+
+	// Save terminal execution checkpoint
+	finalStatus := "COMPLETED"
+	if execErr != nil || execRes.ExitCode != 0 {
+		finalStatus = "FAILED"
+	}
+	_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
+		JobID:                    job.ID,
+		ScheduleID:               job.ScheduleID,
+		Engine:                   engineName,
+		WorktreePath:             worktree,
+		ConversationID:           activeConvID,
+		StoryID:                  job.StoryID,
+		StepIndex:                3,
+		StartedAt:                time.Now().UTC().Format(time.RFC3339),
+		Status:                   finalStatus,
+		ExitCode:                 execRes.ExitCode,
+		ASEComplete:              diagReport.ASEComplete,
+		TerminationReasonCode:    terminationCode,
+		TerminationReasonMessage: terminationMessage,
+		Resumable:                resumable,
+		NonResumableReason:       nonResumableReason,
+		WorkspaceDirtyFiles:      dirtyFiles,
+		BackgroundTasks:          execRes.BackgroundTasks,
+	})
+
+	// Explicitly release checkout file lock before posting exit to control plane,
+	// ensuring subsequent jobs can immediately acquire the lock without race or contention.
+	_ = lock.Release()
 
 	span.SetTag("iazio.status", finalStatus)
 	span.SetTag("iazio.exit_code", fmt.Sprintf("%d", execRes.ExitCode))
@@ -1393,4 +1434,27 @@ func runVerifyReleaseCommand(args []string) error {
 		fmt.Printf("  - %s\n", detail)
 	}
 	return nil
+}
+
+func collectWorkspaceDirtyFiles(worktree string) []string {
+	if worktree == "" {
+		return nil
+	}
+	cmd := exec.Command("git", "-C", worktree, "status", "--porcelain")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(string(out), "\n")
+	var dirty []string
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if len(trimmed) > 3 {
+			filePath := strings.TrimSpace(trimmed[2:])
+			if filePath != "" {
+				dirty = append(dirty, filePath)
+			}
+		}
+	}
+	return dirty
 }

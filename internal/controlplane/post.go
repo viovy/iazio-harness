@@ -237,14 +237,20 @@ func GetJob(ctx context.Context, baseURL, token, jobID string) (JobDetail, error
 
 // ExitOptions provides structured completion and failure metadata.
 type ExitOptions struct {
-	ExitCode       int    `json:"exit_code"`
-	Reason         string `json:"reason,omitempty"`
-	ErrorMessage   string `json:"error_message,omitempty"`
-	DiagnosticCode string `json:"diagnostic_code,omitempty"`
-	Engine         string `json:"engine,omitempty"`
-	Model          string `json:"model,omitempty"`
-	Remediation    string `json:"remediation,omitempty"`
-	ASEComplete    bool   `json:"ase_complete,omitempty"`
+	ExitCode                 int      `json:"exit_code"`
+	Reason                   string   `json:"reason,omitempty"`
+	ErrorMessage             string   `json:"error_message,omitempty"`
+	DiagnosticCode           string   `json:"diagnostic_code,omitempty"`
+	Engine                   string   `json:"engine,omitempty"`
+	Model                    string   `json:"model,omitempty"`
+	Remediation              string   `json:"remediation,omitempty"`
+	ASEComplete              bool     `json:"ase_complete,omitempty"`
+	TerminationReasonCode    string   `json:"termination_reason_code,omitempty"`
+	TerminationReasonMessage string   `json:"termination_reason_message,omitempty"`
+	Resumable                bool     `json:"resumable"`
+	NonResumableReason       string   `json:"non_resumable_reason,omitempty"`
+	WorkspaceDirtyFiles      []string `json:"workspace_dirty_files,omitempty"`
+	BackgroundTasks          any      `json:"background_tasks,omitempty"`
 }
 
 // PostExit reports the process exit code to the control plane.
