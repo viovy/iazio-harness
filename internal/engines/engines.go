@@ -593,15 +593,33 @@ type rawWriter struct {
 	supervisor   *TaskSupervisor
 }
 
+func cleanRootAgentIdle(p []byte) []byte {
+	if !bytes.Contains(p, []byte("root agent idle; waiting up to")) {
+		return p
+	}
+	lines := bytes.Split(p, []byte("\n"))
+	var filtered [][]byte
+	for _, l := range lines {
+		if !bytes.Contains(l, []byte("root agent idle; waiting up to")) {
+			filtered = append(filtered, l)
+		}
+	}
+	if len(filtered) == 0 || (len(filtered) == 1 && len(filtered[0]) == 0) {
+		return nil
+	}
+	return bytes.Join(filtered, []byte("\n"))
+}
+
 func (w rawWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if w.supervisor != nil {
-		w.supervisor.OnOutput(p)
+	pClean := cleanRootAgentIdle(p)
+	if w.supervisor != nil && len(pClean) > 0 {
+		w.supervisor.OnOutput(pClean)
 	}
-	if w.logFile != nil {
-		_, _ = w.logFile.Write(p)
+	if w.logFile != nil && len(pClean) > 0 {
+		_, _ = w.logFile.Write(pClean)
 	}
 	if w.onConv != nil && w.scanned != nil && w.mu != nil {
 		w.mu.Lock()
@@ -627,23 +645,10 @@ func (w rawWriter) Write(p []byte) (int, error) {
 		}
 		w.mu.Unlock()
 	}
-	if w.dst != nil {
-		cleaned := p
-		if bytes.Contains(cleaned, []byte("root agent idle; waiting up to")) {
-			lines := bytes.Split(cleaned, []byte("\n"))
-			var filtered [][]byte
-			for _, l := range lines {
-				if !bytes.Contains(l, []byte("root agent idle; waiting up to")) {
-					filtered = append(filtered, l)
-				}
-			}
-			cleaned = bytes.Join(filtered, []byte("\n"))
-		}
-		if len(cleaned) > 0 {
-			buf := append([]byte(nil), cleaned...)
-			if err := w.dst.AppendRaw(w.stream, buf); err != nil {
-				return 0, err
-			}
+	if w.dst != nil && len(pClean) > 0 {
+		buf := append([]byte(nil), pClean...)
+		if err := w.dst.AppendRaw(w.stream, buf); err != nil {
+			return 0, err
 		}
 	}
 	return len(p), nil
@@ -834,9 +839,7 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		return argv, nil
 	case "agy":
 		timeout := req.PrintTimeout
-		if timeout == "" {
-			timeout = "10m"
-		} else if timeout == "0" || timeout == "0s" || timeout == "none" || timeout == "unbounded" {
+		if timeout == "" || timeout == "0" || timeout == "0s" || timeout == "none" || timeout == "unbounded" {
 			timeout = "0"
 		}
 		model := req.Model

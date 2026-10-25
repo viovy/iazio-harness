@@ -93,6 +93,22 @@ func (s *Spool) AppendRaw(stream string, p []byte) error {
 	if len(p) == 0 {
 		return nil
 	}
+	if bytes.Contains(p, []byte("root agent idle; waiting up to")) {
+		lines := bytes.Split(p, []byte("\n"))
+		var filtered [][]byte
+		for _, l := range lines {
+			if !bytes.Contains(l, []byte("root agent idle; waiting up to")) {
+				filtered = append(filtered, l)
+			}
+		}
+		if len(filtered) == 0 || (len(filtered) == 1 && len(filtered[0]) == 0) {
+			return nil
+		}
+		p = bytes.Join(filtered, []byte("\n"))
+		if len(p) == 0 {
+			return nil
+		}
+	}
 	if stream == "" {
 		stream = "stdout"
 	}
