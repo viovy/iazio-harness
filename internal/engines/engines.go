@@ -828,6 +828,20 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 			engine = "agy"
 		}
 	}
+
+	trimmedPrompt := strings.TrimSpace(req.Prompt)
+	isResumeRequest := strings.EqualFold(trimmedPrompt, "resume") ||
+		strings.EqualFold(trimmedPrompt, "/autonomous-story-execution resume") ||
+		req.Kind == "resume"
+
+	if req.ResumeConversationID == "" && isResumeRequest {
+		return nil, fmt.Errorf("cannot execute engine %q with prompt %q when ResumeConversationID is empty", engine, req.Prompt)
+	}
+
+	if req.ResumeConversationID != "" && (req.Prompt == "" || isResumeRequest) {
+		req.Prompt = "resume"
+	}
+
 	switch engine {
 	case "agent":
 		argv := []string{"agent", "--print", "--output-format", "text", "--trust", "--force"}
@@ -851,10 +865,8 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 			model = "gemini-3.8-flash-high"
 		}
 		prompt := req.Prompt
-		if req.ResumeConversationID != "" && (prompt == "" || strings.EqualFold(strings.TrimSpace(prompt), "resume") || req.Kind == "resume") {
+		if prompt == "" {
 			prompt = "resume"
-		} else if req.ResumeConversationID == "" && strings.EqualFold(strings.TrimSpace(prompt), "resume") {
-			return nil, fmt.Errorf("cannot execute engine %q with prompt %q when ResumeConversationID is empty", req.Engine, prompt)
 		}
 		bin := "agy"
 		if _, err := exec.LookPath(bin); err != nil {

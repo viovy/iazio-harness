@@ -1189,4 +1189,75 @@ func TestProcessGroupHelpers(t *testing.T) {
 	}
 }
 
+func TestBuildArgv_UnanchoredResumeRejection(t *testing.T) {
+	engines := []string{"agy", "agent", "copilot", "opencode"}
+	prompts := []string{"resume", "RESUME", " resume ", "/autonomous-story-execution resume"}
+
+	for _, eng := range engines {
+		for _, p := range prompts {
+			req := ExecutionRequest{
+				Engine: eng,
+				Prompt: p,
+			}
+			_, err := BuildArgv(req)
+			if err == nil {
+				t.Fatalf("expected error for unanchored resume on engine %q prompt %q, got nil", eng, p)
+			}
+			if !strings.Contains(err.Error(), "when ResumeConversationID is empty") {
+				t.Fatalf("expected ResumeConversationID is empty error, got %v", err)
+			}
+		}
+
+		// Also verify Kind: resume with empty prompt
+		reqKind := ExecutionRequest{
+			Engine: eng,
+			Kind:   "resume",
+		}
+		_, errKind := BuildArgv(reqKind)
+		if errKind == nil {
+			t.Fatalf("expected error for unanchored Kind=resume on engine %q, got nil", eng)
+		}
+	}
+}
+
+func TestBuildArgv_AnchoredResumePass(t *testing.T) {
+	reqAgy := ExecutionRequest{
+		Engine:               "agy",
+		Prompt:               "resume",
+		ResumeConversationID: "conv-agy-1",
+	}
+	argvAgy, err := BuildArgv(reqAgy)
+	if err != nil {
+		t.Fatalf("unexpected error for anchored agy resume: %v", err)
+	}
+	foundConv := false
+	for _, a := range argvAgy {
+		if strings.Contains(a, "--conversation=conv-agy-1") {
+			foundConv = true
+		}
+	}
+	if !foundConv {
+		t.Fatalf("expected --conversation=conv-agy-1 in argv: %v", argvAgy)
+	}
+
+	reqAgent := ExecutionRequest{
+		Engine:               "agent",
+		Prompt:               "resume",
+		ResumeConversationID: "conv-agent-1",
+	}
+	argvAgent, errAgent := BuildArgv(reqAgent)
+	if errAgent != nil {
+		t.Fatalf("unexpected error for anchored agent resume: %v", errAgent)
+	}
+	foundResume := false
+	for i, a := range argvAgent {
+		if a == "--resume" && i+1 < len(argvAgent) && argvAgent[i+1] == "conv-agent-1" {
+			foundResume = true
+		}
+	}
+	if !foundResume {
+		t.Fatalf("expected --resume conv-agent-1 in argv: %v", argvAgent)
+	}
+}
+
 
