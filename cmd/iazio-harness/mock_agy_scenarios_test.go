@@ -23,11 +23,33 @@ func buildMockAgy(t *testing.T) string {
 	binPath := filepath.Join(tempDir, "mock-agy")
 	agyPath := filepath.Join(tempDir, "agy")
 
+	// Preserve Go build caches before isolating HOME
+	origGopath := os.Getenv("GOPATH")
+	if origGopath == "" {
+		if u, err := os.UserHomeDir(); err == nil {
+			origGopath = filepath.Join(u, "go")
+		}
+	}
+	origGocache := os.Getenv("GOCACHE")
+
 	// Isolate HOME so local sessionstore / conversation history does not pollute tests
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 
-	cmd := exec.Command("go", "build", "-o", binPath, "github.com/viovy/iazio-harness/cmd/mock-agy")
+	if origGopath != "" {
+		t.Setenv("GOPATH", origGopath)
+	}
+	if origGocache != "" {
+		t.Setenv("GOCACHE", origGocache)
+	}
+
+	// Resolve local source package for mock-agy
+	mockAgyPkg := "../mock-agy"
+	if _, err := os.Stat(mockAgyPkg); err != nil {
+		mockAgyPkg = "github.com/viovy/iazio-harness/cmd/mock-agy"
+	}
+
+	cmd := exec.Command("go", "build", "-o", binPath, mockAgyPkg)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to compile mock-agy: %v\noutput: %s", err, string(out))
 	}
@@ -46,6 +68,15 @@ func buildMockAgy(t *testing.T) string {
 
 	t.Setenv("PATH", tempDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return binPath
+}
+
+func initTestGitWorktree(t *testing.T) string {
+	t.Helper()
+	worktree := t.TempDir()
+	_ = exec.Command("git", "init", worktree).Run()
+	_ = exec.Command("git", "-C", worktree, "config", "user.name", "Test User").Run()
+	_ = exec.Command("git", "-C", worktree, "config", "user.email", "test@test.local").Run()
+	return worktree
 }
 
 // Scenario 1: ordinary_prompt_with_mcp_daemons (job-1506 / job-1464)
@@ -95,8 +126,7 @@ func TestMockAgy_Scenario1_OrdinaryPromptWithMCPDaemons(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	worktree := t.TempDir()
-	_ = exec.Command("git", "init", worktree).Run()
+	worktree := initTestGitWorktree(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -175,8 +205,7 @@ func TestMockAgy_Scenario2_AgentRestartAndUpgradeMidRun(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	worktree := t.TempDir()
-	_ = exec.Command("git", "init", worktree).Run()
+	worktree := initTestGitWorktree(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -257,8 +286,7 @@ func TestMockAgy_Scenario3_ASEPrintTimeoutInJobContinuation(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	worktree := t.TempDir()
-	_ = exec.Command("git", "init", worktree).Run()
+	worktree := initTestGitWorktree(t)
 	_ = exec.Command("git", "-C", worktree, "config", "user.name", "Test Runner").Run()
 	_ = exec.Command("git", "-C", worktree, "config", "user.email", "test@test.local").Run()
 	_ = os.WriteFile(filepath.Join(worktree, "init.txt"), []byte("init"), 0o644)
@@ -342,8 +370,7 @@ func TestMockAgy_Scenario4_BackgroundTaskHangRecovery(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	worktree := t.TempDir()
-	_ = exec.Command("git", "init", worktree).Run()
+	worktree := initTestGitWorktree(t)
 	_ = exec.Command("git", "-C", worktree, "config", "user.name", "Test Runner").Run()
 	_ = exec.Command("git", "-C", worktree, "config", "user.email", "test@test.local").Run()
 	_ = os.WriteFile(filepath.Join(worktree, "init.txt"), []byte("init"), 0o644)
@@ -438,8 +465,7 @@ func TestMockAgy_Scenario5_MultiAttemptLogPreservationAndScheduleSync(t *testing
 	}))
 	defer srv.Close()
 
-	worktree := t.TempDir()
-	_ = exec.Command("git", "init", worktree).Run()
+	worktree := initTestGitWorktree(t)
 
 	// Attempt 1 execution
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
@@ -521,8 +547,7 @@ func TestMockAgy_Scenario6_DirtyWorktreeResumeAndQueueUnblock(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	worktree := t.TempDir()
-	_ = exec.Command("git", "init", worktree).Run()
+	worktree := initTestGitWorktree(t)
 
 	// Run 1: Fails with code 10 and leaves dirty file
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
