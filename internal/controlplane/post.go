@@ -224,6 +224,7 @@ type JobDetail struct {
 	ExitCode                    int               `json:"exit_code,omitempty"`
 	TerminationReasonMessage    string            `json:"termination_reason_message,omitempty"`
 	FailureReasonSummary        string            `json:"failure_reason_summary,omitempty"`
+	FencingToken                int64             `json:"fencing_token,omitempty"`
 }
 
 // GetJob fetches the job definition from the control plane.
@@ -371,7 +372,7 @@ func GetRehydrationBundle(ctx context.Context, baseURL, token, conversationID st
 }
 
 // PostStoryBinding dynamically binds an allocated story ID and metadata to a running or historical job.
-func PostStoryBinding(ctx context.Context, baseURL, token, jobID, storyID, storyTitle, storyPath string) error {
+func PostStoryBinding(ctx context.Context, baseURL, token, jobID, storyID, storyTitle, storyPath string, fencingToken ...int64) error {
 	storyID = strings.TrimSpace(storyID)
 	if storyID == "" {
 		return errors.New("story_id is required")
@@ -380,6 +381,9 @@ func PostStoryBinding(ctx context.Context, baseURL, token, jobID, storyID, story
 		"story_id":    storyID,
 		"story_title": storyTitle,
 		"story_path":  storyPath,
+	}
+	if len(fencingToken) > 0 && fencingToken[0] > 0 {
+		payload["fencing_token"] = fencingToken[0]
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {

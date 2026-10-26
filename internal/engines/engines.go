@@ -665,14 +665,17 @@ func (w rawWriter) Write(p []byte) (int, error) {
 	}
 	if w.onStoryAllocated != nil && len(pClean) > 0 {
 		str := string(pClean)
-		if idx := strings.Index(str, "ALLOCATED_STORY_ID:"); idx != -1 {
-			rem := str[idx+len("ALLOCATED_STORY_ID:"):]
-			if endIdx := strings.IndexAny(rem, "\r\n"); endIdx != -1 {
-				rem = rem[:endIdx]
-			}
-			storyID := strings.TrimSpace(rem)
-			if storyID != "" {
-				w.onStoryAllocated(storyID)
+		for _, prefix := range []string{"ALLOCATED_STORY_ID:", "STORY_ID:", "Bound active story ID:", "Bound dynamically allocated story ID:"} {
+			if idx := strings.Index(str, prefix); idx != -1 {
+				rem := strings.TrimLeft(str[idx+len(prefix):], " \t")
+				if endIdx := strings.IndexAny(rem, "\r\n ,;()"); endIdx != -1 {
+					rem = rem[:endIdx]
+				}
+				storyID := strings.TrimSpace(rem)
+				if storyID != "" && storyID != "pending-allocation" && storyID != "pending_harness_creation" {
+					w.onStoryAllocated(storyID)
+					break
+				}
 			}
 		}
 	}
