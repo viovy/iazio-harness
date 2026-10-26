@@ -702,7 +702,7 @@ func resolveFleetProgressFingerprint(worktree string) string {
 	}
 	h := sha256.New()
 
-	// 1. Root meta-repo state
+	// 1. Root repository state
 	headSHA := resolveGitHead(worktree)
 	branch := resolveLiveGitBranch(worktree)
 	dirtyFiles := collectWorkspaceDirtyFiles(worktree)
