@@ -1364,6 +1364,41 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	if job.ParentJobID != "" {
 		initialBanner += fmt.Sprintf("[ASE-SUPERVISOR] Lineage: parent_job=%s, root_job=%s\n", job.ParentJobID, job.RootJobID)
 	}
+
+	attemptNum := job.ExecutionAttempt
+	if attemptNum <= 0 {
+		if job.ParentJobID != "" {
+			attemptNum = 2
+		} else {
+			attemptNum = 1
+		}
+	}
+	triggerReason := job.Reason
+	if triggerReason == "" {
+		if attemptNum > 1 {
+			triggerReason = "resume_or_retry"
+		} else {
+			triggerReason = "initial_dispatch"
+		}
+	}
+	prevExitCode := job.ExitCode
+	prevError := job.TerminationReasonMessage
+	if prevError == "" {
+		prevError = job.FailureReasonSummary
+	}
+	if prevError == "" {
+		prevError = "none"
+	}
+	bannerCID := resumeConvID
+	if bannerCID == "" {
+		bannerCID = "none"
+	}
+	structuredAttemptBanner := fmt.Sprintf("\n================================================================================\n"+
+		"[iazio] Starting Attempt #%d (trigger_reason: %s, previous_exit_code: %d, previous_error: %s, conversation_id: %s, timestamp: %s)\n"+
+		"================================================================================\n",
+		attemptNum, triggerReason, prevExitCode, prevError, bannerCID, time.Now().UTC().Format(time.RFC3339),
+	)
+	initialBanner += structuredAttemptBanner
 	_ = sp.AppendRaw("stdout", []byte(initialBanner))
 	_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", initialBanner)
 
@@ -1958,6 +1993,18 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			len(dirtyFiles),
 			engineName, resumeTargetID,
 		)
+		turnAttemptNum := attemptNum + autoResumeCount
+		prevTurnExitCode := execRes.ExitCode
+		prevTurnError := strings.Join(unmetGatesList, ",")
+		if prevTurnError == "" {
+			prevTurnError = "turn_interrupted"
+		}
+		turnAttemptBanner := fmt.Sprintf("\n================================================================================\n"+
+			"[iazio] Starting Attempt #%d (trigger_reason: %s, previous_exit_code: %d, previous_error: %s, conversation_id: %s, timestamp: %s)\n"+
+			"================================================================================\n",
+			turnAttemptNum, triggerReason, prevTurnExitCode, prevTurnError, resumeTargetID, time.Now().UTC().Format(time.RFC3339),
+		)
+		autoResumeMsg += turnAttemptBanner
 		_ = sp.AppendRaw("stdout", []byte(autoResumeMsg))
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", autoResumeMsg)
 		childProcsNow, _ := watchdog.GetDescendantProcesses(activePID)
