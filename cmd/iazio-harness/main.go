@@ -39,9 +39,12 @@ import (
 const fallbackResumeStoryID = "STORY-RESUME-INPLACE"
 
 var (
-	version = "0.1.0-dev"
-	commit  = "unknown"
-	branch  = "unknown"
+	version        = "0.1.0-dev"
+	commit         = "unknown"
+	branch         = "unknown"
+	buildCommitSHA = ""
+	buildTimeUTC   = ""
+	buildDirty     = ""
 )
 
 func main() {
@@ -71,7 +74,13 @@ func run(args []string) error {
 	ctx, span := telemetry.StartSpan(context.Background(), "harness."+args[0], spanOpts...)
 	defer span.End()
 	switch args[0] {
-	case "version":
+	case "version", "--version", "-v":
+		for _, a := range args[1:] {
+			if a == "--json" || a == "-json" {
+				fmt.Println(formatVersionJSON())
+				return nil
+			}
+		}
 		fmt.Println(formatVersion())
 		return nil
 	case "auth":
@@ -1987,11 +1996,55 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	return nil
 }
 
+func resolveCommit() string {
+	if sha := strings.TrimSpace(buildCommitSHA); sha != "" && sha != "unknown" {
+		return sha
+	}
+	if sha := strings.TrimSpace(commit); sha != "" && sha != "unknown" {
+		return sha
+	}
+	return "unknown"
+}
+
+func resolveBuildTime() string {
+	if t := strings.TrimSpace(buildTimeUTC); t != "" {
+		return t
+	}
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
+func resolveDirty() bool {
+	if d := strings.TrimSpace(buildDirty); d != "" {
+		return d == "true" || d == "1"
+	}
+	return false
+}
+
+type versionInfo struct {
+	Name      string `json:"name"`
+	Version   string `json:"version"`
+	CommitSHA string `json:"commit_sha"`
+	BuildTime string `json:"build_time,omitempty"`
+	Dirty     bool   `json:"dirty"`
+}
+
+func formatVersionJSON() string {
+	info := versionInfo{
+		Name:      "iazio-harness",
+		Version:   version,
+		CommitSHA: resolveCommit(),
+		BuildTime: resolveBuildTime(),
+		Dirty:     resolveDirty(),
+	}
+	data, _ := json.Marshal(info)
+	return string(data)
+}
+
 func formatVersion() string {
-	if commit == "" || commit == "unknown" {
+	sha := resolveCommit()
+	if sha == "" || sha == "unknown" {
 		return "iazio-harness " + version
 	}
-	sha := commit
 	if len(sha) > 12 {
 		sha = sha[:12]
 	}
