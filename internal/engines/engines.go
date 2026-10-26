@@ -828,6 +828,22 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 			engine = "agy"
 		}
 	}
+
+	trimmedPrompt := strings.TrimSpace(req.Prompt)
+	isEmptyOrBareResume := trimmedPrompt == "" ||
+		strings.EqualFold(trimmedPrompt, "resume") ||
+		strings.EqualFold(trimmedPrompt, "/autonomous-story-execution resume")
+
+	if req.ResumeConversationID == "" {
+		if strings.EqualFold(trimmedPrompt, "resume") ||
+			strings.EqualFold(trimmedPrompt, "/autonomous-story-execution resume") ||
+			(req.Kind == "resume" && trimmedPrompt == "") {
+			return nil, fmt.Errorf("cannot execute engine %q with prompt %q when ResumeConversationID is empty", engine, req.Prompt)
+		}
+	} else if isEmptyOrBareResume || req.Kind == "resume" {
+		req.Prompt = "resume"
+	}
+
 	switch engine {
 	case "agent":
 		argv := []string{"agent", "--print", "--output-format", "text", "--trust", "--force"}
@@ -851,7 +867,7 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 			model = "gemini-3.8-flash-high"
 		}
 		prompt := req.Prompt
-		if req.ResumeConversationID != "" && (prompt == "" || strings.EqualFold(strings.TrimSpace(prompt), "resume") || req.Kind == "resume") {
+		if prompt == "" {
 			prompt = "resume"
 		}
 		bin := "agy"
