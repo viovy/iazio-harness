@@ -132,6 +132,8 @@ func TestMockAgy_Scenario2_AgentRestartAndUpgradeMidRun(t *testing.T) {
 	var mu sync.Mutex
 	var postedChunks []string
 	var postedExitCode = -1
+	var reportedReasons []string
+	var tickCount int
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -154,13 +156,18 @@ func TestMockAgy_Scenario2_AgentRestartAndUpgradeMidRun(t *testing.T) {
 			postedChunks = append(postedChunks, body.Text)
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ticks"):
+			tickCount++
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
 			var body struct {
-				ExitCode int `json:"exit_code"`
+				ExitCode int    `json:"exit_code"`
+				Reason   string `json:"reason"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			postedExitCode = body.ExitCode
+			if body.Reason != "" {
+				reportedReasons = append(reportedReasons, body.Reason)
+			}
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusOK)
@@ -186,9 +193,18 @@ func TestMockAgy_Scenario2_AgentRestartAndUpgradeMidRun(t *testing.T) {
 		t.Fatalf("expected exit code 0, got %d", postedExitCode)
 	}
 
+	for _, reason := range reportedReasons {
+		if reason == "ORPHANED_RUN_EXPIRED" || reason == "lease_expired" || reason == "process_died" {
+			t.Fatalf("unexpected premature failure reported during active run: %s", reason)
+		}
+	}
+
 	allOutput := strings.Join(postedChunks, "\n")
 	if !strings.Contains(allOutput, "step 5/5: active and streaming") {
 		t.Fatalf("expected output to contain final streaming step, got: %s", allOutput)
+	}
+	if !strings.Contains(allOutput, "All steps completed successfully") {
+		t.Fatalf("expected output to contain completion message, got: %s", allOutput)
 	}
 }
 
@@ -370,6 +386,7 @@ func TestMockAgy_Scenario5_MultiAttemptLogPreservationAndScheduleSync(t *testing
 	var attempt1Chunks []string
 	var attempt2Chunks []string
 	var currentAttempt = 1
+	var scheduleStatus = "pending"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -386,6 +403,12 @@ func TestMockAgy_Scenario5_MultiAttemptLogPreservationAndScheduleSync(t *testing
 				Agent:            "mock-agy",
 				Status:           "RUNNING",
 			})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/schedules/"):
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":                "sch-1467",
+				"status":            scheduleStatus,
+				"execution_attempt": currentAttempt,
+			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
 			var body struct {
 				Text string `json:"text"`
@@ -400,6 +423,14 @@ func TestMockAgy_Scenario5_MultiAttemptLogPreservationAndScheduleSync(t *testing
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ticks"):
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+			var body struct {
+				ExitCode int    `json:"exit_code"`
+				Reason   string `json:"reason"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if currentAttempt == 2 && body.ExitCode == 0 {
+				scheduleStatus = "completed"
+			}
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusOK)
@@ -441,6 +472,12 @@ func TestMockAgy_Scenario5_MultiAttemptLogPreservationAndScheduleSync(t *testing
 	}
 	if !strings.Contains(att2Out, "Attempt 2 succeeded cleanly") {
 		t.Fatalf("expected Attempt 2 completion, got: %s", att2Out)
+	}
+	if scheduleStatus != "completed" {
+		t.Fatalf("expected linked schedule sch-1467 to transition to completed, got: %s", scheduleStatus)
+	}
+	if currentAttempt != 2 {
+		t.Fatalf("expected execution_attempt == 2, got: %d", currentAttempt)
 	}
 }
 
