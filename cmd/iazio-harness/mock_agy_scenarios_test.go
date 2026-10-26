@@ -49,7 +49,7 @@ func buildMockAgy(t *testing.T) string {
 		mockAgyPkg = "github.com/viovy/iazio-harness/cmd/mock-agy"
 	}
 
-	cmd := exec.Command("go", "build", "-o", binPath, mockAgyPkg)
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", binPath, mockAgyPkg)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to compile mock-agy: %v\noutput: %s", err, string(out))
 	}
