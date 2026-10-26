@@ -1260,4 +1260,57 @@ func TestBuildArgv_AnchoredResumePass(t *testing.T) {
 	}
 }
 
+func TestEngineExecutionSymlinkResolutionAndFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping symlink tests on windows")
+	}
+	dir := t.TempDir()
+	realBin := filepath.Join(dir, "real-sh")
+	if err := os.WriteFile(realBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	validSymlink := filepath.Join(dir, "symlink-sh")
+	if err := os.Symlink(realBin, validSymlink); err != nil {
+		t.Fatal(err)
+	}
+
+	brokenSymlink := filepath.Join(dir, "broken-symlink")
+	if err := os.Symlink(filepath.Join(dir, "nonexistent"), brokenSymlink); err != nil {
+		t.Fatal(err)
+	}
+
+	cli := CLI{Engine: "test"}
+	// Valid symlink execute
+	res, err := cli.Execute(context.Background(), ExecutionRequest{
+		Engine: "custom",
+		Argv:   []string{validSymlink},
+	}, nil)
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("expected valid symlink execution to succeed, got %+v, %v", res, err)
+	}
+
+	// Broken symlink execute
+	_, errBroken := cli.Execute(context.Background(), ExecutionRequest{
+		Engine: "custom",
+		Argv:   []string{brokenSymlink},
+	}, nil)
+	if errBroken == nil {
+		t.Fatalf("expected broken symlink execution to fail")
+	}
+
+	// Valid symlink healthcheck
+	cliValid := CLI{Engine: "test", LookPath: func(string) (string, error) { return validSymlink, nil }}
+	if err := cliValid.HealthCheck(); err != nil {
+		t.Fatalf("expected valid symlink healthcheck to succeed, got %v", err)
+	}
+
+	// Broken symlink healthcheck
+	cliBroken := CLI{Engine: "test", LookPath: func(string) (string, error) { return brokenSymlink, nil }}
+	if err := cliBroken.HealthCheck(); err == nil {
+		t.Fatalf("expected broken symlink healthcheck to fail")
+	}
+}
+
+
 
