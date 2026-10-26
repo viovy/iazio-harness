@@ -830,15 +830,17 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 	}
 
 	trimmedPrompt := strings.TrimSpace(req.Prompt)
-	isResumeRequest := strings.EqualFold(trimmedPrompt, "resume") ||
-		strings.EqualFold(trimmedPrompt, "/autonomous-story-execution resume") ||
-		req.Kind == "resume"
+	isEmptyOrBareResume := trimmedPrompt == "" ||
+		strings.EqualFold(trimmedPrompt, "resume") ||
+		strings.EqualFold(trimmedPrompt, "/autonomous-story-execution resume")
 
-	if req.ResumeConversationID == "" && isResumeRequest {
-		return nil, fmt.Errorf("cannot execute engine %q with prompt %q when ResumeConversationID is empty", engine, req.Prompt)
-	}
-
-	if req.ResumeConversationID != "" && (req.Prompt == "" || isResumeRequest) {
+	if req.ResumeConversationID == "" {
+		if strings.EqualFold(trimmedPrompt, "resume") ||
+			strings.EqualFold(trimmedPrompt, "/autonomous-story-execution resume") ||
+			(req.Kind == "resume" && trimmedPrompt == "") {
+			return nil, fmt.Errorf("cannot execute engine %q with prompt %q when ResumeConversationID is empty", engine, req.Prompt)
+		}
+	} else if isEmptyOrBareResume || req.Kind == "resume" {
 		req.Prompt = "resume"
 	}
 
