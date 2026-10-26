@@ -355,7 +355,7 @@ func TestPostStoryBinding_AndPostTurnContinued(t *testing.T) {
 	if err := PostStoryBinding(context.Background(), srv.URL, "tok", "job-1", "", "title", "path"); err == nil {
 		t.Fatalf("expected error for empty storyID")
 	}
-	if err := PostStoryBinding(context.Background(), srv.URL, "tok", "job-1", "STORY-GOV-1234", "My Story", "docs/stories/1234.md"); err != nil {
+	if err := PostStoryBinding(context.Background(), srv.URL, "tok", "job-1", "STORY-GOV-1234", "My Story", "docs/stories/1234.md", 42); err != nil {
 		t.Fatalf("PostStoryBinding failed: %v", err)
 	}
 
@@ -368,6 +368,9 @@ func TestPostStoryBinding_AndPostTurnContinued(t *testing.T) {
 	}
 	if paths[0] != "/v1/jobs/job-1/story-binding" {
 		t.Errorf("expected story-binding path, got %s", paths[0])
+	}
+	if ft, ok := bodies[0]["fencing_token"].(float64); !ok || int64(ft) != 42 {
+		t.Errorf("expected fencing_token 42 in story binding, got %v", bodies[0]["fencing_token"])
 	}
 	if paths[1] != "/v1/jobs/job-1/chunks" {
 		t.Errorf("expected chunks path, got %s", paths[1])

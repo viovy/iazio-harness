@@ -62,6 +62,7 @@ type ExecutionRequest struct {
 	LogFile                    string
 	ResumeConversationID       string
 	OnConversationID           func(string)
+	OnStoryAllocated           func(string)
 	OnPID                      func(int)
 	// Argv, when non-empty, replaces BuildArgv. Tests use it to run a local program.
 	Argv []string
@@ -356,8 +357,8 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		defer supervisor.Stop()
 	}
 
-	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentOut, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: nil, supervisor: supervisor}
-	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, scanned: &scanned, recent: &recentErr, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: stderrLogFile, supervisor: supervisor}
+	stdoutWriter := rawWriter{stream: "stdout", dst: stream, onConv: req.OnConversationID, onStoryAllocated: req.OnStoryAllocated, scanned: &scanned, recent: &recentOut, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: nil, supervisor: supervisor}
+	stderrWriter := rawWriter{stream: "stderr", dst: stream, onConv: req.OnConversationID, onStoryAllocated: req.OnStoryAllocated, scanned: &scanned, recent: &recentErr, mu: &convMu, resumeConvID: req.ResumeConversationID, logFile: stderrLogFile, supervisor: supervisor}
 
 	startTime := time.Now().Add(-2 * time.Second)
 	var logOffset int64
@@ -622,15 +623,16 @@ func exitCode(err error) int {
 }
 
 type rawWriter struct {
-	stream       string
-	dst          EventStream
-	onConv       func(string)
-	scanned      *bool
-	recent       *string
-	mu           *sync.Mutex
-	resumeConvID string
-	logFile      *os.File
-	supervisor   *TaskSupervisor
+	stream           string
+	dst              EventStream
+	onConv           func(string)
+	onStoryAllocated func(string)
+	scanned          *bool
+	recent           *string
+	mu               *sync.Mutex
+	resumeConvID     string
+	logFile          *os.File
+	supervisor       *TaskSupervisor
 }
 
 func cleanRootAgentIdle(p []byte) []byte {
@@ -660,6 +662,22 @@ func (w rawWriter) Write(p []byte) (int, error) {
 	}
 	if w.logFile != nil && len(pClean) > 0 {
 		_, _ = w.logFile.Write(pClean)
+	}
+	if w.onStoryAllocated != nil && len(pClean) > 0 {
+		str := string(pClean)
+		for _, prefix := range []string{"ALLOCATED_STORY_ID:", "STORY_ID:", "Bound active story ID:", "Bound dynamically allocated story ID:"} {
+			if idx := strings.Index(str, prefix); idx != -1 {
+				rem := strings.TrimLeft(str[idx+len(prefix):], " \t")
+				if endIdx := strings.IndexAny(rem, "\r\n ,;()"); endIdx != -1 {
+					rem = rem[:endIdx]
+				}
+				storyID := strings.TrimSpace(rem)
+				if storyID != "" && storyID != "pending-allocation" && storyID != "pending_harness_creation" {
+					w.onStoryAllocated(storyID)
+					break
+				}
+			}
+		}
 	}
 	if w.onConv != nil && w.scanned != nil && w.mu != nil {
 		w.mu.Lock()
@@ -911,7 +929,9 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 			prompt = "resume"
 		}
 		bin := engine
-		if bin == "agy" {
+		if envBin := os.Getenv("IAZIO_AGY_BIN"); envBin != "" {
+			bin = envBin
+		} else if bin == "agy" {
 			if _, err := exec.LookPath(bin); err != nil {
 				if _, errG := exec.LookPath("gemini"); errG == nil {
 					bin = "gemini"

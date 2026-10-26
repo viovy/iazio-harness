@@ -1360,7 +1360,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 									Prompt:         job.Prompt,
 									Status:         "RUNNING",
 								})
-								_ = controlplane.PostStoryBinding(context.Background(), api, token, jobID, resolved, "", "")
+								_ = controlplane.PostStoryBinding(context.Background(), api, token, jobID, resolved, "", "", job.FencingToken)
 								bindMsg := fmt.Sprintf("[iazio-harness] Bound active story ID: %s (branch: %s, previously: %s)\n",
 									resolved, resolveLiveGitBranch(worktree), prevStory)
 								_ = sp.AppendRaw("stdout", []byte(bindMsg))
@@ -1453,6 +1453,30 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		ScheduleEnv:                job.EnvVars,
 		LogFile:                    filepath.Join(spool.DefaultDir(), jobID+".engine.log"),
 		ResumeConversationID:       resumeConvID,
+		OnStoryAllocated: func(allocStoryID string) {
+			if allocStoryID != "" && allocStoryID != "pending-allocation" && allocStoryID != "pending_harness_creation" && allocStoryID != currentBoundStoryID {
+				prevStory := currentBoundStoryID
+				currentBoundStoryID = allocStoryID
+				job.StoryID = allocStoryID
+				_ = lockHandle.Update(repolock.LockInfo{
+					JobID:          job.ID,
+					ScheduleID:     job.ScheduleID,
+					PID:            os.Getpid(),
+					HarnessPID:     os.Getpid(),
+					ToolPID:        activePID,
+					Engine:         engineName,
+					ConversationID: activeConvID,
+					StoryID:        allocStoryID,
+					Prompt:         job.Prompt,
+					Status:         "RUNNING",
+				})
+				_ = controlplane.PostStoryBinding(context.Background(), api, token, jobID, allocStoryID, "", "", job.FencingToken)
+				bindMsg := fmt.Sprintf("[iazio-harness] Bound dynamically allocated story ID: %s (previously: %s)\n",
+					allocStoryID, prevStory)
+				_ = sp.AppendRaw("stdout", []byte(bindMsg))
+				_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", bindMsg)
+			}
+		},
 		OnPID: func(pid int) {
 			activePID = pid
 			span.AddAnnotation(fmt.Sprintf("engine_process_started:pid=%d", pid))
@@ -2005,7 +2029,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			prevStory := currentBoundStoryID
 			currentBoundStoryID = resolved
 			job.StoryID = resolved
-			_ = controlplane.PostStoryBinding(context.Background(), api, token, jobID, resolved, "", "")
+			_ = controlplane.PostStoryBinding(context.Background(), api, token, jobID, resolved, "", "", job.FencingToken)
 			bindMsg := fmt.Sprintf("[iazio-harness] Bound active story ID: %s (branch: %s, previously: %s)\n",
 				resolved, resolveLiveGitBranch(worktree), prevStory)
 			_ = sp.AppendRaw("stdout", []byte(bindMsg))

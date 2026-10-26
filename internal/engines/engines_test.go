@@ -1312,5 +1312,41 @@ func TestEngineExecutionSymlinkResolutionAndFailure(t *testing.T) {
 	}
 }
 
+func TestBuildArgv_IazioAgyBinOverride(t *testing.T) {
+	customAgy := "/custom/opt/bin/mock-agy"
+	t.Setenv("IAZIO_AGY_BIN", customAgy)
+
+	argv, err := BuildArgv(ExecutionRequest{
+		Engine: "agy",
+		Prompt: "test",
+	})
+	if err != nil {
+		t.Fatalf("BuildArgv failed: %v", err)
+	}
+	if len(argv) == 0 || argv[0] != customAgy {
+		t.Fatalf("expected argv[0] to be %q, got %+v", customAgy, argv)
+	}
+}
+
+func TestRawWriter_OnStoryAllocated(t *testing.T) {
+	var allocated string
+	var mu sync.Mutex
+	w := rawWriter{
+		onStoryAllocated: func(s string) {
+			mu.Lock()
+			allocated = s
+			mu.Unlock()
+		},
+	}
+
+	_, _ = w.Write([]byte("Some log line\nALLOCATED_STORY_ID: STORY-GOV-9999\nAnother line"))
+	mu.Lock()
+	got := allocated
+	mu.Unlock()
+
+	if got != "STORY-GOV-9999" {
+		t.Fatalf("expected STORY-GOV-9999, got %q", got)
+	}
+}
 
 
