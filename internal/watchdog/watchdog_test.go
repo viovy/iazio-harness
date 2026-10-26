@@ -241,6 +241,32 @@ func TestFormatActiveChildProcessesSummary(t *testing.T) {
 	}
 }
 
+func TestFilterNonDaemonChildProcesses_MCPExclusion(t *testing.T) {
+	procs := []ProcessInfo{
+		{PID: 82790, Command: "autopilot-mcp", Args: "/Users/romeo/.local/bin/autopilot-mcp serve"},
+		{PID: 82794, Command: "npm", Args: "npm exec chrome-devtools-mcp@latest"},
+		{PID: 82898, Command: "chrome-devtools-mcp", Args: "chrome-devtools-mcp"},
+		{PID: 82945, Command: "node", Args: "node .../googlecloudtools.datacloud..."},
+		{PID: 90001, Command: "make", Args: "make validate-local"},
+	}
+
+	filtered := FilterNonDaemonChildProcesses(procs)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 non-MCP process, got %d", len(filtered))
+	}
+	if filtered[0].PID != 90001 {
+		t.Fatalf("expected PID 90001 to survive, got %d", filtered[0].PID)
+	}
+
+	summary, pids := FormatActiveChildProcessesSummary(procs)
+	if strings.Contains(summary, "autopilot-mcp") || strings.Contains(summary, "chrome-devtools-mcp") {
+		t.Fatalf("expected summary to exclude MCP daemons, got: %s", summary)
+	}
+	if len(pids) != 1 || pids[0] != 90001 {
+		t.Fatalf("expected only non-MCP PID 90001 in pids, got: %v", pids)
+	}
+}
+
 func TestIsProcessAlive_AndScanPSDescendants(t *testing.T) {
 	myPid := os.Getpid()
 	if !IsProcessAlive(myPid) {

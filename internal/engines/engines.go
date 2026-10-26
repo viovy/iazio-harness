@@ -471,7 +471,20 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 
 	waitCh := make(chan error, 1)
 	go func() {
-		waitCh <- cmd.Wait()
+		// Monitor the primary engine process (tool_pid) directly rather than blocking on
+		// inherited pipe descriptors held open by persistent grandchild MCP daemons.
+		if cmd.Process != nil {
+			state, err := cmd.Process.Wait()
+			if err != nil {
+				waitCh <- err
+			} else if !state.Success() {
+				waitCh <- &exec.ExitError{ProcessState: state}
+			} else {
+				waitCh <- nil
+			}
+		} else {
+			waitCh <- cmd.Wait()
+		}
 	}()
 
 	pipesDone := make(chan struct{})
@@ -495,6 +508,8 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 			case <-time.After(500 * time.Millisecond):
 			}
 		}
+		// Reap any lingering grandchild MCP server daemons in the job's process group
+		killProcessGroup(cmd)
 	case <-ctx.Done():
 		stopProcessGroup(cmd)
 		select {

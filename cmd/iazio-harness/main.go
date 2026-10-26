@@ -507,6 +507,23 @@ func cleanStaleGitLocks(workspacePath string) []string {
 	return removed
 }
 
+func isASEJob(job controlplane.JobDetail) bool {
+	if job.Kind == "ordinary" {
+		return false
+	}
+	if job.Kind == "ase" || job.Kind == "story_execution" || job.Kind == "story_refinement" {
+		return true
+	}
+	promptLower := strings.ToLower(job.Prompt)
+	if strings.Contains(promptLower, "/autonomous-story-execution") || strings.Contains(promptLower, "autonomous-story-execution") {
+		return true
+	}
+	if job.StoryID != "" && job.StoryID != fallbackResumeStoryID && job.StoryID != "pending_harness_creation" {
+		return true
+	}
+	return false
+}
+
 // resolveConversationFallback discovers an active or recent conversation ID on disk or in the worktree.
 func resolveConversationFallback(worktree, storyID, engineName string) string {
 	if worktree == "" {
@@ -1047,14 +1064,20 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	defer lock.Release()
 
 	storyID := job.StoryID
-	if strings.TrimSpace(storyID) == "" || strings.EqualFold(storyID, fallbackResumeStoryID) || strings.EqualFold(storyID, "resume complete current ase flow") {
-		dCtx := sessionstore.DefaultResolver().DetectDirtyWorktreeContext(worktree)
-		if dCtx.StoryID != "" {
-			storyID = dCtx.StoryID
+	isASE := isASEJob(job)
+	if isASE {
+		if strings.TrimSpace(storyID) == "" || strings.EqualFold(storyID, fallbackResumeStoryID) || strings.EqualFold(storyID, "resume complete current ase flow") {
+			dCtx := sessionstore.DefaultResolver().DetectDirtyWorktreeContext(worktree)
+			if dCtx.StoryID != "" {
+				storyID = dCtx.StoryID
+			}
 		}
-	}
-	if strings.TrimSpace(storyID) == "" {
-		storyID = fallbackResumeStoryID
+		if strings.TrimSpace(storyID) == "" {
+			storyID = fallbackResumeStoryID
+		}
+	} else {
+		storyID = ""
+		job.StoryID = ""
 	}
 
 	prepRes, err := prompt.Prepare(prompt.Input{
@@ -1116,7 +1139,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 		log.Printf("[harness] [job.resume.conversation_fallback] resume_mode=fallback_new_conversation reason=%q", preflightFallbackReason)
 	}
-	if resumeConvID == "" && !isControlPlaneResume && job.ResumeMode != "fallback_new_conversation" {
+	if isASE && resumeConvID == "" && !isControlPlaneResume && job.ResumeMode != "fallback_new_conversation" {
 		resumeConvID = resolveConversationFallback(worktree, job.StoryID, engineName)
 		if resumeConvID != "" {
 			log.Printf("[harness] [ASE-SUPERVISOR] Discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
@@ -1148,7 +1171,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		log.Printf("[harness] [ASE-SUPERVISOR] Discovered active tool process (ToolPID: %d) from existing lock on %s", attachToolPID, worktree)
 	}
 
-	if !isControlPlaneResume && job.ResumeMode != "fallback_new_conversation" && resumeConvID == "" && lockHandle.Info().ConversationID != "" && (job.Kind == "resume" || (job.StoryID != "" && lockHandle.Info().StoryID == job.StoryID && lockHandle.Info().Status != "COMPLETED")) {
+	if isASE && !isControlPlaneResume && job.ResumeMode != "fallback_new_conversation" && resumeConvID == "" && lockHandle.Info().ConversationID != "" && (job.Kind == "resume" || (job.StoryID != "" && lockHandle.Info().StoryID == job.StoryID && lockHandle.Info().Status != "COMPLETED")) {
 		resumeConvID = lockHandle.Info().ConversationID
 		log.Printf("[harness] Adopted prior conversation %s from repo lock for %s", resumeConvID, worktree)
 	}
@@ -1261,7 +1284,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	defer stopFlush()
 
 	currentBoundStoryID := job.StoryID
-	if currentBoundStoryID == "" || currentBoundStoryID == "pending_harness_creation" {
+	if isASE && (currentBoundStoryID == "" || currentBoundStoryID == "pending_harness_creation") {
 		if initResolved := resolveLiveStoryID(worktree, prepRes.Prompt, currentBoundStoryID); initResolved != "" && initResolved != "pending_harness_creation" {
 			currentBoundStoryID = initResolved
 			job.StoryID = initResolved
@@ -1296,16 +1319,19 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 								lastTickSent = now
 							}
 						}
-						// Progress-aware liveness: check if engine has active child processes
+						// Progress-aware liveness: check if engine has active child processes (excluding persistent MCP daemons)
 						childProcs, _ := watchdog.GetDescendantProcesses(activePID)
+						childProcs = watchdog.FilterNonDaemonChildProcesses(childProcs)
 						if len(childProcs) > 0 {
 							if now.Sub(lastSilenceWarning) >= 30*time.Second {
 								lastSilenceWarning = now
 								elapsedStr := time.Since(startTime).Truncate(time.Second).String()
 								summary, pids := watchdog.FormatActiveChildProcessesSummary(childProcs)
-								diag := fmt.Sprintf("[iazio-harness] Execution active (job %s, elapsed: %s); engine waiting on active child task(s): %s (pids: %v)\n",
-									jobID, elapsedStr, summary, pids)
-								_ = controlplane.PostChunkWithTelemetry(context.Background(), api, token, jobID, "stdout", diag, summary)
+								if summary != "" {
+									diag := fmt.Sprintf("[iazio-harness] Execution active (job %s, elapsed: %s); engine waiting on active child task(s): %s (pids: %v)\n",
+										jobID, elapsedStr, summary, pids)
+									_ = controlplane.PostChunkWithTelemetry(context.Background(), api, token, jobID, "stdout", diag, summary)
+								}
 							}
 						} else if ev.SilentForMs >= 30000 && now.Sub(lastSilenceWarning) >= 30*time.Second {
 							lastSilenceWarning = now
@@ -1317,27 +1343,28 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 						}
 
 						// Dynamic Story ID & Branch sync
-						if resolved := resolveLiveStoryID(worktree, "", currentBoundStoryID); resolved != "" && resolved != "pending_harness_creation" && resolved != currentBoundStoryID {
-							prevStory := currentBoundStoryID
-							currentBoundStoryID = resolved
-							job.StoryID = resolved
-							_ = lockHandle.Update(repolock.LockInfo{
-								JobID:          job.ID,
-								ScheduleID:     job.ScheduleID,
-								PID:            os.Getpid(),
-								HarnessPID:     os.Getpid(),
-								ToolPID:        activePID,
-								Engine:         engineName,
-								ConversationID: activeConvID,
-								StoryID:        resolved,
-								Prompt:         job.Prompt,
-								Status:         "RUNNING",
-							})
-							_ = controlplane.PostStoryBinding(context.Background(), api, token, jobID, resolved, "", "")
-							bindMsg := fmt.Sprintf("[iazio-harness] Bound active story ID: %s (branch: %s, previously: %s)\n",
-								resolved, resolveLiveGitBranch(worktree), prevStory)
-							_ = sp.AppendRaw("stdout", []byte(bindMsg))
-							_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", bindMsg)
+						if isASE {
+							if resolved := resolveLiveStoryID(worktree, "", currentBoundStoryID); resolved != "" && resolved != "pending_harness_creation" && resolved != currentBoundStoryID {
+								prevStory := currentBoundStoryID
+								currentBoundStoryID = resolved
+								job.StoryID = resolved
+								_ = lockHandle.Update(repolock.LockInfo{
+									JobID:          job.ID,
+									ScheduleID:     job.ScheduleID,
+									PID:            os.Getpid(),
+									HarnessPID:     os.Getpid(),
+									ToolPID:        activePID,
+									Engine:         engineName,
+									ConversationID: activeConvID,
+									StoryID:        resolved,
+									Prompt:         job.Prompt,
+									Status:         "RUNNING",
+								})
+								_ = controlplane.PostStoryBinding(context.Background(), api, token, jobID, resolved, "", "")
+								bindMsg := fmt.Sprintf("[iazio-harness] Bound active story ID: %s (branch: %s, previously: %s)\n",
+									resolved, resolveLiveGitBranch(worktree), prevStory)
+								_ = sp.AppendRaw("stdout", []byte(bindMsg))
+							}
 						}
 					}
 				}
@@ -1400,7 +1427,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	)
 	initialBanner += structuredAttemptBanner
 	_ = sp.AppendRaw("stdout", []byte(initialBanner))
-	_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", initialBanner)
+	for _, ev := range sp.Flush() {
+		if ev.Type == spool.EventOutputChunk {
+			_ = controlplane.PostChunk(context.Background(), api, token, jobID, ev.Stream, ev.Text)
+		}
+	}
 
 	var convWg sync.WaitGroup
 	var convMu sync.Mutex
@@ -1892,6 +1923,10 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 
 		// 2. Unmet ASE flow gates: when child engine exited with code 0 but left an incomplete story flow or dirty worktree
+		if !isASE {
+			// For ordinary non-ASE jobs, successful exit code 0 is immediately completed without checking story gates
+			return false, nil, ""
+		}
 		if execRes.ExitCode == 0 {
 			dirtyFiles := collectWorkspaceDirtyFiles(worktree)
 			if (diagReport.SIR != nil && diagReport.SIR.AutoHealable) || len(dirtyFiles) > 0 || (job.StoryID != "" && !diagReport.ASEComplete) {
@@ -1918,7 +1953,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			}
 		}
 
-		if os.Getenv("IAZIO_ENABLE_IN_PLACE_AUTO_RESUME") == "1" && execRes.ExitCode != 0 && job.StoryID != "" && !diagReport.ASEComplete {
+		if isASE && os.Getenv("IAZIO_ENABLE_IN_PLACE_AUTO_RESUME") == "1" && execRes.ExitCode != 0 && job.StoryID != "" && !diagReport.ASEComplete {
 			return true, []string{"incomplete_ase_flow"}, fmt.Sprintf("exit_code_%d", execRes.ExitCode)
 		}
 

@@ -2581,6 +2581,95 @@ fi
 	}
 }
 
+func TestExecuteJob_OrdinaryPrompt_CleanExecution_MCPDaemonsNoHang(t *testing.T) {
+	var postChunkTexts []string
+	var postExitCode int
+	var mu sync.Mutex
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
+			json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:          "job-1506",
+				Prompt:      "update tools",
+				Kind:        "ordinary",
+				Engine:      "agy",
+				Agent:       "agy",
+				Status:      "RUNNING",
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			var body struct {
+				Text string `json:"text"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			postChunkTexts = append(postChunkTexts, body.Text)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ticks"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+			var body struct {
+				ExitCode int `json:"exit_code"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			postExitCode = body.ExitCode
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	worktree := t.TempDir()
+	initCmd := exec.Command("git", "init", worktree)
+	_ = initCmd.Run()
+
+	mockDir := t.TempDir()
+	mockAgy := filepath.Join(mockDir, "agy")
+	script := `#!/bin/sh
+# Spawn long-lived mock MCP servers that hold open stdout/stderr
+sleep 30 &
+sleep 30 &
+echo "### Summary of Actions Completed (job-1506)"
+echo "zero open SIRs, clean state."
+exit 0
+`
+	if err := os.WriteFile(mockAgy, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", mockDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := executeJob(ctx, ts.URL, "job-1506", worktree, "", "ordinary", "", "")
+	if err != nil {
+		t.Fatalf("expected executeJob to succeed, got error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if postExitCode != 0 {
+		t.Fatalf("expected exit code 0 reported to control plane, got %d", postExitCode)
+	}
+
+	allOutput := strings.Join(postChunkTexts, "\n")
+	if strings.Contains(allOutput, "harness-job:") {
+		t.Fatalf("expected output to NOT contain harness-job prefix, got: %s", allOutput)
+	}
+	if strings.Contains(allOutput, "STORY-RESUME-INPLACE") {
+		t.Fatalf("expected ordinary prompt to NOT inject STORY-RESUME-INPLACE, got: %s", allOutput)
+	}
+
+	// Verify no duplicate [ASE-SUPERVISOR] Starting execution for job
+	bannerCount := strings.Count(allOutput, "Starting execution for job job-1506")
+	if bannerCount != 1 {
+		t.Fatalf("expected exactly 1 occurrence of startup banner, got %d in: %s", bannerCount, allOutput)
+	}
+}
+
 
 
 
