@@ -220,6 +220,10 @@ type JobDetail struct {
 	ResumeFallbackReason        string            `json:"resume_fallback_reason,omitempty"`
 	InterruptedASEState         map[string]any    `json:"interrupted_ase_state,omitempty"`
 	ConversationIDs             []string          `json:"conversation_ids,omitempty"`
+	Reason                      string            `json:"reason,omitempty"`
+	ExitCode                    int               `json:"exit_code,omitempty"`
+	TerminationReasonMessage    string            `json:"termination_reason_message,omitempty"`
+	FailureReasonSummary        string            `json:"failure_reason_summary,omitempty"`
 }
 
 // GetJob fetches the job definition from the control plane.
