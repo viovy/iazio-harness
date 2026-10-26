@@ -377,8 +377,40 @@ func GetDescendantProcesses(rootPID int) ([]ProcessInfo, error) {
 	return platformGetDescendantProcesses(rootPID)
 }
 
-// FormatActiveChildProcessesSummary formats a concise summary of active child tasks.
+// IsMCPDaemon reports whether a command line or process name belongs to a persistent MCP or IDE daemon.
+func IsMCPDaemon(cmdOrArgs string) bool {
+	lower := strings.ToLower(cmdOrArgs)
+	return strings.Contains(lower, "autopilot-mcp") ||
+		strings.Contains(lower, "chrome-devtools-mcp") ||
+		strings.Contains(lower, "googlecloudtools") ||
+		strings.Contains(lower, "-mcp") ||
+		strings.Contains(lower, "mcp serve") ||
+		strings.Contains(lower, "mcp-server") ||
+		strings.Contains(lower, "datacloud")
+}
+
+// FilterNonDaemonChildProcesses removes persistent MCP/IDE daemon servers from the child process list.
+func FilterNonDaemonChildProcesses(procs []ProcessInfo) []ProcessInfo {
+	if len(procs) == 0 {
+		return nil
+	}
+	var filtered []ProcessInfo
+	for _, p := range procs {
+		target := p.Args
+		if target == "" {
+			target = p.Command
+		}
+		if !IsMCPDaemon(target) {
+			filtered = append(filtered, p)
+		}
+	}
+	return filtered
+}
+
+// FormatActiveChildProcessesSummary formats a concise summary of active child tasks,
+// excluding persistent background MCP daemons.
 func FormatActiveChildProcessesSummary(procs []ProcessInfo) (summary string, pids []int) {
+	procs = FilterNonDaemonChildProcesses(procs)
 	if len(procs) == 0 {
 		return "", nil
 	}

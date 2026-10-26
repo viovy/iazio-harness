@@ -70,13 +70,13 @@ func Fill(body string, v Values) (string, error) {
 
 // Prepare fills the stored body and, for story_refinement, writes the idea transcript
 // beside the spool. Transcript bytes are not copied into the prompt string.
-// The marker line harness-job: <job_id> is prepended to the text sent to the CLI.
+// Prompt text is kept clean without synthetic harness-job prefixes.
 func Prepare(in Input) (Result, error) {
 	if err := safeJobID(in.JobID); err != nil {
 		return Result{}, err
 	}
 	values := in.Values
-	if strings.TrimSpace(values.StoryID) == "" {
+	if in.Kind != "ordinary" && strings.TrimSpace(values.StoryID) == "" {
 		values.StoryID = "STORY-RESUME-INPLACE"
 	}
 	var transcriptPath string
@@ -100,10 +100,9 @@ func Prepare(in Input) (Result, error) {
 	if in.Kind == KindStoryRefinement && in.Transcript != "" && strings.Contains(filled, in.Transcript) {
 		return Result{}, errors.New("transcript bytes must not be placed in the prompt")
 	}
-	prompt := "harness-job: " + in.JobID + "\n" + filled
+	prompt := filled
 	if in.Kind == "resume" {
-		prompt = "harness-job: " + in.JobID + " [RESUME]\n" +
-			"[RESUMPTION NOTICE]: You are resuming an interrupted execution in " + in.Values.WorktreePath + ".\n" +
+		prompt = "[RESUMPTION NOTICE]: You are resuming an interrupted execution in " + in.Values.WorktreePath + ".\n" +
 			"Do NOT discard or revert uncommitted changes or submodule commits. Inspect existing git status, reviews, and test status first.\n" +
 			"If implementation is already committed in submodules and initial review scheme has run, advance directly to subsequent review iterations and execute-story-flow closeout.\n\n" + filled
 	}

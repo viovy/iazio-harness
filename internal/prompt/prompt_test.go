@@ -28,7 +28,10 @@ func TestTranscriptNotInBody(t *testing.T) {
 	if strings.Contains(res.Prompt, "secret transcript") {
 		t.Fatal(res.Prompt)
 	}
-	if !strings.Contains(res.Prompt, "harness-job: job-1") {
+	if strings.Contains(res.Prompt, "harness-job:") {
+		t.Fatalf("expected clean prompt without harness-job prefix, got %q", res.Prompt)
+	}
+	if !strings.Contains(res.Prompt, "read ") {
 		t.Fatal(res.Prompt)
 	}
 }
@@ -41,14 +44,33 @@ func TestPrepareResumeKind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(res.Prompt, "harness-job: job-99 [RESUME]") {
-		t.Fatalf("expected resume header, got %q", res.Prompt)
+	if strings.Contains(res.Prompt, "harness-job:") {
+		t.Fatalf("expected clean prompt without harness-job prefix, got %q", res.Prompt)
 	}
 	if !strings.Contains(res.Prompt, "[RESUMPTION NOTICE]") {
 		t.Fatalf("expected resumption notice, got %q", res.Prompt)
 	}
 	if !strings.Contains(res.Prompt, "implement story") {
 		t.Fatalf("expected original prompt body, got %q", res.Prompt)
+	}
+}
+
+func TestPrepareOrdinaryKindDoesNotInjectStoryID(t *testing.T) {
+	res, err := Prepare(Input{
+		JobID: "job-1506", Kind: "ordinary",
+		Body: "update tools",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Prompt, "harness-job:") {
+		t.Fatalf("expected clean prompt without harness-job prefix, got %q", res.Prompt)
+	}
+	if strings.Contains(res.Prompt, "STORY-RESUME-INPLACE") {
+		t.Fatalf("expected no fake story ID, got %q", res.Prompt)
+	}
+	if res.Prompt != "update tools" {
+		t.Fatalf("expected clean prompt 'update tools', got %q", res.Prompt)
 	}
 }
 
