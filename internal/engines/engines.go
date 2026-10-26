@@ -872,7 +872,7 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		}
 		argv = append(argv, "--", req.Prompt)
 		return argv, nil
-	case "agy":
+	case "agy", "mock-agy":
 		timeout := req.PrintTimeout
 		if timeout == "" || timeout == "0" || timeout == "0s" || timeout == "none" || timeout == "unbounded" {
 			timeout = "0"
@@ -885,10 +885,12 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		if prompt == "" {
 			prompt = "resume"
 		}
-		bin := "agy"
-		if _, err := exec.LookPath(bin); err != nil {
-			if _, errG := exec.LookPath("gemini"); errG == nil {
-				bin = "gemini"
+		bin := engine
+		if bin == "agy" {
+			if _, err := exec.LookPath(bin); err != nil {
+				if _, errG := exec.LookPath("gemini"); errG == nil {
+					bin = "gemini"
+				}
 			}
 		}
 		argv := []string{bin, "--print", prompt, "--print-timeout", timeout, "--model", model}
