@@ -4,6 +4,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -198,6 +200,8 @@ func hasEngineSessionAttachError(logData []byte) bool {
 			strings.HasPrefix(line, "error:") ||
 			strings.HasPrefix(line, "fatal:") ||
 			strings.HasPrefix(line, "[fatal]") ||
+			strings.HasPrefix(line, "warning: conversation") ||
+			strings.HasPrefix(line, "warning: session") ||
 			strings.HasPrefix(line, "failed to attach") ||
 			strings.HasPrefix(line, "failed to open session") ||
 			strings.HasPrefix(line, "cannot find session") ||
@@ -207,12 +211,12 @@ func hasEngineSessionAttachError(logData []byte) bool {
 			strings.HasPrefix(line, "session not found") ||
 			strings.HasPrefix(line, "invalid session")
 
-		if !isErrorPrefix {
-			continue
+		if isErrorPrefix && (strings.Contains(line, "conversation") || strings.Contains(line, "session")) {
+			return true
 		}
 
-		if strings.Contains(line, "conversation") ||
-			strings.Contains(line, "session") {
+		if (strings.Contains(line, "conversation") || strings.Contains(line, "session")) &&
+			(strings.Contains(line, "not found") || strings.Contains(line, "unable to resume") || strings.Contains(line, "failed to attach") || strings.Contains(line, "corrupted")) {
 			return true
 		}
 	}
@@ -558,6 +562,188 @@ func countReviewReports(workspacePath string) int {
 	return count
 }
 
+func dedupeStrings(slice []string) []string {
+	seen := make(map[string]bool)
+	var res []string
+	for _, s := range slice {
+		s = strings.TrimSpace(s)
+		if s != "" && !seen[s] {
+			seen[s] = true
+			res = append(res, s)
+		}
+	}
+	return res
+}
+
+func reapStaleGitLocks(worktree string) {
+	if worktree == "" {
+		return
+	}
+	candidates := []string{
+		filepath.Join(worktree, ".git", "index.lock"),
+		filepath.Join(worktree, ".autopilot", "lock"),
+		filepath.Join(worktree, ".ase", "active.lock"),
+	}
+	submodules := discoverNestedSubmodules(worktree)
+	for _, sub := range submodules {
+		candidates = append(candidates, filepath.Join(worktree, sub, ".git", "index.lock"))
+		gitFile := filepath.Join(worktree, sub, ".git")
+		if data, err := os.ReadFile(gitFile); err == nil {
+			content := strings.TrimSpace(string(data))
+			if strings.HasPrefix(content, "gitdir:") {
+				relGitDir := strings.TrimSpace(strings.TrimPrefix(content, "gitdir:"))
+				gitDir := filepath.Join(worktree, sub, relGitDir)
+				candidates = append(candidates, filepath.Join(gitDir, "index.lock"))
+			}
+		}
+	}
+
+	for _, lockPath := range candidates {
+		if fi, err := os.Stat(lockPath); err == nil && !fi.IsDir() {
+			if time.Since(fi.ModTime()) > 5*time.Second {
+				_ = os.Remove(lockPath)
+			}
+		}
+	}
+}
+
+func discoverNestedSubmodules(worktree string) []string {
+	if worktree == "" {
+		return nil
+	}
+	found := make(map[string]bool)
+
+	// 1. Parse .gitmodules if present
+	gmPath := filepath.Join(worktree, ".gitmodules")
+	if data, err := os.ReadFile(gmPath); err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, l := range lines {
+			trimmed := strings.TrimSpace(l)
+			if strings.HasPrefix(trimmed, "path =") || strings.HasPrefix(trimmed, "path=") {
+				parts := strings.SplitN(trimmed, "=", 2)
+				if len(parts) == 2 {
+					sub := strings.TrimSpace(parts[1])
+					sub = filepath.ToSlash(sub)
+					if sub != "" {
+						found[sub] = true
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Scan direct children for .git directory or git file
+	entries, err := os.ReadDir(worktree)
+	if err == nil {
+		for _, e := range entries {
+			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+				subPath := filepath.Join(worktree, e.Name())
+				if _, err := os.Stat(filepath.Join(subPath, ".git")); err == nil {
+					found[e.Name()] = true
+				}
+			}
+		}
+	}
+
+	var res []string
+	for sub := range found {
+		res = append(res, sub)
+	}
+	sort.Strings(res)
+	return res
+}
+
+func countStoryChecklists(workspacePath string) string {
+	if workspacePath == "" {
+		return "0/0"
+	}
+	storiesDir := filepath.Join(workspacePath, "docs", "stories")
+	entries, err := os.ReadDir(storiesDir)
+	if err != nil {
+		return "0/0"
+	}
+	checked := 0
+	total := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".story.md") {
+			data, err := os.ReadFile(filepath.Join(storiesDir, e.Name()))
+			if err == nil {
+				checked += strings.Count(string(data), "- [x]")
+				total += (strings.Count(string(data), "- [x]") + strings.Count(string(data), "- [ ]"))
+			}
+		}
+	}
+	return fmt.Sprintf("%d/%d", checked, total)
+}
+
+func collectAutopilotStateFingerprint(workspacePath string) string {
+	if workspacePath == "" {
+		return ""
+	}
+	h := sha256.New()
+	for _, relDir := range []string{filepath.Join("docs", "reviews"), filepath.Join("tmp", "reports"), ".autopilot"} {
+		dir := filepath.Join(workspacePath, relDir)
+		entries, err := os.ReadDir(dir)
+		if err == nil {
+			for _, e := range entries {
+				fi, err := e.Info()
+				if err == nil {
+					h.Write([]byte(fmt.Sprintf("%s:%d:%d\n", e.Name(), fi.Size(), fi.ModTime().UnixNano())))
+				}
+			}
+		}
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func resolveFleetProgressFingerprint(worktree string) string {
+	if worktree == "" {
+		return ""
+	}
+	h := sha256.New()
+
+	// 1. Root meta-repo state
+	headSHA := resolveGitHead(worktree)
+	branch := resolveLiveGitBranch(worktree)
+	dirtyFiles := collectWorkspaceDirtyFiles(worktree)
+	h.Write([]byte(fmt.Sprintf("root:%s:%s:%d\n", headSHA, branch, len(dirtyFiles))))
+	for _, f := range dirtyFiles {
+		h.Write([]byte(fmt.Sprintf("dirty:%s\n", f)))
+	}
+	if diffOut, err := exec.Command("git", "-C", worktree, "diff", "HEAD").Output(); err == nil && len(diffOut) > 0 {
+		diffH := sha256.Sum256(diffOut)
+		h.Write([]byte(fmt.Sprintf("root-diff:%x\n", diffH)))
+	}
+
+	// 2. Discover all nested fleet sub-repositories
+	submodules := discoverNestedSubmodules(worktree)
+	for _, sub := range submodules {
+		subPath := filepath.Join(worktree, sub)
+		subHead := resolveGitHead(subPath)
+		subBranch := resolveLiveGitBranch(subPath)
+		subDirty := collectWorkspaceDirtyFiles(subPath)
+		h.Write([]byte(fmt.Sprintf("sub:%s:%s:%s:%d\n", sub, subHead, subBranch, len(subDirty))))
+		for _, f := range subDirty {
+			h.Write([]byte(fmt.Sprintf("sub-dirty:%s:%s\n", sub, f)))
+		}
+		if subDiff, err := exec.Command("git", "-C", subPath, "diff", "HEAD").Output(); err == nil && len(subDiff) > 0 {
+			diffH := sha256.Sum256(subDiff)
+			h.Write([]byte(fmt.Sprintf("sub-diff:%s:%x\n", sub, diffH)))
+		}
+	}
+
+	// 3. Review reports and .autopilot/ state progression
+	reviewsCount := countReviewReports(worktree)
+	autopilotFingerprint := collectAutopilotStateFingerprint(worktree)
+	h.Write([]byte(fmt.Sprintf("reviews:%d:ap:%s\n", reviewsCount, autopilotFingerprint)))
+
+	// 4. Story checklist progression
+	checklistState := countStoryChecklists(worktree)
+	h.Write([]byte(fmt.Sprintf("checklists:%s\n", checklistState)))
+
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
 func resolveLiveStoryID(workspacePath string, outputText string, currentStoryID string) string {
 	// 1. From output text explicit STORY_ID bindings (e.g. STORY_ID=STORY-GOV-3691 or STORY_ID: STORY-GOV-3691)
 	storyRegex := regexp.MustCompile(`STORY_ID[=:\s]+(STORY-[A-Z]+-[0-9]+)`)
@@ -897,18 +1083,21 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	isPreflightFallback := false
 	preflightFallbackReason := ""
 
-	resumeConvID := job.ActiveConversationID
-	if resumeConvID == "" && job.ResumeMode != "fallback_new_conversation" {
-		resumeConvID = job.ResumeConversationID
-	}
-	if resumeConvID == "" && job.ResumeMode != "fallback_new_conversation" {
-		resumeConvID = job.InitialConversationID
-	}
-	if resumeConvID == "" && job.ResumeMode != "fallback_new_conversation" && job.EnvVars != nil {
-		resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
-	}
-	if resumeConvID == "" && job.ResumeMode != "fallback_new_conversation" && len(job.ConversationIDs) > 0 {
-		resumeConvID = job.ConversationIDs[0]
+	resumeConvID := ""
+	if job.ResumeMode != "fallback_new_conversation" {
+		resumeConvID = job.ActiveConversationID
+		if resumeConvID == "" {
+			resumeConvID = job.ResumeConversationID
+		}
+		if resumeConvID == "" {
+			resumeConvID = job.InitialConversationID
+		}
+		if resumeConvID == "" && job.EnvVars != nil {
+			resumeConvID = job.EnvVars["RESUME_CONVERSATION_ID"]
+		}
+		if resumeConvID == "" && len(job.ConversationIDs) > 0 {
+			resumeConvID = job.ConversationIDs[0]
+		}
 	}
 	if job.ResumeMode == "fallback_new_conversation" && job.ActiveConversationID == "" {
 		isPreflightFallback = true
@@ -918,7 +1107,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 		log.Printf("[harness] [job.resume.conversation_fallback] resume_mode=fallback_new_conversation reason=%q", preflightFallbackReason)
 	}
-	if resumeConvID == "" && !isControlPlaneResume {
+	if resumeConvID == "" && !isControlPlaneResume && job.ResumeMode != "fallback_new_conversation" {
 		resumeConvID = resolveConversationFallback(worktree, job.StoryID, engineName)
 		if resumeConvID != "" {
 			log.Printf("[harness] [ASE-SUPERVISOR] Discovered prior conversation %s (story: %s, engine: %s) for worktree %s", resumeConvID, job.StoryID, engineName, worktree)
@@ -950,7 +1139,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		log.Printf("[harness] [ASE-SUPERVISOR] Discovered active tool process (ToolPID: %d) from existing lock on %s", attachToolPID, worktree)
 	}
 
-	if !isControlPlaneResume && resumeConvID == "" && lockHandle.Info().ConversationID != "" && (job.Kind == "resume" || (job.StoryID != "" && lockHandle.Info().StoryID == job.StoryID && lockHandle.Info().Status != "COMPLETED")) {
+	if !isControlPlaneResume && job.ResumeMode != "fallback_new_conversation" && resumeConvID == "" && lockHandle.Info().ConversationID != "" && (job.Kind == "resume" || (job.StoryID != "" && lockHandle.Info().StoryID == job.StoryID && lockHandle.Info().Status != "COMPLETED")) {
 		resumeConvID = lockHandle.Info().ConversationID
 		log.Printf("[harness] Adopted prior conversation %s from repo lock for %s", resumeConvID, worktree)
 	}
@@ -1427,6 +1616,14 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		fallbackReq := execReq
 		fallbackReq.ResumeConversationID = "" // clear to start a new conversation
 		fallbackReq.Argv = nil
+		fallbackReq.DangerouslySkipPermissions = true
+
+		canonicalASEPrompt := "resume and complete current /autonomous-story-execution flow"
+		if fallbackReq.Prompt == "" || strings.EqualFold(strings.TrimSpace(fallbackReq.Prompt), "resume") {
+			fallbackReq.Prompt = canonicalASEPrompt
+		} else if !strings.Contains(fallbackReq.Prompt, canonicalASEPrompt) {
+			fallbackReq.Prompt = canonicalASEPrompt + "\n\n" + fallbackReq.Prompt
+		}
 
 		// Reset confirmed conversation so the new fallback conversation can be pinned
 		convMu.Lock()
@@ -1651,21 +1848,33 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 
 		// 2. Unmet ASE flow gates: when child engine exited with code 0 but left an incomplete story flow or dirty worktree
-		if execRes.ExitCode == 0 && diagReport.SIR != nil && diagReport.SIR.AutoHealable {
-			var unmet []string
-			for _, f := range diagReport.Findings {
-				if f.Code == diagnostics.CodeIncompleteASEFlow {
-					unmet = append(unmet, "clean_working_tree", "story_definition_of_done")
-				} else if f.Code == diagnostics.CodeDirtyWorktreePostExit {
+		if execRes.ExitCode == 0 {
+			dirtyFiles := collectWorkspaceDirtyFiles(worktree)
+			if (diagReport.SIR != nil && diagReport.SIR.AutoHealable) || len(dirtyFiles) > 0 || (job.StoryID != "" && !diagReport.ASEComplete) {
+				var unmet []string
+				if diagReport.GateResult != nil && len(diagReport.GateResult.UnmetGates) > 0 {
+					unmet = append(unmet, diagReport.GateResult.UnmetGates...)
+				}
+				for _, f := range diagReport.Findings {
+					if f.Code == diagnostics.CodeIncompleteASEFlow {
+						unmet = append(unmet, "clean_working_tree", "story_definition_of_done")
+					} else if f.Code == diagnostics.CodeDirtyWorktreePostExit {
+						unmet = append(unmet, "clean_working_tree")
+					}
+				}
+				if len(unmet) == 0 && len(dirtyFiles) > 0 {
 					unmet = append(unmet, "clean_working_tree")
 				}
-			}
-			if len(unmet) > 0 {
-				return true, unmet, "unmet_ase_completion_gates"
+				if len(unmet) == 0 && job.StoryID != "" && !diagReport.ASEComplete {
+					unmet = append(unmet, "story_definition_of_done")
+				}
+				if len(unmet) > 0 {
+					return true, dedupeStrings(unmet), "unmet_ase_completion_gates"
+				}
 			}
 		}
 
-		if os.Getenv("IAZIO_ENABLE_IN_PLACE_AUTO_RESUME") == "1" && execRes.ExitCode != 0 && !diagReport.ASEComplete {
+		if os.Getenv("IAZIO_ENABLE_IN_PLACE_AUTO_RESUME") == "1" && execRes.ExitCode != 0 && job.StoryID != "" && !diagReport.ASEComplete {
 			return true, []string{"incomplete_ase_flow"}, fmt.Sprintf("exit_code_%d", execRes.ExitCode)
 		}
 
@@ -1678,10 +1887,10 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			break
 		}
 
-		headSHA := resolveGitHead(worktree)
+		reapStaleGitLocks(worktree)
 		dirtyFiles := collectWorkspaceDirtyFiles(worktree)
-		reviewsCount := countReviewReports(worktree)
-		currentFp := fmt.Sprintf("%s:%s:%d:%d", headSHA, resolveLiveGitBranch(worktree), len(dirtyFiles), reviewsCount)
+
+		currentFp := resolveFleetProgressFingerprint(worktree)
 		if currentFp != lastProgressFp {
 			consecutiveStalls = 0
 			lastProgressFp = currentFp
@@ -2296,7 +2505,7 @@ func collectWorkspaceDirtyFiles(worktree string) []string {
 		trimmed := strings.TrimSpace(l)
 		if len(trimmed) > 3 {
 			filePath := strings.TrimSpace(trimmed[2:])
-			if filePath != "" {
+			if filePath != "" && !gate.IsIgnoredTransientArtifact(filePath) {
 				dirty = append(dirty, filePath)
 			}
 		}

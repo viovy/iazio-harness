@@ -2053,10 +2053,20 @@ func TestExecuteJob_AttachRunningTool(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	mockDir := t.TempDir()
+	mockAgy := filepath.Join(mockDir, "agy")
+	_ = os.WriteFile(mockAgy, []byte("#!/bin/sh\nexit 0\n"), 0755)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
 	cmd := exec.Command("sleep", "0.4")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("failed to start mock tool process: %v", err)
 	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}()
 	go func() {
 		_ = cmd.Wait()
 	}()
@@ -2446,6 +2456,128 @@ func TestCollectWorkspaceDirtyFiles_AndVerifyRelease(t *testing.T) {
 	err := runVerifyReleaseCommand([]string{"--api-url", "http://127.0.0.1:54321", "--token", "tok"})
 	if err == nil {
 		t.Errorf("expected error connecting to non-existent server")
+	}
+}
+
+func TestExecuteJob_DeterministicResume_ConversationNotFound_StartsNewConversationWithASEPrompt(t *testing.T) {
+	mockHome := t.TempDir()
+	t.Setenv("HOME", mockHome)
+
+	mockDir := t.TempDir()
+	countFile := filepath.Join(mockDir, "invocations.txt")
+	mockAgy := filepath.Join(mockDir, "agy")
+	targetConvID := "110d238e-1851-4036-a4f8-c4633e56ae27"
+	newConvID := "220e349f-2962-5147-b5f9-d5744f67bf38"
+
+	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
+run_num=$(wc -l < "%s" 2>/dev/null || echo 0)
+echo "run" >> "%s"
+echo "$*" > "%s/run_${run_num}.txt"
+
+if [ "$run_num" -eq 0 ]; then
+  # Run 1: Resuming target conversation fails because conversation is not found
+  echo 'warning: conversation "%s" not found' >&2
+  exit 1
+else
+  # Run 2: Clean fallback starts new conversation
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --log-file)
+        shift
+        echo "I1026 04:00:00.000000 1 server.go:1274] Created conversation %s" > "$1"
+        ;;
+    esac
+    shift
+  done
+  echo "autonomous execution converged to green"
+  exit 0
+fi
+`, countFile, countFile, mockDir, targetConvID, newConvID)), 0755)
+
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	_ = exec.Command("git", "init", workDir).Run()
+
+	var postMu sync.Mutex
+	var postedConvs []map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/chunks") || strings.HasSuffix(r.URL.Path, "/ticks") || strings.HasSuffix(r.URL.Path, "/exit") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/conversations") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postMu.Lock()
+			postedConvs = append(postedConvs, body)
+			postMu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/jobs/job-1461-ase-resume" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:                    "job-1461-ase-resume",
+				Kind:                  "resume",
+				Engine:                "agy",
+				Prompt:                "resume",
+				WorktreePath:          workDir,
+				InitialConversationID: targetConvID,
+				ResumeConversationID:  targetConvID,
+				ParentJobID:           "job-1459",
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := executeJob(context.Background(), srv.URL, "job-1461-ase-resume", workDir, "")
+	if err != nil {
+		t.Fatalf("executeJob failed: %v", err)
+	}
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("expected count file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected exactly 2 executions (run1 resume fail, run2 clean fallback), got %d executions: %v", len(lines), lines)
+	}
+
+	run1Data, err := os.ReadFile(filepath.Join(mockDir, "run_0.txt"))
+	if err != nil {
+		t.Fatalf("expected run_0.txt: %v", err)
+	}
+	run1Str := string(run1Data)
+
+	run2Data, err := os.ReadFile(filepath.Join(mockDir, "run_1.txt"))
+	if err != nil {
+		t.Fatalf("expected run_1.txt: %v", err)
+	}
+	run2Str := string(run2Data)
+
+	// 1. Run 1: attempt previous conversation with --conversation and --dangerously-skip-permissions
+	if !strings.Contains(run1Str, "--conversation="+targetConvID) {
+		t.Fatalf("expected run 1 to attempt target conversation, got: %s", run1Str)
+	}
+	if !strings.Contains(run1Str, "--dangerously-skip-permissions") {
+		t.Fatalf("expected run 1 to include --dangerously-skip-permissions, got: %s", run1Str)
+	}
+
+	// 2. Run 2: start new conversation without --conversation, with --dangerously-skip-permissions, and with canonical ASE prompt
+	if strings.Contains(run2Str, "--conversation="+targetConvID) {
+		t.Fatalf("expected run 2 NOT to have target conversation, got: %s", run2Str)
+	}
+	if !strings.Contains(run2Str, "--dangerously-skip-permissions") {
+		t.Fatalf("expected run 2 to include --dangerously-skip-permissions, got: %s", run2Str)
+	}
+	if !strings.Contains(run2Str, "resume and complete current /autonomous-story-execution flow") {
+		t.Fatalf("expected run 2 to include canonical ASE prompt 'resume and complete current /autonomous-story-execution flow', got: %s", run2Str)
 	}
 }
 

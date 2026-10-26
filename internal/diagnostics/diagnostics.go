@@ -59,17 +59,18 @@ type SIRRecord struct {
 
 // DiagnosticReport is the overall result of diagnosing an execution.
 type DiagnosticReport struct {
-	Healthy      bool       `json:"healthy"`
-	ASEComplete  bool       `json:"ase_complete"`
-	ExitCode     int        `json:"exit_code"`
-	Findings     []Finding  `json:"findings"`
-	StoryID      string     `json:"story_id,omitempty"`
-	WorktreePath string     `json:"worktree_path"`
-	Branch       string     `json:"branch,omitempty"`
-	Porcelain    string     `json:"porcelain,omitempty"`
-	SIR          *SIRRecord `json:"sir,omitempty"`
-	SIRPath      string     `json:"sir_path,omitempty"`
-	GeneratedAt  string     `json:"generated_at"`
+	Healthy      bool             `json:"healthy"`
+	ASEComplete  bool             `json:"ase_complete"`
+	ExitCode     int              `json:"exit_code"`
+	Findings     []Finding        `json:"findings"`
+	StoryID      string           `json:"story_id,omitempty"`
+	WorktreePath string           `json:"worktree_path"`
+	Branch       string           `json:"branch,omitempty"`
+	Porcelain    string           `json:"porcelain,omitempty"`
+	SIR          *SIRRecord       `json:"sir,omitempty"`
+	SIRPath      string           `json:"sir_path,omitempty"`
+	GeneratedAt  string           `json:"generated_at"`
+	GateResult   *gate.GateResult `json:"gate_result,omitempty"`
 }
 
 // DiagnosticInput provides context for execution diagnosis.
@@ -281,7 +282,14 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 	// 2. Check worktree porcelain status
 	if input.WorktreePath != "" {
 		if porc, err := git("status", "--porcelain"); err == nil {
-			report.Porcelain = porc
+			var meaningfulLines []string
+			for _, l := range strings.Split(porc, "\n") {
+				trimmed := strings.TrimSpace(l)
+				if trimmed != "" && !gate.IsIgnoredTransientArtifact(trimmed) {
+					meaningfulLines = append(meaningfulLines, l)
+				}
+			}
+			report.Porcelain = strings.Join(meaningfulLines, "\n")
 		}
 	}
 
@@ -478,13 +486,20 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 	// 5. Worktree cleanliness check after exit
 	if input.ExitCode == 0 && report.Porcelain != "" {
 		lines := strings.Split(strings.TrimSpace(report.Porcelain), "\n")
-		count := len(lines)
-		report.Findings = append(report.Findings, Finding{
-			Code:        CodeDirtyWorktreePostExit,
-			Severity:    "ERROR",
-			Message:     fmt.Sprintf("Child engine exited with code 0 but left %d modified/untracked files in worktree without completing story.", count),
-			Remediation: "Review uncommitted changes, complete ASE Phase 4/5, or discard untracked artifacts.",
-		})
+		var meaningfulCount int
+		for _, l := range lines {
+			if strings.TrimSpace(l) != "" && !gate.IsIgnoredTransientArtifact(l) {
+				meaningfulCount++
+			}
+		}
+		if meaningfulCount > 0 {
+			report.Findings = append(report.Findings, Finding{
+				Code:        CodeDirtyWorktreePostExit,
+				Severity:    "ERROR",
+				Message:     fmt.Sprintf("Child engine exited with code 0 but left %d modified/untracked files in worktree without completing story.", meaningfulCount),
+				Remediation: "Review uncommitted changes, complete ASE Phase 4/5, or discard untracked artifacts.",
+			})
+		}
 	}
 
 	// 5b. Post-exit ASE Completion Gate
@@ -496,6 +511,7 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 			RequireReleaseVerified: input.RequireReleaseVerified,
 			GitRunner:              git,
 		})
+		report.GateResult = &gateRes
 		if !gateRes.Passed {
 			report.ASEComplete = false
 			report.Findings = append(report.Findings, Finding{
@@ -504,6 +520,8 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 				Message:     fmt.Sprintf("Child engine exited with code 0 but ASE completion gate failed: unmet gates: %v", gateRes.UnmetGates),
 				Remediation: "Continue execution on active conversation to complete remaining ASE gates: " + strings.Join(gateRes.UnmetGates, ", "),
 			})
+		} else if gateRes.Passed && input.StoryID != "" {
+			report.ASEComplete = true
 		}
 	}
 
