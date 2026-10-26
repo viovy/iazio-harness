@@ -285,7 +285,7 @@ func TestSpool_MultiAttemptAppendPreservesInitialLogs(t *testing.T) {
 	attempt1Banner := "\n================================================================================\n" +
 		"[iazio] Starting Attempt #1 (trigger_reason: initial_dispatch, previous_exit_code: 0, previous_error: none, conversation_id: 110d238e, timestamp: 2026-10-26T04:05:11Z)\n" +
 		"================================================================================\n"
-	attempt1Startup := "[ASE-SUPERVISOR] Initializing execution for job job-1466 on /Users/romeo/work/meta-repo (engine: agy, kind: ordinary)\n"
+	attempt1Startup := "[ASE-SUPERVISOR] Initializing execution for job job-1466 on /Users/romeo/work/sample-repo (engine: agy, kind: ordinary)\n"
 	attempt1ModelOutput := "Model generating code for Attempt 1...\n"
 	_ = sp1.AppendRaw("stdout", []byte(attempt1Banner))
 	_ = sp1.AppendRaw("stdout", []byte(attempt1Startup))
@@ -302,7 +302,7 @@ func TestSpool_MultiAttemptAppendPreservesInitialLogs(t *testing.T) {
 	attempt2Banner := "\n================================================================================\n" +
 		"[iazio] Starting Attempt #2 (trigger_reason: lease_expired, previous_exit_code: 1, previous_error: LEASE_EXPIRED, conversation_id: 110d238e, timestamp: 2026-10-26T04:18:46Z)\n" +
 		"================================================================================\n"
-	attempt2Startup := "[ASE-SUPERVISOR] Initializing execution for job job-1466 on /Users/romeo/work/meta-repo (engine: agy, kind: resume)\n"
+	attempt2Startup := "[ASE-SUPERVISOR] Initializing execution for job job-1466 on /Users/romeo/work/sample-repo (engine: agy, kind: resume)\n"
 	_ = sp2.AppendRaw("stdout", []byte(attempt2Banner))
 	_ = sp2.AppendRaw("stdout", []byte(attempt2Startup))
 	if err := sp2.Close(); err != nil {
@@ -319,7 +319,7 @@ func TestSpool_MultiAttemptAppendPreservesInitialLogs(t *testing.T) {
 	if !strings.Contains(logStr, "[iazio] Starting Attempt #1") {
 		t.Errorf("Attempt 1 banner missing from disk log")
 	}
-	if !strings.Contains(logStr, "[ASE-SUPERVISOR] Initializing execution for job job-1466 on /Users/romeo/work/meta-repo (engine: agy, kind: ordinary)") {
+	if !strings.Contains(logStr, "[ASE-SUPERVISOR] Initializing execution for job job-1466 on /Users/romeo/work/sample-repo (engine: agy, kind: ordinary)") {
 		t.Errorf("Attempt 1 startup log missing from disk log")
 	}
 	if !strings.Contains(logStr, "Model generating code for Attempt 1...") {
