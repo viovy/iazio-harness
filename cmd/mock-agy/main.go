@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +11,10 @@ import (
 )
 
 func main() {
+	os.Exit(run(os.Args[1:], strings.TrimSpace(os.Getenv("MOCK_AGY_SCENARIO")), os.Stdout, os.Stderr))
+}
+
+func run(args []string, scenario string, stdout, stderr io.Writer) int {
 	var conversationID string
 	var printPrompt string
 	var model string
@@ -17,7 +22,6 @@ func main() {
 	var logFile string
 	var positional []string
 
-	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
@@ -74,8 +78,6 @@ func main() {
 		fullPrompt = strings.Join(positional, " ")
 	}
 
-	scenario := strings.TrimSpace(os.Getenv("MOCK_AGY_SCENARIO"))
-
 	// Ensure conversation DB directory exists if conversationID is provided
 	if conversationID != "" {
 		if home, err := os.UserHomeDir(); err == nil && home != "" {
@@ -90,31 +92,35 @@ func main() {
 	case "ordinary_prompt_with_mcp_daemons":
 		// Scenario 1: Print normal output, spawn persistent background child daemon that keeps
 		// pipes inherited, and exit 0 immediately.
-		fmt.Printf("[mock-agy] Executing ordinary prompt (model: %s, agent: %s)...\n", model, agent)
-		fmt.Printf("[mock-agy] Prompt: %s\n", fullPrompt)
-		fmt.Println("[mock-agy] Initializing background MCP daemons: autopilot-mcp, chrome-devtools-mcp...")
+		fmt.Fprintf(stdout, "[mock-agy] Executing ordinary prompt (model: %s, agent: %s)...\n", model, agent)
+		fmt.Fprintf(stdout, "[mock-agy] Prompt: %s\n", fullPrompt)
+		fmt.Fprintln(stdout, "[mock-agy] Initializing background MCP daemons: autopilot-mcp, chrome-devtools-mcp...")
 
 		// Spawn background sleeper that holds pipes open
 		cmd := exec.Command("sleep", "60")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
 		_ = cmd.Start()
 
-		fmt.Println("[mock-agy] Execution completed successfully. Primary engine PID exiting 0.")
-		os.Exit(0)
+		fmt.Fprintln(stdout, "[mock-agy] Execution completed successfully. Primary engine PID exiting 0.")
+		return 0
 
 	case "agent_restart_and_upgrade_mid_run":
 		// Scenario 2: Runs streaming output for several seconds.
-		fmt.Println("[mock-agy] Starting execution for agent restart/upgrade resilience test...")
+		fmt.Fprintln(stdout, "[mock-agy] Starting execution for agent restart/upgrade resilience test...")
 		if conversationID != "" {
-			fmt.Printf("[mock-agy] Active conversation: %s\n", conversationID)
+			fmt.Fprintf(stdout, "[mock-agy] Active conversation: %s\n", conversationID)
+		}
+		stepDelay := 300 * time.Millisecond
+		if os.Getenv("MOCK_AGY_FAST") == "1" {
+			stepDelay = time.Millisecond
 		}
 		for i := 1; i <= 5; i++ {
-			fmt.Printf("[mock-agy] Processing step %d/5: active and streaming...\n", i)
-			time.Sleep(300 * time.Millisecond)
+			fmt.Fprintf(stdout, "[mock-agy] Processing step %d/5: active and streaming...\n", i)
+			time.Sleep(stepDelay)
 		}
-		fmt.Println("[mock-agy] All steps completed successfully.")
-		os.Exit(0)
+		fmt.Fprintln(stdout, "[mock-agy] All steps completed successfully.")
+		return 0
 
 	case "ase_print_timeout_in_job_continuation":
 		// Scenario 3: Turn 1 creates modified files in worktree and outputs print timeout, exiting 0.
@@ -127,18 +133,18 @@ func main() {
 			// Turn 1
 			_ = os.WriteFile("ase_worktree_change.tmp", []byte("uncommitted change"), 0644)
 			_ = os.WriteFile(stateMarker, []byte("turn1_done"), 0644)
-			fmt.Println("Created conversation c0ffee00-1234-5678-9abc-000000000003")
-			fmt.Println("[mock-agy] Turn 1 executing ASE story flow...")
-			fmt.Println("[agy] print timeout after 1h0m0s with turn in progress; returning partial output")
-			os.Exit(0)
+			fmt.Fprintln(stdout, "Created conversation c0ffee00-1234-5678-9abc-000000000003")
+			fmt.Fprintln(stdout, "[mock-agy] Turn 1 executing ASE story flow...")
+			fmt.Fprintln(stdout, "[agy] print timeout after 1h0m0s with turn in progress; returning partial output")
+			return 0
 		} else {
 			// Turn 2 (resumed in-place)
 			_ = os.Remove("ase_worktree_change.tmp")
 			_ = os.Remove(stateMarker)
-			fmt.Printf("[mock-agy] Turn 2 resumed in-place with conversation %s.\n", conversationID)
-			fmt.Println("[mock-agy] Committed changes, cleaned worktree, and satisfied ASE gates.")
-			fmt.Println("[mock-agy] Story flow complete. Exit 0.")
-			os.Exit(0)
+			fmt.Fprintf(stdout, "[mock-agy] Turn 2 resumed in-place with conversation %s.\n", conversationID)
+			fmt.Fprintln(stdout, "[mock-agy] Committed changes, cleaned worktree, and satisfied ASE gates.")
+			fmt.Fprintln(stdout, "[mock-agy] Story flow complete. Exit 0.")
+			return 0
 		}
 
 	case "background_task_hang_recovery":
@@ -149,15 +155,15 @@ func main() {
 
 		if isTurn2 {
 			_ = os.Remove(stateMarker)
-			fmt.Printf("[mock-agy] Resumed after background task hang was reaped on conversation %s.\n", conversationID)
-			fmt.Println("[mock-agy] Finished remaining tasks.")
-			os.Exit(0)
+			fmt.Fprintf(stdout, "[mock-agy] Resumed after background task hang was reaped on conversation %s.\n", conversationID)
+			fmt.Fprintln(stdout, "[mock-agy] Finished remaining tasks.")
+			return 0
 		}
 		_ = os.WriteFile(stateMarker, []byte("hung"), 0644)
-		fmt.Println("Created conversation c0ffee00-1234-5678-9abc-000000000004")
-		fmt.Println("root agent idle; waiting up to 1h0m0s for 1 background task(s)")
-		fmt.Println("[ASE-SUPERVISOR] [background_task.auto_reaped] Inactivity limit (60s) exceeded while root agent is idle. Terminating 1 background task(s) to unblock resume cycle...")
-		os.Exit(143)
+		fmt.Fprintln(stdout, "Created conversation c0ffee00-1234-5678-9abc-000000000004")
+		fmt.Fprintln(stdout, "root agent idle; waiting up to 1h0m0s for 1 background task(s)")
+		fmt.Fprintln(stdout, "[ASE-SUPERVISOR] [background_task.auto_reaped] Inactivity limit (60s) exceeded while root agent is idle. Terminating 1 background task(s) to unblock resume cycle...")
+		return 143
 
 	case "multi_attempt_log_preservation_and_schedule_sync":
 		// Scenario 5: Attempt 1 crashes transiently; Attempt 2 resumes and succeeds.
@@ -165,14 +171,14 @@ func main() {
 		data, err := os.ReadFile(marker)
 		if err != nil || string(data) != "attempt_2" {
 			_ = os.WriteFile(marker, []byte("attempt_2"), 0644)
-			fmt.Println("[mock-agy] Attempt 1 startup logs: initializing environment and loading configuration...")
-			fmt.Fprintln(os.Stderr, "[mock-agy] Transient network reset occurred. Crashing attempt 1.")
-			os.Exit(1)
+			fmt.Fprintln(stdout, "[mock-agy] Attempt 1 startup logs: initializing environment and loading configuration...")
+			fmt.Fprintln(stderr, "[mock-agy] Transient network reset occurred. Crashing attempt 1.")
+			return 1
 		}
 		_ = os.Remove(marker)
-		fmt.Println("[mock-agy] Attempt 2 startup logs: resuming from checkpoint...")
-		fmt.Println("[mock-agy] Attempt 2 succeeded cleanly. Task finished.")
-		os.Exit(0)
+		fmt.Fprintln(stdout, "[mock-agy] Attempt 2 startup logs: resuming from checkpoint...")
+		fmt.Fprintln(stdout, "[mock-agy] Attempt 2 succeeded cleanly. Task finished.")
+		return 0
 
 	case "dirty_worktree_resume_and_queue_unblock":
 		// Scenario 6: First run leaves uncommitted files and fails with 10;
@@ -184,26 +190,26 @@ func main() {
 		if !isResume {
 			_ = os.WriteFile(stateMarker, []byte("dirty"), 0644)
 			_ = os.WriteFile("dirty_file_1324.tmp", []byte("dirty worktree content"), 0644)
-			fmt.Println("[mock-agy] Execution terminated leaving dirty worktree.")
-			os.Exit(10)
+			fmt.Fprintln(stdout, "[mock-agy] Execution terminated leaving dirty worktree.")
+			return 10
 		}
 		_ = os.Remove(stateMarker)
 		_ = os.Remove("dirty_file_1324.tmp")
-		fmt.Println("[mock-agy] Resume on existing worktree succeeded. Worktree clean.")
-		os.Exit(0)
+		fmt.Fprintln(stdout, "[mock-agy] Resume on existing worktree succeeded. Worktree clean.")
+		return 0
 
 	default:
 		// Default simple execution
 		if conversationID != "" {
-			fmt.Printf("Resumed conversation %s\n", conversationID)
+			fmt.Fprintf(stdout, "Resumed conversation %s\n", conversationID)
 		} else {
 			cid := "mock-conv-0000-1111-2222-3333"
-			fmt.Printf("Created conversation %s\n", cid)
+			fmt.Fprintf(stdout, "Created conversation %s\n", cid)
 		}
-		fmt.Printf("[mock-agy] Executed prompt: %s\n", fullPrompt)
+		fmt.Fprintf(stdout, "[mock-agy] Executed prompt: %s\n", fullPrompt)
 		if logFile != "" {
 			_ = os.WriteFile(logFile, []byte("[mock-agy] Log file output\n"), 0644)
 		}
-		os.Exit(0)
+		return 0
 	}
 }
