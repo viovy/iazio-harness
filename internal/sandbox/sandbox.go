@@ -132,13 +132,14 @@ func (s *Sandbox) Diff() (string, error) {
 		return "", fmt.Errorf("sandbox is not initialized")
 	}
 
-	cmd := exec.Command("git", "diff", "--no-index", "--no-color", s.OriginalPath, s.SandboxPath)
-	out, err := cmd.Output()
+	cmd := exec.Command("git", "--git-dir=/dev/null", "diff", "--no-index", "--no-color", s.OriginalPath, s.SandboxPath)
+	cmd.Dir = s.SandboxPath
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 			return strings.TrimSpace(string(out)), nil
 		}
-		return "", fmt.Errorf("git diff failed: %w", err)
+		return "", fmt.Errorf("git diff failed: %w (output: %s)", err, strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out)), nil
 }
