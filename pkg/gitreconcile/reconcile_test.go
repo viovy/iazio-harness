@@ -74,7 +74,7 @@ func TestLeaseClient_AcquireRenewRelease(t *testing.T) {
 	defer cancel()
 
 	// 1. Acquire
-	handle, err := client.AcquireWithRetry(ctx, "viovy/meta-repo", "workspace-a", 10)
+	handle, err := client.AcquireWithRetry(ctx, "viovy/superproject-root", "workspace-a", 10)
 	if err != nil {
 		t.Fatalf("failed acquiring lease: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestLeaseClient_AcquireRenewRelease(t *testing.T) {
 	}
 
 	// 3. Acquire by workspace-b
-	handleB, err := client.AcquireWithRetry(ctx, "viovy/meta-repo", "workspace-b", 10)
+	handleB, err := client.AcquireWithRetry(ctx, "viovy/superproject-root", "workspace-b", 10)
 	if err != nil {
 		t.Fatalf("failed acquiring lease by workspace-b: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestReconciler_ReconcileSuperprojectGitlinks(t *testing.T) {
 		"iazio-web":   "fedcba9876543210fedcba9876543210fedcba98",
 	}
 
-	err := rec.ReconcileSuperprojectGitlinks(ctx, "/work/meta-repo", modified)
+	err := rec.ReconcileSuperprojectGitlinks(ctx, "/work/superproject-root", modified)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
