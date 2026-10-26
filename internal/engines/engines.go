@@ -853,6 +853,8 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		prompt := req.Prompt
 		if req.ResumeConversationID != "" && (prompt == "" || strings.EqualFold(strings.TrimSpace(prompt), "resume") || req.Kind == "resume") {
 			prompt = "resume"
+		} else if req.ResumeConversationID == "" && strings.EqualFold(strings.TrimSpace(prompt), "resume") {
+			return nil, fmt.Errorf("cannot execute engine %q with prompt %q when ResumeConversationID is empty", req.Engine, prompt)
 		}
 		bin := "agy"
 		if _, err := exec.LookPath(bin); err != nil {
