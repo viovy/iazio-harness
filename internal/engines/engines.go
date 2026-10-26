@@ -103,8 +103,13 @@ func (c CLI) HealthCheck() error {
 	if look == nil {
 		look = exec.LookPath
 	}
-	_, err := look(c.Name())
+	resolved, err := look(c.Name())
 	if err == nil {
+		if lfi, errL := os.Lstat(resolved); errL == nil && (lfi.Mode()&os.ModeSymlink != 0) {
+			if _, errS := filepath.EvalSymlinks(resolved); errS != nil {
+				return fmt.Errorf("engine %s is a broken symlink: %w", c.Name(), errS)
+			}
+		}
 		return nil
 	}
 	if c.LookPath == nil {
@@ -115,7 +120,12 @@ func (c CLI) HealthCheck() error {
 				filepath.Join(home, ".gemini", "antigravity-cli", "bin", c.Name()),
 			}
 			for _, cand := range candidates {
-				if fi, errS := os.Stat(cand); errS == nil && !fi.IsDir() {
+				if lfi, errL := os.Lstat(cand); errL == nil && !lfi.IsDir() {
+					if lfi.Mode()&os.ModeSymlink != 0 {
+						if _, errS := filepath.EvalSymlinks(cand); errS != nil {
+							continue
+						}
+					}
 					return nil
 				}
 			}
@@ -206,7 +216,15 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 
 	bin := argv[0]
 	if resolved, err := exec.LookPath(bin); err == nil {
-		bin = resolved
+		if lfi, errL := os.Lstat(resolved); errL == nil && (lfi.Mode()&os.ModeSymlink != 0) {
+			if realPath, errS := filepath.EvalSymlinks(resolved); errS == nil {
+				bin = realPath
+			} else {
+				return ExecutionResult{}, fmt.Errorf("engine binary %s is a broken symlink: %w", resolved, errS)
+			}
+		} else {
+			bin = resolved
+		}
 	} else if home, err := os.UserHomeDir(); err == nil && home != "" {
 		candidates := []string{
 			filepath.Join(home, ".local", "bin", bin),
@@ -214,7 +232,14 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 			filepath.Join(home, ".gemini", "antigravity-cli", "bin", bin),
 		}
 		for _, cand := range candidates {
-			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+			if lfi, errL := os.Lstat(cand); errL == nil && !lfi.IsDir() {
+				if lfi.Mode()&os.ModeSymlink != 0 {
+					if realPath, errS := filepath.EvalSymlinks(cand); errS == nil {
+						bin = realPath
+						break
+					}
+					continue
+				}
 				bin = cand
 				break
 			}
