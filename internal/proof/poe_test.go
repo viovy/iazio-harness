@@ -156,3 +156,78 @@ func TestCaptureGitSHAs(t *testing.T) {
 		t.Fatalf("expected SHAs to diverge, got head1=%s head2=%s tree1=%s tree2=%s", head1, head2, tree1, tree2)
 	}
 }
+
+func TestCaptureWorktreeSnapshot_And_VerifyStrictStoryExecution(t *testing.T) {
+	tempDir := t.TempDir()
+
+	runGit := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", tempDir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+		}
+	}
+
+	runGit("init")
+	runGit("config", "user.name", "Test")
+	runGit("config", "user.email", "test@example.com")
+
+	// Base file
+	_ = os.WriteFile(filepath.Join(tempDir, "main.go"), []byte("package main\n"), 0644)
+	runGit("add", ".")
+	runGit("commit", "-m", "init")
+
+	// 1. Capture initial snapshot
+	snap1, err := CaptureWorktreeSnapshot(tempDir)
+	if err != nil {
+		t.Fatalf("CaptureWorktreeSnapshot failed: %v", err)
+	}
+	if snap1.DirtyFileCount != 0 || snap1.HasIndexLock {
+		t.Fatalf("expected clean worktree, got %+v", snap1)
+	}
+
+	// 2. Pre-scaffold a story file in docs/stories/
+	storiesDir := filepath.Join(tempDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0755)
+	_ = os.WriteFile(filepath.Join(storiesDir, "story-123.story.md"), []byte("# Story\n"), 0644)
+
+	snap2, err := CaptureWorktreeSnapshot(tempDir)
+	if err != nil {
+		t.Fatalf("CaptureWorktreeSnapshot 2 failed: %v", err)
+	}
+
+	// Non-spec mutation hash MUST NOT change when only docs/stories/* changes!
+	if snap1.NonSpecMutationHash != snap2.NonSpecMutationHash {
+		t.Fatalf("expected NonSpecMutationHash to be identical when only story spec changed, got snap1=%s snap2=%s",
+			snap1.NonSpecMutationHash, snap2.NonSpecMutationHash)
+	}
+
+	// Strict PoE must catch this no-op bypass
+	stdout := "valid stdout output\nline 2\nline 3\nline 4\nline 5\n" + string(make([]byte, 300))
+	code, err := VerifyStrictStoryExecution("/autonomous-story-execution", snap1, snap2, stdout)
+	if !errors.Is(err, ErrBypassOrNoOpDetected) || code != "PRE_SCAFFOLD_NOOP_BYPASS" {
+		t.Fatalf("expected PRE_SCAFFOLD_NOOP_BYPASS, got code=%s err=%v", code, err)
+	}
+
+	// 3. Mutate non-spec file
+	_ = os.WriteFile(filepath.Join(tempDir, "feature.go"), []byte("package main\n// new code\n"), 0644)
+	snap3, err := CaptureWorktreeSnapshot(tempDir)
+	if err != nil {
+		t.Fatalf("CaptureWorktreeSnapshot 3 failed: %v", err)
+	}
+
+	if snap1.NonSpecMutationHash == snap3.NonSpecMutationHash {
+		t.Fatalf("expected NonSpecMutationHash to diverge when non-spec file created")
+	}
+
+	code, err = VerifyStrictStoryExecution("/autonomous-story-execution", snap1, snap3, stdout)
+	if err != nil || code != "VERIFIED" {
+		t.Fatalf("expected VERIFIED, got code=%s err=%v", code, err)
+	}
+
+	// 4. Verify index lock detection
+	_ = os.WriteFile(filepath.Join(tempDir, ".git", "index.lock"), []byte("lock"), 0644)
+	snapLock, _ := CaptureWorktreeSnapshot(tempDir)
+	if !snapLock.HasIndexLock {
+		t.Fatalf("expected HasIndexLock to be true when .git/index.lock exists")
+	}
+}
