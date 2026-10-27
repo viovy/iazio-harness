@@ -1,0 +1,16 @@
+{
+  "worktree_path": "/mock/repo",
+  "success": true,
+  "clean": true,
+  "files_reset": 0,
+  "locks_removed": [
+    "index.lock"
+  ],
+  "operations_aborted": [
+    "merge"
+  ],
+  "submodules_cleaned": 2,
+  "duration_ns": 12000000,
+  "duration": "12ms",
+  "message": "Workspace successfully reset to pristine git state (clean)"
+}

@@ -1,0 +1,8 @@
+[iazio-harness] Workspace Discard Report: /mock/repo
+  - Success: true
+  - Worktree Clean: true
+  - Duration: 12ms
+  - Stale Locks Removed (1): index.lock
+  - In-Progress Operations Aborted: merge
+  - Submodules Recursively Cleaned: 2
+  - Status: git status is 100% clean

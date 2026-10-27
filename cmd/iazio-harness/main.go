@@ -29,6 +29,7 @@ import (
 	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/diagnostics"
 	"github.com/viovy/iazio-harness/internal/engines"
+	"github.com/viovy/iazio-harness/internal/gitclean"
 	"github.com/viovy/iazio-harness/internal/prompt"
 	"github.com/viovy/iazio-harness/internal/proof"
 	"github.com/viovy/iazio-harness/internal/repolock"
@@ -63,7 +64,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: iazio-harness version|auth|run|story|prompt|codebase|status|heal-ase|service|daemon")
+		return fmt.Errorf("usage: iazio-harness version|auth|run|story|prompt|codebase|status|heal-ase|discard|service|daemon")
 	}
 	var spanOpts = []telemetry.SpanOption{
 		telemetry.WithKind("INTERNAL"),
@@ -109,6 +110,8 @@ func run(args []string) error {
 		return runFleetStatusCommand(args[1:])
 	case "heal-ase":
 		return runHealASECommand(args[1:])
+	case "discard", "clean-git", "git-clean", "reset-workspace":
+		return runDiscardCommand(args[1:])
 	case "service":
 		return runServiceCommand(args[1:])
 	case "daemon":
@@ -1083,6 +1086,18 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		job.StoryID = ""
 	}
 
+	sp, err := spool.Open(spool.DefaultDir(), jobID)
+	if err != nil {
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: open spool for job %s: %v\n", jobID, err))
+		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
+		return fmt.Errorf("open spool: %w", err)
+	}
+	defer sp.Close()
+
+	if gitclean.IsPureCodeAction(job.Kind) || gitclean.IsPureCodeAction(kindOverride) {
+		return executePureCodeAction(ctx, api, token, job, targetDir, docsHub, sp, wd)
+	}
+
 	prepRes, err := prompt.Prepare(prompt.Input{
 		Kind:       job.Kind,
 		JobID:      job.ID,
@@ -1101,14 +1116,6 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
 		return fmt.Errorf("prepare prompt: %w", err)
 	}
-
-	sp, err := spool.Open(spool.DefaultDir(), jobID)
-	if err != nil {
-		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: open spool for job %s: %v\n", jobID, err))
-		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
-		return fmt.Errorf("open spool: %w", err)
-	}
-	defer sp.Close()
 
 	// Enterprise-grade pre-execution validation: if a specific story ID is requested, verify it exists
 	if isASE && storyID != "" && storyID != fallbackResumeStoryID && storyID != "pending_harness_creation" {

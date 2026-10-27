@@ -185,3 +185,14 @@ func Read(worktree string) (LockInfo, error) {
 	}
 	return info, nil
 }
+
+// ForceRelease removes the repository lock file and flock, marking it idle.
+func ForceRelease(worktree string) error {
+	if worktree == "" {
+		return nil
+	}
+	_ = os.Remove(filepath.Join(worktree, ".iazio", "repo.lock"))
+	_ = os.Remove(filepath.Join(worktree, ".iazio", "repo.lock.flock"))
+	_ = os.Remove(filepath.Join(worktree, ".iazio", "repo.flock"))
+	return nil
+}

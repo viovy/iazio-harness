@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/gitclean"
 )
 
 // ============================================================================
@@ -318,7 +320,8 @@ func (ac *AgentWorkspaceController) AbortActiveProcess(repo string) bool {
 }
 
 // DiscardChanges implements the exact backend + agent logic for the
-// "Discard Changes" button on /agents/mac-mini/iazio-test-repo/queue
+// "Discard Changes" button on /agents/mac-mini/iazio-test-repo/queue,
+// delegating to the production gitclean.DiscardWorkspace pure code action routine.
 func (ac *AgentWorkspaceController) DiscardChanges(repoName string, forceKillActive bool) (WorktreeSnapshot, error) {
 	repoDir, ok := ac.RepoPaths[repoName]
 	if !ok {
@@ -329,22 +332,14 @@ func (ac *AgentWorkspaceController) DiscardChanges(repoName string, forceKillAct
 		ac.AbortActiveProcess(repoName)
 	}
 
-	// 1. Remove any lingering .git/index.lock that blocks git operations
-	lockPath := filepath.Join(repoDir, ".git", "index.lock")
-	_ = os.Remove(lockPath)
-
-	// 2. Non-interactive hard reset of tracked files
-	resetCmd := exec.Command("git", "-C", repoDir, "reset", "--hard", "HEAD")
-	resetCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	if out, err := resetCmd.CombinedOutput(); err != nil {
-		return WorktreeSnapshot{}, fmt.Errorf("git reset --hard failed: %v (%s)", err, string(out))
-	}
-
-	// 3. Force-clean untracked files and nested untracked submodule directories (-ffdx)
-	cleanCmd := exec.Command("git", "-C", repoDir, "clean", "-ffdx")
-	cleanCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	if out, err := cleanCmd.CombinedOutput(); err != nil {
-		return WorktreeSnapshot{}, fmt.Errorf("git clean -ffdx failed: %v (%s)", err, string(out))
+	_, err := gitclean.DiscardWorkspace(context.Background(), gitclean.DiscardOptions{
+		WorktreePath: repoDir,
+		Force:        forceKillActive,
+		Submodules:   true,
+		RemoveLocks:  true,
+	})
+	if err != nil {
+		return WorktreeSnapshot{}, err
 	}
 
 	return CaptureWorktreeSnapshot(repoDir)
@@ -1263,3 +1258,63 @@ func TestE2E_AgentRepo_DiscardAllRepos_AndInProgressJobCancellation(t *testing.T
 		t.Fatalf("expected untracked_beta.tmp to be deleted")
 	}
 }
+
+// Test 5: Pure Code Action execution: Discard and Clean Git without AI model invocation
+func TestE2E_IazioHarness_PureCodeAction_DiscardAndClean(t *testing.T) {
+	repoDir := initTestGitRepo(t)
+
+	// Dirty the repo with modified tracked file, untracked file, untracked folder, and stale lock
+	_ = os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Overwritten uncommitted\n"), 0644)
+	_ = os.WriteFile(filepath.Join(repoDir, "new_untracked_file.go"), []byte("package main\n"), 0644)
+	subDir := filepath.Join(repoDir, "untracked_dir", "nested")
+	_ = os.MkdirAll(subDir, 0755)
+	_ = os.WriteFile(filepath.Join(subDir, "untracked_leaf.txt"), []byte("data"), 0644)
+	_ = os.WriteFile(filepath.Join(repoDir, ".git", "index.lock"), []byte("lock content"), 0644)
+
+	snapDirty, _ := CaptureWorktreeSnapshot(repoDir)
+	if snapDirty.DirtyFileCount == 0 {
+		t.Fatalf("expected dirty repo before discard, got %+v", snapDirty)
+	}
+
+	var progressStages []string
+	res, err := gitclean.DiscardWorkspace(context.Background(), gitclean.DiscardOptions{
+		WorktreePath: repoDir,
+		Force:        true,
+		Submodules:   true,
+		RemoveLocks:  true,
+		OnProgress: func(stage, detail string) {
+			progressStages = append(progressStages, stage)
+		},
+	})
+	if err != nil {
+		t.Fatalf("DiscardWorkspace failed: %v", err)
+	}
+
+	if !res.Success || !res.Clean {
+		t.Fatalf("expected res.Success and res.Clean to be true, got %+v", res)
+	}
+	if res.RemainingPorcelain != "" {
+		t.Fatalf("expected empty remaining porcelain, got: %s", res.RemainingPorcelain)
+	}
+
+	// Verify post-condition: 100% clean
+	snapClean, _ := CaptureWorktreeSnapshot(repoDir)
+	if snapClean.DirtyFileCount != 0 || snapClean.HasIndexLock {
+		t.Fatalf("expected clean worktree after discard, got %+v", snapClean)
+	}
+
+	// Verify file content restored
+	readmeBytes, _ := os.ReadFile(filepath.Join(repoDir, "README.md"))
+	if string(readmeBytes) != "# Iazio Repo\n" {
+		t.Fatalf("README.md was not reset: %s", string(readmeBytes))
+	}
+
+	// Verify untracked items removed
+	if _, err := os.Stat(filepath.Join(repoDir, "new_untracked_file.go")); !os.IsNotExist(err) {
+		t.Fatalf("expected new_untracked_file.go to be deleted")
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "untracked_dir")); !os.IsNotExist(err) {
+		t.Fatalf("expected untracked_dir to be deleted")
+	}
+}
+
