@@ -199,6 +199,9 @@ func MaterializeStoryFile(repoRoot, storyID, filename, content string) error {
 	return nil
 }
 
+// ErrStoryNotFound is returned when a requested story does not exist in the backlog or control plane.
+var ErrStoryNotFound = errors.New("story not found in backlog or control plane")
+
 const storyFileExt = ".story.md"
 
 type remoteStoryDetail struct {
@@ -210,26 +213,116 @@ type remoteStoryDetail struct {
 	Submodules []string `json:"submodules,omitempty"`
 }
 
+// StoryExistsOnDisk reports whether the specified story file exists in the repoRoot or fleetRoot backlog.
+func StoryExistsOnDisk(repoRoot, storyID string) bool {
+	return storyExistsOnDisk(repoRoot, storyID)
+}
+
+func storyMatchesID(name, storyID string) bool {
+	nameUpper := strings.ToUpper(name)
+	idUpper := strings.ToUpper(storyID)
+	if strings.Contains(nameUpper, idUpper) {
+		return true
+	}
+	cleanID := strings.TrimPrefix(idUpper, "STORY-")
+	if cleanID != "" && strings.Contains(nameUpper, cleanID) {
+		return true
+	}
+	return false
+}
+
+func checkIndexForStory(indexPath, storyID, baseDir string) bool {
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		return false
+	}
+	content := string(data)
+	idUpper := strings.ToUpper(storyID)
+	cleanUpper := strings.TrimPrefix(idUpper, "STORY-")
+	contentUpper := strings.ToUpper(content)
+	if !strings.Contains(contentUpper, idUpper) && (cleanUpper == "" || !strings.Contains(contentUpper, cleanUpper)) {
+		return false
+	}
+	lines := strings.Split(content, "\n")
+	currentMatch := false
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "- id:") {
+			val := strings.TrimSpace(strings.TrimPrefix(line, "- id:"))
+			currentMatch = strings.EqualFold(val, storyID) || strings.EqualFold(strings.TrimPrefix(val, "STORY-"), cleanUpper)
+		} else if currentMatch && strings.HasPrefix(line, "path:") {
+			relPath := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "path:")), `"`)
+			if relPath != "" {
+				fullPath := filepath.Join(baseDir, relPath)
+				if fi, err := os.Stat(fullPath); err == nil && !fi.IsDir() && fi.Size() > 0 {
+					return true
+				}
+			}
+			return true
+		}
+	}
+	return currentMatch
+}
+
+func scanStoriesDir(storiesDir, storyID string) bool {
+	entries, err := os.ReadDir(storiesDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(name, storyFileExt) || strings.HasSuffix(name, ".md") {
+			if storyMatchesID(name, storyID) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func storyExistsOnDisk(repoRoot, storyID string) bool {
+	cleanID := strings.TrimSpace(storyID)
+	if cleanID == "" {
+		return false
+	}
 	storiesDir := filepath.Join(repoRoot, "docs", "stories")
 	candidates := []string{
-		filepath.Join(storiesDir, storyID+storyFileExt),
-		filepath.Join(storiesDir, storyID+".md"),
-		filepath.Join(storiesDir, strings.ToLower(storyID)+storyFileExt),
-		filepath.Join(storiesDir, strings.ToLower(storyID)+".md"),
+		filepath.Join(storiesDir, cleanID+storyFileExt),
+		filepath.Join(storiesDir, cleanID+".md"),
+		filepath.Join(storiesDir, strings.ToLower(cleanID)+storyFileExt),
+		filepath.Join(storiesDir, strings.ToLower(cleanID)+".md"),
 	}
 	fleetRoot := ResolveFleetRoot()
 	if fleetRoot != "" && fleetRoot != repoRoot {
 		fleetStories := filepath.Join(fleetRoot, "docs", "stories")
 		candidates = append(candidates,
-			filepath.Join(fleetStories, storyID+storyFileExt),
-			filepath.Join(fleetStories, storyID+".md"),
-			filepath.Join(fleetStories, strings.ToLower(storyID)+storyFileExt),
-			filepath.Join(fleetStories, strings.ToLower(storyID)+".md"),
+			filepath.Join(fleetStories, cleanID+storyFileExt),
+			filepath.Join(fleetStories, cleanID+".md"),
+			filepath.Join(fleetStories, strings.ToLower(cleanID)+storyFileExt),
+			filepath.Join(fleetStories, strings.ToLower(cleanID)+".md"),
 		)
 	}
 	for _, c := range candidates {
 		if fi, err := os.Stat(c); err == nil && !fi.IsDir() && fi.Size() > 0 {
+			return true
+		}
+	}
+	if scanStoriesDir(storiesDir, cleanID) {
+		return true
+	}
+	if fleetRoot != "" && fleetRoot != repoRoot {
+		if scanStoriesDir(filepath.Join(fleetRoot, "docs", "stories"), cleanID) {
+			return true
+		}
+	}
+	if checkIndexForStory(filepath.Join(storiesDir, "index.yml"), cleanID, repoRoot) {
+		return true
+	}
+	if fleetRoot != "" && fleetRoot != repoRoot {
+		if checkIndexForStory(filepath.Join(fleetRoot, "docs", "stories", "index.yml"), cleanID, fleetRoot) {
 			return true
 		}
 	}
@@ -300,6 +393,9 @@ func MaterializePendingStories(ctx context.Context, repoRoot, storyID string) er
 
 	detail, err := fetchStoryDetail(ctx, storyID)
 	if err != nil {
+		if strings.Contains(err.Error(), "404") || strings.Contains(strings.ToLower(err.Error()), "not found") {
+			return fmt.Errorf("%w: story %q: %v", ErrStoryNotFound, storyID, err)
+		}
 		return err
 	}
 

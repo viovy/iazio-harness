@@ -284,6 +284,9 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 			if stream != nil {
 				_ = stream.AppendRaw("stderr", []byte(fmt.Sprintf("[iazio-harness] Warning: pre-flight story materialization failed: %v\n", pfErr)))
 			}
+			if strings.Contains(strings.ToLower(pfErr.Error()), "not found") || strings.Contains(pfErr.Error(), "404") {
+				return ExecutionResult{ExitCode: 1}, fmt.Errorf("story %q not found: %w", req.StoryID, pfErr)
+			}
 		}
 	}
 	base := req.BaseEnv
