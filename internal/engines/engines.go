@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -232,16 +233,28 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 			filepath.Join(home, ".iazio", "bin", bin),
 			filepath.Join(home, ".gemini", "antigravity-cli", "bin", bin),
 		}
+		if runtime.GOOS == "windows" {
+			candidates = append(candidates, filepath.Join(home, "bin", bin))
+		}
 		for _, cand := range candidates {
-			if lfi, errL := os.Lstat(cand); errL == nil && !lfi.IsDir() {
-				if lfi.Mode()&os.ModeSymlink != 0 {
-					if realPath, errS := filepath.EvalSymlinks(cand); errS == nil {
-						bin = realPath
-						break
+			toCheck := []string{cand}
+			if runtime.GOOS == "windows" && filepath.Ext(cand) == "" {
+				toCheck = append(toCheck, cand+".exe", cand+".cmd", cand+".bat")
+			}
+			for _, target := range toCheck {
+				if lfi, errL := os.Lstat(target); errL == nil && !lfi.IsDir() {
+					if lfi.Mode()&os.ModeSymlink != 0 {
+						if realPath, errS := filepath.EvalSymlinks(target); errS == nil {
+							bin = realPath
+							break
+						}
+						continue
 					}
-					continue
+					bin = target
+					break
 				}
-				bin = cand
+			}
+			if bin != argv[0] {
 				break
 			}
 		}
@@ -874,6 +887,24 @@ func ResolveDynamicTool(engine string, priorityList []string) string {
 
 // BuildArgv returns the IDE CLI arguments for the engine.
 // The prompt is a single argv element.
+func isWorktreeDirty(worktree string) bool {
+	if worktree == "" {
+		return false
+	}
+	cmd := exec.Command("git", "-C", worktree, "status", "--porcelain")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	for _, l := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(l)
+		if len(trimmed) > 3 {
+			return true
+		}
+	}
+	return false
+}
+
 func BuildArgv(req ExecutionRequest) ([]string, error) {
 	engine := strings.TrimSpace(strings.ToLower(req.Engine))
 	if engine == "" || engine == "auto" {
@@ -892,14 +923,27 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		strings.EqualFold(trimmedPrompt, "resume") ||
 		strings.EqualFold(trimmedPrompt, "/autonomous-story-execution resume")
 
-	if req.ResumeConversationID == "" {
-		if strings.EqualFold(trimmedPrompt, "resume") ||
-			strings.EqualFold(trimmedPrompt, "/autonomous-story-execution resume") ||
-			(req.Kind == "resume" && trimmedPrompt == "") {
-			return nil, fmt.Errorf("cannot execute engine %q with prompt %q when ResumeConversationID is empty", engine, req.Prompt)
+	if req.ResumeConversationID != "" {
+		// "resume" prompt is only valid when resuming an existing conversation with --conversation
+		if isEmptyOrBareResume || req.Kind == "resume" {
+			req.Prompt = "resume"
 		}
-	} else if isEmptyOrBareResume || req.Kind == "resume" {
-		req.Prompt = "resume"
+	} else {
+		// When ResumeConversationID is empty, "resume" prompt cannot be used with agy.
+		// If fleet git status is dirty: use prompt that completes current ASE flow.
+		// Otherwise: if StoryID is present, use initial story prompt.
+		// Otherwise: unanchored bare resume without conversation or worktree fails closed.
+		if isEmptyOrBareResume || req.Kind == "resume" {
+			if isWorktreeDirty(req.WorktreePath) {
+				req.Prompt = "resume and complete current /autonomous-story-execution flow, inspecting existing changes, running tests, review scheme, and git flow"
+			} else if req.StoryID != "" {
+				req.Prompt = fmt.Sprintf("Execute story %s end-to-end using /autonomous-story-execution.", req.StoryID)
+			} else if req.WorktreePath != "" {
+				req.Prompt = "Execute /autonomous-story-execution to create and implement story end-to-end."
+			} else {
+				return nil, fmt.Errorf("cannot execute engine %q with prompt %q when ResumeConversationID is empty", engine, req.Prompt)
+			}
+		}
 	}
 
 	switch engine {

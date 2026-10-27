@@ -264,3 +264,151 @@ func TestE2E_FullPipeline_MultiAttemptLogPreservation(t *testing.T) {
 		t.Fatalf("expected attempt 2 status 'completed', got %s", job2.Status)
 	}
 }
+
+// Test 5: In-Place Auto-Resume on Transient Tool Failure
+// Tests that when mock-agy fails on Turn 1 with code 1, the pipeline's in-place auto-resume
+// catches it and completes on Turn 2, verifying PoE advancement and status COMPLETED.
+func TestE2E_FullPipeline_InPlaceHarnessAutoResume(t *testing.T) {
+	repoDir := initTestGitRepo(t)
+	mockAgy := buildCompiledMockAgy(t)
+	zipkin, zipkinSrv := NewZipkinCollectorServer()
+	defer zipkinSrv.Close()
+
+	agentCtrl := &AgentWorkspaceController{
+		AgentID:   "pc1",
+		RepoPaths: map[string]string{"meta-repo-02": repoDir},
+	}
+	cp := NewIazioControlPlane(agentCtrl, zipkin, 10*time.Second)
+	apiSrv := httptest.NewServer(cp.BuildHTTPHandler())
+	defer apiSrv.Close()
+
+	marker := filepath.Join(os.TempDir(), "mock_agy_inplace_resume.tmp")
+	_ = os.Remove(marker)
+	defer os.Remove(marker)
+
+	_ = cp.EnqueueJob(
+		"/autonomous-story-execution",
+		"meta-repo-02",
+		"agy",
+		"STORY-GOV-3721",
+		"Verify in-place auto-resume resilience",
+		"",
+		"",
+		30,
+	)
+
+	// Turn 1 fails transiently
+	job1, err1 := cp.ExecuteNextJob(
+		context.Background(),
+		mockAgy,
+		[]string{"MOCK_AGY_SCENARIO=in_place_harness_auto_resume"},
+	)
+	if err1 == nil {
+		t.Fatalf("expected turn 1 to fail transiently")
+	}
+
+	// Trigger in-place resume
+	retryResp, err := http.Post(fmt.Sprintf("%s/api/v1/global-queue/jobs/%s/retry", apiSrv.URL, job1.ID), "application/json", nil)
+	if err != nil {
+		t.Fatalf("retry request failed: %v", err)
+	}
+	_ = retryResp.Body.Close()
+
+	// Turn 2 succeeds with committed file
+	job2, err2 := cp.ExecuteNextJob(
+		context.Background(),
+		mockAgy,
+		[]string{"MOCK_AGY_SCENARIO=in_place_harness_auto_resume"},
+	)
+	if err2 != nil {
+		t.Fatalf("expected turn 2 to succeed, got: %v", err2)
+	}
+	if job2.Status != StatusCompleted {
+		t.Fatalf("expected status 'completed', got %s", job2.Status)
+	}
+}
+
+// Test 6: Empty Conversation ID with Dirty Worktree Recovery
+// Proves that when conversation ID is empty and worktree is dirty,
+// prompt is rewritten to complete dirty ASE flow and pipeline finishes cleanly.
+func TestE2E_FullPipeline_EmptyConversation_DirtyWorktreeRecovery(t *testing.T) {
+	repoDir := initTestGitRepo(t)
+	mockAgy := buildCompiledMockAgy(t)
+	zipkin, zipkinSrv := NewZipkinCollectorServer()
+	defer zipkinSrv.Close()
+
+	agentCtrl := &AgentWorkspaceController{
+		AgentID:   "pc1",
+		RepoPaths: map[string]string{"meta-repo-02": repoDir},
+	}
+	cp := NewIazioControlPlane(agentCtrl, zipkin, 10*time.Second)
+	apiSrv := httptest.NewServer(cp.BuildHTTPHandler())
+	defer apiSrv.Close()
+
+	// Leave uncommitted dirty worktree file
+	_ = os.WriteFile(filepath.Join(repoDir, "dirty_worktree_file.tmp"), []byte("uncommitted work"), 0644)
+
+	_ = cp.EnqueueJob(
+		"resume and complete current /autonomous-story-execution flow, inspecting existing changes, running tests, review scheme, and git flow",
+		"meta-repo-02",
+		"agy",
+		"STORY-GOV-3721",
+		"Resume dirty flow unanchored",
+		"",
+		"", // empty conversation ID
+		30,
+	)
+
+	completedJob, err := cp.ExecuteNextJob(
+		context.Background(),
+		mockAgy,
+		[]string{"MOCK_AGY_SCENARIO=empty_conversation_dirty_worktree_resume"},
+	)
+	if err != nil {
+		t.Fatalf("expected dirty flow execution to succeed, got: %v", err)
+	}
+	if completedJob.Status != StatusCompleted {
+		t.Fatalf("expected status 'completed', got %s", completedJob.Status)
+	}
+}
+
+// Test 7: Empty Conversation ID with Clean Worktree Story Restart
+// Proves that when conversation ID is empty and worktree is clean,
+// prompt is rewritten to execute story end-to-end from scratch and pipeline finishes cleanly.
+func TestE2E_FullPipeline_EmptyConversation_CleanWorktreeRestart(t *testing.T) {
+	repoDir := initTestGitRepo(t)
+	mockAgy := buildCompiledMockAgy(t)
+	zipkin, zipkinSrv := NewZipkinCollectorServer()
+	defer zipkinSrv.Close()
+
+	agentCtrl := &AgentWorkspaceController{
+		AgentID:   "pc1",
+		RepoPaths: map[string]string{"meta-repo-02": repoDir},
+	}
+	cp := NewIazioControlPlane(agentCtrl, zipkin, 10*time.Second)
+	apiSrv := httptest.NewServer(cp.BuildHTTPHandler())
+	defer apiSrv.Close()
+
+	_ = cp.EnqueueJob(
+		"Execute story STORY-GOV-3721 end-to-end using /autonomous-story-execution.",
+		"meta-repo-02",
+		"agy",
+		"STORY-GOV-3721",
+		"Restart clean story unanchored",
+		"",
+		"", // empty conversation ID
+		30,
+	)
+
+	completedJob, err := cp.ExecuteNextJob(
+		context.Background(),
+		mockAgy,
+		[]string{"MOCK_AGY_SCENARIO=empty_conversation_clean_worktree_story_restart"},
+	)
+	if err != nil {
+		t.Fatalf("expected clean restart to succeed, got: %v", err)
+	}
+	if completedJob.Status != StatusCompleted {
+		t.Fatalf("expected status 'completed', got %s", completedJob.Status)
+	}
+}

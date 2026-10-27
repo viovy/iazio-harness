@@ -851,3 +851,232 @@ func TestMockAgy_Scenario9_DownstreamReleaseGate_RejectsUnprovenJobs(t *testing.
 		t.Fatalf("expected PoEEnforcementPassed to be true")
 	}
 }
+
+// Scenario 10: In-Place Harness Auto-Resume on Transient Tool Failure
+// Turn 1 fails with code 1; Harness catches the failure in-place, emits continuation banners
+// and attempt history, re-invokes mock-agy on Turn 2, and exits 0 cleanly.
+func TestMockAgy_Scenario10_InPlaceHarnessAutoResume(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "in_place_harness_auto_resume")
+
+	marker := filepath.Join(os.TempDir(), "mock_agy_inplace_resume.tmp")
+	_ = os.Remove(marker)
+	defer os.Remove(marker)
+
+	var mu sync.Mutex
+	var postedChunks []string
+	var postedExitCode = -1
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:          "job-inplace-3721",
+				Prompt:      "/autonomous-story-execution verify-in-place-resume",
+				Kind:        "autonomous-story-execution",
+				Engine:      "mock-agy",
+				Agent:       "mock-agy",
+				StoryID:     "STORY-GOV-3721",
+				Status:      "RUNNING",
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			var body struct {
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedChunks = append(postedChunks, body.Text)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ticks"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/conversations"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/continued"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+			var body struct {
+				ExitCode int `json:"exit_code"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedExitCode = body.ExitCode
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	worktree := initTestGitWorktree(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := executeJob(ctx, srv.URL, "job-inplace-3721", worktree, "", "autonomous-story-execution", "", "")
+	if err != nil {
+		t.Fatalf("expected executeJob with in-place auto-resume to succeed, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if postedExitCode != 0 {
+		t.Fatalf("expected final exit code 0 reported to control plane, got %d", postedExitCode)
+	}
+
+	allOutput := strings.Join(postedChunks, "\n")
+	if !strings.Contains(allOutput, "Starting Attempt #2") {
+		t.Fatalf("expected output to contain 'Starting Attempt #2' banner, got:\n%s", allOutput)
+	}
+	if !strings.Contains(allOutput, "In-place auto-resume attempt 2 succeeded cleanly") {
+		t.Fatalf("expected output to contain Turn 2 completion message, got:\n%s", allOutput)
+	}
+}
+
+// Scenario 11: Empty Conversation ID with Dirty Worktree Resume Recovery
+// Proves that when conversation ID is empty and worktree has uncommitted modifications,
+// the harness uses the ASE flow completion prompt, omits --conversation, and finishes the story flow.
+func TestMockAgy_Scenario11_EmptyConversation_DirtyWorktree_FlowCompletion(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "empty_conversation_dirty_worktree_resume")
+
+	var mu sync.Mutex
+	var postedChunks []string
+	var postedExitCode = -1
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:          "job-dirty-unanchored",
+				Prompt:      "resume",
+				Kind:        "resume",
+				Engine:      "mock-agy",
+				Agent:       "mock-agy",
+				StoryID:     "STORY-GOV-3721",
+				Status:      "RUNNING",
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			var body struct {
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedChunks = append(postedChunks, body.Text)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ticks"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/conversations"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+			var body struct {
+				ExitCode int `json:"exit_code"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedExitCode = body.ExitCode
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	worktree := initTestGitWorktree(t)
+
+	// Create dirty uncommitted file
+	_ = os.WriteFile(filepath.Join(worktree, "dirty_worktree_file.tmp"), []byte("uncommitted work"), 0644)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	// Empty conversation ID override passed with kind "resume"
+	err := executeJob(ctx, srv.URL, "job-dirty-unanchored", worktree, "", "resume", "", "")
+	if err != nil {
+		t.Fatalf("expected executeJob with unanchored dirty worktree to succeed, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if postedExitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", postedExitCode)
+	}
+
+	allOutput := strings.Join(postedChunks, "\n")
+	if !strings.Contains(allOutput, "Unanchored dirty worktree flow completed successfully") {
+		t.Fatalf("expected completion of dirty flow, got: %s", allOutput)
+	}
+}
+
+// Scenario 12: Empty Conversation ID with Clean Worktree Story Restart
+// Proves that when conversation ID is empty and worktree is clean,
+// the harness uses the story execution start prompt, omits --conversation, and restarts from scratch.
+func TestMockAgy_Scenario12_EmptyConversation_CleanWorktree_StoryRestart(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "empty_conversation_clean_worktree_story_restart")
+
+	var mu sync.Mutex
+	var postedChunks []string
+	var postedExitCode = -1
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:          "job-clean-story-start",
+				Prompt:      "resume",
+				Kind:        "resume",
+				Engine:      "mock-agy",
+				Agent:       "mock-agy",
+				StoryID:     "STORY-GOV-3721",
+				Status:      "RUNNING",
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			var body struct {
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedChunks = append(postedChunks, body.Text)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ticks"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/conversations"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+			var body struct {
+				ExitCode int `json:"exit_code"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedExitCode = body.ExitCode
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	worktree := initTestGitWorktree(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	err := executeJob(ctx, srv.URL, "job-clean-story-start", worktree, "", "resume", "", "")
+	if err != nil {
+		t.Fatalf("expected executeJob on clean worktree story restart to succeed, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if postedExitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", postedExitCode)
+	}
+
+	allOutput := strings.Join(postedChunks, "\n")
+	if !strings.Contains(allOutput, "Story restarted from scratch on clean worktree successfully") {
+		t.Fatalf("expected clean worktree story restart notice, got: %s", allOutput)
+	}
+}

@@ -340,6 +340,79 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "[mock-agy] Resume on existing worktree succeeded. Worktree clean.")
 		return 0
 
+	case "in_place_harness_auto_resume":
+		// Scenario 10: Turn 1 fails transiently; Turn 2 resumes in-place and succeeds.
+		stateMarker := filepath.Join(os.TempDir(), "mock_agy_inplace_resume.tmp")
+		_, mErr := os.Stat(stateMarker)
+		if mErr != nil {
+			_ = os.WriteFile(stateMarker, []byte("attempt_1_done"), 0644)
+			cid := "mock-conv-1111-2222-3333-444455556666"
+			fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+				_ = os.MkdirAll(convDir, 0755)
+				_ = os.WriteFile(filepath.Join(convDir, cid+".db"), []byte("mock-db"), 0644)
+			}
+			fmt.Fprintln(stderr, "[mock-agy] Transient network reset on attempt 1. Exiting 1.")
+			return 1
+		}
+		_ = os.Remove(stateMarker)
+		_ = os.WriteFile("inplace_resumed_file.txt", []byte("inplace recovery content\n"), 0644)
+		_ = exec.Command("git", "add", "inplace_resumed_file.txt").Run()
+		_ = exec.Command("git", "commit", "-m", "chore: auto-resumed in-place").Run()
+		if conversationID != "" {
+			fmt.Fprintf(stdout, "Resumed conversation %s\n", conversationID)
+		}
+		fmt.Fprintln(stdout, "[mock-agy] In-place auto-resume attempt 2 succeeded cleanly.")
+		return 0
+
+	case "empty_conversation_dirty_worktree_resume":
+		// Scenario 11: Empty conversation ID + dirty worktree resume
+		if conversationID != "" {
+			fmt.Fprintf(stderr, "Error: expected empty conversation ID, got %q\n", conversationID)
+			return 1
+		}
+		if !strings.Contains(fullPrompt, "complete current /autonomous-story-execution flow") {
+			fmt.Fprintf(stderr, "Error: expected prompt to complete dirty ASE flow, got %q\n", fullPrompt)
+			return 1
+		}
+		_ = os.Remove("dirty_worktree_file.tmp")
+		_ = os.WriteFile("completed_story_work.txt", []byte("story work finished\n"), 0644)
+		_ = exec.Command("git", "add", ".").Run()
+		_ = exec.Command("git", "commit", "-m", "chore: complete unanchored dirty flow").Run()
+		cid := "mock-conv-dirty-uuid-0000-1111-2222"
+		fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+			_ = os.MkdirAll(convDir, 0755)
+			_ = os.WriteFile(filepath.Join(convDir, cid+".db"), []byte("mock-db"), 0644)
+		}
+		fmt.Fprintln(stdout, "[mock-agy] Unanchored dirty worktree flow completed successfully.")
+		return 0
+
+	case "empty_conversation_clean_worktree_story_restart":
+		// Scenario 12: Empty conversation ID + clean worktree story restart
+		if conversationID != "" {
+			fmt.Fprintf(stderr, "Error: expected empty conversation ID, got %q\n", conversationID)
+			return 1
+		}
+		if !strings.Contains(fullPrompt, "Execute story") {
+			fmt.Fprintf(stderr, "Error: expected Execute story prompt, got %q\n", fullPrompt)
+			return 1
+		}
+		_ = os.WriteFile("story_initialized.txt", []byte("story initialized\n"), 0644)
+		_ = exec.Command("git", "add", ".").Run()
+		_ = exec.Command("git", "commit", "-m", "feat: start story from scratch").Run()
+		cid := "mock-conv-clean-uuid-0000-1111-2222"
+		fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+			_ = os.MkdirAll(convDir, 0755)
+			_ = os.WriteFile(filepath.Join(convDir, cid+".db"), []byte("mock-db"), 0644)
+		}
+		fmt.Fprintln(stdout, "[mock-agy] Story restarted from scratch on clean worktree successfully.")
+		return 0
+
 	case "noop_bypass_empty_stdout":
 		// Scenario 7: No-Op Bypass with empty stdout / synthetic wrapper summary
 		fmt.Fprintln(stdout, "[+] prompt executed via agy (exit 0)")
@@ -373,8 +446,14 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		if conversationID != "" {
 			fmt.Fprintf(stdout, "Resumed conversation %s\n", conversationID)
 		} else {
-			cid := "mock-conv-0000-1111-2222-3333"
+			cid := "mock-conv-0000-1111-2222-33334444"
 			fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+				_ = os.MkdirAll(convDir, 0755)
+				dbPath := filepath.Join(convDir, cid+".db")
+				_ = os.WriteFile(dbPath, []byte("mock-db"), 0644)
+			}
 		}
 		fmt.Fprintf(stdout, "[mock-agy] Executed prompt: %s\n", fullPrompt)
 		if logFile != "" {

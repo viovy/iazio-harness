@@ -222,9 +222,21 @@ type JobDetail struct {
 	ConversationIDs             []string          `json:"conversation_ids,omitempty"`
 	Reason                      string            `json:"reason,omitempty"`
 	ExitCode                    int               `json:"exit_code,omitempty"`
-	TerminationReasonMessage    string            `json:"termination_reason_message,omitempty"`
-	FailureReasonSummary        string            `json:"failure_reason_summary,omitempty"`
-	FencingToken                int64             `json:"fencing_token,omitempty"`
+	TerminationReasonMessage    string                 `json:"termination_reason_message,omitempty"`
+	FailureReasonSummary        string                 `json:"failure_reason_summary,omitempty"`
+	FencingToken                int64                  `json:"fencing_token,omitempty"`
+	AttemptHistory              []AttemptFailureRecord `json:"attempt_history,omitempty"`
+}
+
+// AttemptFailureRecord documents a single recorded attempt failure in history.
+type AttemptFailureRecord struct {
+	AttemptNumber   int       `json:"attempt_number"`
+	Tool            string    `json:"tool,omitempty"`
+	ExitCode        int       `json:"exit_code"`
+	FailureCategory string    `json:"failure_category,omitempty"`
+	Reason          string    `json:"reason,omitempty"`
+	ErrorMessage    string    `json:"error_message,omitempty"`
+	Timestamp       time.Time `json:"timestamp,omitempty"`
 }
 
 // GetJob fetches the job definition from the control plane.

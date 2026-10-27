@@ -1260,6 +1260,75 @@ func TestBuildArgv_AnchoredResumePass(t *testing.T) {
 	}
 }
 
+func TestBuildArgv_EmptyConversation_DirtyWorktree(t *testing.T) {
+	dir := t.TempDir()
+	// Initialize git repo in dir and create uncommitted file
+	_ = exec.Command("git", "-C", dir, "init").Run()
+	_ = os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty content"), 0644)
+
+	req := ExecutionRequest{
+		Engine:       "agy",
+		Prompt:       "resume",
+		WorktreePath: dir,
+		StoryID:      "STORY-GOV-9999",
+	}
+	argv, err := BuildArgv(req)
+	if err != nil {
+		t.Fatalf("expected dirty worktree to resolve prompt without error, got: %v", err)
+	}
+	// Verify --conversation is NOT passed when ResumeConversationID is empty
+	for _, a := range argv {
+		if strings.Contains(a, "--conversation") {
+			t.Fatalf("did not expect --conversation in argv when ResumeConversationID is empty: %v", argv)
+		}
+	}
+	// Verify prompt is resolved to complete current ASE flow
+	foundPrompt := false
+	for _, a := range argv {
+		if strings.Contains(a, "resume and complete current /autonomous-story-execution flow") {
+			foundPrompt = true
+			break
+		}
+	}
+	if !foundPrompt {
+		t.Fatalf("expected dirty flow completion prompt in argv, got: %v", argv)
+	}
+}
+
+func TestBuildArgv_EmptyConversation_CleanWorktree_StoryID(t *testing.T) {
+	dir := t.TempDir()
+	// Initialize clean git repo
+	_ = exec.Command("git", "-C", dir, "init").Run()
+
+	req := ExecutionRequest{
+		Engine:       "agy",
+		Prompt:       "resume",
+		WorktreePath: dir,
+		StoryID:      "STORY-GOV-8888",
+	}
+	argv, err := BuildArgv(req)
+	if err != nil {
+		t.Fatalf("expected clean worktree with StoryID to resolve prompt without error, got: %v", err)
+	}
+	// Verify --conversation is NOT passed
+	for _, a := range argv {
+		if strings.Contains(a, "--conversation") {
+			t.Fatalf("did not expect --conversation in argv: %v", argv)
+		}
+	}
+	// Verify prompt executes the story
+	foundPrompt := false
+	for _, a := range argv {
+		if strings.Contains(a, "Execute story STORY-GOV-8888 end-to-end") {
+			foundPrompt = true
+			break
+		}
+	}
+	if !foundPrompt {
+		t.Fatalf("expected story execution prompt in argv, got: %v", argv)
+	}
+}
+
 func TestEngineExecutionSymlinkResolutionAndFailure(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping symlink tests on windows")
