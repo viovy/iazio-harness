@@ -148,4 +148,73 @@ func TestMockAgy_ScenariosUnit(t *testing.T) {
 			t.Fatalf("expected log file to exist: %v", err)
 		}
 	})
+
+	t.Run("Subcommands", func(t *testing.T) {
+		var stdout bytes.Buffer
+		code := run([]string{"version", "--json"}, "", &stdout, os.Stderr)
+		if code != 0 || !strings.Contains(stdout.String(), "1.15.0-mock") {
+			t.Fatalf("version failed: code %d, out: %s", code, stdout.String())
+		}
+
+		stdout.Reset()
+		code = run([]string{"models", "--json"}, "", &stdout, os.Stderr)
+		if code != 0 || !strings.Contains(stdout.String(), "gemini-2.5-pro") {
+			t.Fatalf("models failed: code %d, out: %s", code, stdout.String())
+		}
+
+		stdout.Reset()
+		code = run([]string{"agents"}, "", &stdout, os.Stderr)
+		if code != 0 || !strings.Contains(stdout.String(), "autonomous") {
+			t.Fatalf("agents failed: code %d, out: %s", code, stdout.String())
+		}
+
+		stdout.Reset()
+		code = run([]string{"help"}, "", &stdout, os.Stderr)
+		if code != 0 || !strings.Contains(stdout.String(), "Usage:") {
+			t.Fatalf("help failed: code %d, out: %s", code, stdout.String())
+		}
+	})
+
+	t.Run("HeadlessPermissionDenied", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		// Missing --dangerously-skip-permissions with permission-requiring prompt
+		code := run([]string{"-p", "please require_permission to edit"}, "", &stdout, &stderr)
+		if code != 1 {
+			t.Fatalf("expected exit 1 on missing permission flag, got %d", code)
+		}
+		if !strings.Contains(stderr.String(), "jetski: no output produced — a tool required the 'command' permission") {
+			t.Fatalf("unexpected stderr: %s", stderr.String())
+		}
+
+		// With --dangerously-skip-permissions, should succeed
+		stdout.Reset()
+		stderr.Reset()
+		code = run([]string{"-p", "please require_permission to edit", "--dangerously-skip-permissions"}, "", &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("expected exit 0 with flag, got %d", code)
+		}
+
+		// Explicit permission_denied scenario
+		stdout.Reset()
+		stderr.Reset()
+		code = run([]string{"-p", "ordinary"}, "permission_denied", &stdout, &stderr)
+		if code != 1 || !strings.Contains(stderr.String(), "jetski: no output produced") {
+			t.Fatalf("expected permission_denied exit 1, got code %d, err: %s", code, stderr.String())
+		}
+	})
+
+	t.Run("FailureScenarios", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-p", "test"}, "session_corrupted", &stdout, &stderr)
+		if code != 1 || !strings.Contains(stderr.String(), "malformed") {
+			t.Fatalf("expected session_corrupted failure, got %d: %s", code, stderr.String())
+		}
+
+		stdout.Reset()
+		stderr.Reset()
+		code = run([]string{"-p", "test"}, "quota_exhausted", &stdout, &stderr)
+		if code != 1 || !strings.Contains(stderr.String(), "429") {
+			t.Fatalf("expected quota_exhausted failure, got %d: %s", code, stderr.String())
+		}
+	})
 }

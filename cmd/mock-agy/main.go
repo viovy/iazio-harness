@@ -20,7 +20,67 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 	var model string
 	var agent string
 	var logFile string
+	var outputFormat string
+	var inputFormat string
+	var mode string
+	var effort string
+	var addDirs []string
+	var skipPermissions bool
+	var continueSession bool
+	var jsonOutput bool
 	var positional []string
+
+	// Check for top-level subcommands first
+	if len(args) > 0 {
+		subcmd := args[0]
+		switch subcmd {
+		case "version", "--version", "-v":
+			for _, a := range args[1:] {
+				if a == "--json" {
+					jsonOutput = true
+				}
+			}
+			if jsonOutput {
+				fmt.Fprintln(stdout, `{"version": "1.15.0-mock", "channel": "stable"}`)
+			} else {
+				fmt.Fprintln(stdout, "antigravity 1.15.0-mock")
+			}
+			return 0
+		case "models":
+			for _, a := range args[1:] {
+				if a == "--json" {
+					jsonOutput = true
+				}
+			}
+			if jsonOutput {
+				fmt.Fprintln(stdout, `[{"id":"gemini-2.5-pro","name":"Gemini 2.5 Pro"},{"id":"gemini-2.5-flash","name":"Gemini 2.5 Flash"}]`)
+			} else {
+				fmt.Fprintln(stdout, "Available models:\n  - gemini-2.5-pro\n  - gemini-2.5-flash")
+			}
+			return 0
+		case "agents":
+			for _, a := range args[1:] {
+				if a == "--json" {
+					jsonOutput = true
+				}
+			}
+			if jsonOutput {
+				fmt.Fprintln(stdout, `[{"name":"general"},{"name":"autonomous"}]`)
+			} else {
+				fmt.Fprintln(stdout, "Available agents:\n  - general\n  - autonomous")
+			}
+			return 0
+		case "help", "--help", "-h":
+			fmt.Fprintln(stdout, "Usage: agy [options] [prompt]")
+			fmt.Fprintln(stdout, "Flags:")
+			fmt.Fprintln(stdout, "  -p, --print, --prompt <text>      Headless non-interactive execution")
+			fmt.Fprintln(stdout, "  -c, --continue, --conversation    Target conversation session")
+			fmt.Fprintln(stdout, "  --model <model>                   Model identifier")
+			fmt.Fprintln(stdout, "  --agent <agent>                   Agent persona identifier")
+			fmt.Fprintln(stdout, "  --dangerously-skip-permissions    Bypass tool execution confirmation gates")
+			return 0
+		}
+	}
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -32,9 +92,17 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 				conversationID = args[i+1]
 				i++
 			}
+		case arg == "-c" || arg == "--continue":
+			continueSession = true
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				conversationID = args[i+1]
+				i++
+			}
 		case strings.HasPrefix(arg, "--print="):
 			printPrompt = strings.TrimPrefix(arg, "--print=")
-		case arg == "--print":
+		case strings.HasPrefix(arg, "--prompt="):
+			printPrompt = strings.TrimPrefix(arg, "--prompt=")
+		case arg == "--print" || arg == "-p" || arg == "--prompt":
 			if i+1 < len(args) {
 				printPrompt = args[i+1]
 				i++
@@ -60,12 +128,49 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 				logFile = args[i+1]
 				i++
 			}
+		case strings.HasPrefix(arg, "--output-format="):
+			outputFormat = strings.TrimPrefix(arg, "--output-format=")
+		case arg == "--output-format":
+			if i+1 < len(args) {
+				outputFormat = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(arg, "--input-format="):
+			inputFormat = strings.TrimPrefix(arg, "--input-format=")
+		case arg == "--input-format":
+			if i+1 < len(args) {
+				inputFormat = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(arg, "--mode="):
+			mode = strings.TrimPrefix(arg, "--mode=")
+		case arg == "--mode":
+			if i+1 < len(args) {
+				mode = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(arg, "--effort="):
+			effort = strings.TrimPrefix(arg, "--effort=")
+		case arg == "--effort":
+			if i+1 < len(args) {
+				effort = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(arg, "--add-dir="):
+			addDirs = append(addDirs, strings.TrimPrefix(arg, "--add-dir="))
+		case arg == "--add-dir":
+			if i+1 < len(args) {
+				addDirs = append(addDirs, args[i+1])
+				i++
+			}
 		case arg == "--print-timeout" || strings.HasPrefix(arg, "--print-timeout="):
 			if !strings.Contains(arg, "=") && i+1 < len(args) {
 				i++
 			}
-		case arg == "--dangerously-skip-permissions", arg == "--disable-slash-commands":
-			// Boolean flags
+		case arg == "--dangerously-skip-permissions":
+			skipPermissions = true
+		case arg == "--disable-slash-commands":
+			// Boolean flag
 		default:
 			if !strings.HasPrefix(arg, "--") {
 				positional = append(positional, arg)
@@ -77,6 +182,12 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 	if fullPrompt == "" && len(positional) > 0 {
 		fullPrompt = strings.Join(positional, " ")
 	}
+	_ = outputFormat
+	_ = inputFormat
+	_ = mode
+	_ = effort
+	_ = addDirs
+	_ = continueSession
 
 	// Ensure conversation DB directory exists if conversationID is provided
 	if conversationID != "" {
@@ -97,7 +208,20 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	if (!skipPermissions && strings.Contains(strings.ToLower(fullPrompt), "require_permission")) || scenario == "permission_denied" {
+		fmt.Fprintln(stderr, "jetski: no output produced — a tool required the 'command' permission that headless mode cannot prompt for, so it was auto-denied. To allow tools to run without interactive approval, pass --dangerously-skip-permissions.")
+		return 1
+	}
+
 	switch scenario {
+	case "session_corrupted":
+		fmt.Fprintln(stderr, "Error: database disk image is malformed: conversation session corrupted")
+		return 1
+
+	case "quota_exhausted":
+		fmt.Fprintln(stderr, "ResourceExhausted: 429 You have exhausted your current token quota. Please wait or upgrade your tier.")
+		return 1
+
 	case "ordinary_prompt_with_mcp_daemons":
 		// Scenario 1: Print normal output, spawn persistent background child daemon that keeps
 		// pipes inherited, and exit 0 immediately.
@@ -191,6 +315,9 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		_ = os.Remove(marker)
+		_ = os.WriteFile("resumed_attempt_2.txt", []byte("resumed deliverable"), 0644)
+		_ = exec.Command("git", "add", "resumed_attempt_2.txt").Run()
+		_ = exec.Command("git", "commit", "-m", "chore: complete task on attempt 2").Run()
 		fmt.Fprintln(stdout, "[mock-agy] Attempt 2 startup logs: resuming from checkpoint...")
 		fmt.Fprintln(stdout, "[mock-agy] Attempt 2 succeeded cleanly. Task finished.")
 		return 0
