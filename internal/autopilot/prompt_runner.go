@@ -49,6 +49,8 @@ type PromptResult struct {
 	StoryPath     string   `json:"story_path,omitempty"`
 	Status        string   `json:"status"`
 	ExitCode      int      `json:"exit_code"`
+	PreGitHeadSHA string   `json:"pre_git_head_sha,omitempty"`
+	PreGitTreeSHA string   `json:"pre_git_tree_sha,omitempty"`
 	GitHeadSHA    string   `json:"git_head_sha"`
 	GitTreeSHA    string   `json:"git_tree_sha"`
 	ModifiedFiles []string `json:"modified_files"`
@@ -203,6 +205,9 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
+	// Capture pre-execution Git state
+	preHeadSHA, preTreeSHA, _ := captureGitSnapshot(opts.WorkingDir, gitBin)
+
 	// 3. Configure dedicated process group
 	engines.SetProcGroup(cmd)
 
@@ -215,6 +220,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			TargetAgent:   targetAgent,
 			Status:        "failed",
 			ExitCode:      1,
+			PreGitHeadSHA: preHeadSHA,
+			PreGitTreeSHA: preTreeSHA,
 			GitHeadSHA:    headSHA,
 			GitTreeSHA:    treeSHA,
 			ModifiedFiles: modified,
@@ -282,8 +289,6 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			summary = stderrBuf.String()
 		} else if waitErr != nil {
 			summary = waitErr.Error()
-		} else {
-			summary = fmt.Sprintf("Prompt executed successfully in %s via %s", opts.Repo, targetAgent)
 		}
 	}
 	summary = redact.Egress(strings.TrimSpace(summary))
@@ -322,6 +327,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		StoryPath:     detectedStoryPath,
 		Status:        execStatus,
 		ExitCode:      exitCode,
+		PreGitHeadSHA: preHeadSHA,
+		PreGitTreeSHA: preTreeSHA,
 		GitHeadSHA:    headSHA,
 		GitTreeSHA:    treeSHA,
 		ModifiedFiles: modified,

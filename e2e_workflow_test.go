@@ -22,13 +22,14 @@ import (
 )
 
 // ============================================================================
-// 1. DOMAIN & QUEUE STORE (iazio-api with Monotonic Fencing Token CAS)
+// 1. DOMAIN, PROOF-OF-EXECUTION CONTRACT & QUEUE STORE
 // ============================================================================
 
 var (
-	ErrJobNotFound       = errors.New("job not found")
-	ErrStaleFencingToken = errors.New("409 conflict: stale fencing token")
-	ErrNoPendingJob      = errors.New("no pending job available")
+	ErrJobNotFound          = errors.New("job not found")
+	ErrStaleFencingToken    = errors.New("409 conflict: stale fencing token")
+	ErrNoPendingJob         = errors.New("no pending job available")
+	ErrBypassOrNoOpDetected = errors.New("BYPASS_OR_NOOP_DETECTED: job claimed completion without verifiable execution proof")
 )
 
 type JobStatus string
@@ -40,20 +41,72 @@ const (
 	StatusFailed    JobStatus = "failed"
 )
 
+type ExecutionProof struct {
+	PreGitHeadSHA    string `json:"pre_git_head_sha"`
+	PostGitHeadSHA   string `json:"post_git_head_sha"`
+	PreGitTreeSHA    string `json:"pre_git_tree_sha"`
+	PostGitTreeSHA   string `json:"post_git_tree_sha"`
+	AllocatedStoryID string `json:"allocated_story_id"`
+	StdoutBytes      int    `json:"stdout_bytes"`
+	StdoutLineCount  int    `json:"stdout_line_count"`
+	RawTranscript    string `json:"raw_transcript"`
+	AgentPID         int    `json:"agent_pid"`
+	DurationMs       int64  `json:"duration_ms"`
+}
+
+// VerifyExecutionProof enforces hard anti-lying and anti-noop invariants before
+// any job is allowed to transition to StatusCompleted.
+func VerifyExecutionProof(action string, proof ExecutionProof) error {
+	// 1. Reject canned/synthetic wrapper summaries masquerading as output
+	trimmed := strings.TrimSpace(proof.RawTranscript)
+	if trimmed == "" || strings.HasPrefix(trimmed, "[+] prompt executed via") {
+		return fmt.Errorf("%w: synthetic or empty transcript detected (%q)", ErrBypassOrNoOpDetected, trimmed)
+	}
+
+	// 2. Require minimum real telemetry volume from the underlying agent CLI
+	if proof.StdoutBytes < 256 || proof.StdoutLineCount < 5 {
+		return fmt.Errorf("%w: insufficient agent stdout telemetry (bytes=%d, lines=%d)",
+			ErrBypassOrNoOpDetected, proof.StdoutBytes, proof.StdoutLineCount)
+	}
+
+	// 3. For mutating workflows (/autonomous-story-execution), enforce Git mutation & Story allocation
+	if action == "/autonomous-story-execution" {
+		if proof.PreGitHeadSHA == "" || proof.PostGitHeadSHA == "" ||
+			proof.PreGitTreeSHA == "" || proof.PostGitTreeSHA == "" {
+			return fmt.Errorf("%w: missing pre/post Git SHA telemetry", ErrBypassOrNoOpDetected)
+		}
+
+		// If neither HEAD commit nor working tree SHA changed, zero work was done!
+		if proof.PreGitHeadSHA == proof.PostGitHeadSHA && proof.PreGitTreeSHA == proof.PostGitTreeSHA {
+			return fmt.Errorf("%w: zero repository mutation (HEAD=%s and Tree=%s unchanged)",
+				ErrBypassOrNoOpDetected, proof.PostGitHeadSHA, proof.PostGitTreeSHA)
+		}
+
+		// Must have allocated a real Story ID (cannot remain empty or 'pending-allocation')
+		if proof.AllocatedStoryID == "" || proof.AllocatedStoryID == "pending-allocation" {
+			return fmt.Errorf("%w: story_id was never allocated (got %q)",
+				ErrBypassOrNoOpDetected, proof.AllocatedStoryID)
+		}
+	}
+
+	return nil
+}
+
 type Job struct {
-	ID             string    `json:"id"`
-	Action         string    `json:"action"`
-	TargetRepo     string    `json:"target_repo"`
-	TargetAgent    string    `json:"target_agent"`
-	Story          string    `json:"story"`
-	StoryID        string    `json:"story_id"`
-	Status         JobStatus `json:"status"`
-	AgentID        string    `json:"agent_id"`
-	FencingToken   uint64    `json:"fencing_token"`
-	LeaseExpiresAt time.Time `json:"lease_expires_at"`
-	OutputLog      string    `json:"output_log"`
-	ErrorMsg       string    `json:"error_msg"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID             string          `json:"id"`
+	Action         string          `json:"action"`
+	TargetRepo     string          `json:"target_repo"`
+	TargetAgent    string          `json:"target_agent"`
+	Story          string          `json:"story"`
+	StoryID        string          `json:"story_id"`
+	Status         JobStatus       `json:"status"`
+	AgentID        string          `json:"agent_id"`
+	FencingToken   uint64          `json:"fencing_token"`
+	LeaseExpiresAt time.Time       `json:"lease_expires_at"`
+	OutputLog      string          `json:"output_log"`
+	ErrorMsg       string          `json:"error_msg"`
+	ExecutionProof *ExecutionProof `json:"execution_proof,omitempty"`
+	UpdatedAt      time.Time       `json:"updated_at"`
 }
 
 type QueueStore struct {
@@ -151,8 +204,26 @@ func (s *QueueStore) Heartbeat(jobID string, fencingToken uint64, storyID string
 	return nil
 }
 
-// Closeout enforces strict CAS on FencingToken before accepting terminal state.
-func (s *QueueStore) Closeout(jobID string, fencingToken uint64, status JobStatus, storyID, outputLog, errMsg string) error {
+// AppendLogs appends a real-time output chunk to the job's log.
+func (s *QueueStore) AppendLogs(jobID string, fencingToken uint64, chunk string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	j, ok := s.jobs[jobID]
+	if !ok {
+		return ErrJobNotFound
+	}
+	if j.FencingToken != fencingToken || j.Status != StatusRunning {
+		return fmt.Errorf("%w: append logs rejected for job=%s expected_token=%d got_token=%d status=%s",
+			ErrStaleFencingToken, jobID, j.FencingToken, fencingToken, j.Status)
+	}
+	j.OutputLog += chunk
+	j.UpdatedAt = time.Now()
+	return nil
+}
+
+// Closeout enforces strict CAS on FencingToken and validates Proof-of-Execution before accepting completion.
+func (s *QueueStore) Closeout(jobID string, fencingToken uint64, status JobStatus, storyID, outputLog, errMsg string, proof ExecutionProof) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -164,13 +235,27 @@ func (s *QueueStore) Closeout(jobID string, fencingToken uint64, status JobStatu
 		return fmt.Errorf("%w: closeout rejected for job=%s expected_token=%d got_token=%d status=%s",
 			ErrStaleFencingToken, jobID, j.FencingToken, fencingToken, j.Status)
 	}
-	j.Status = status
+
+	j.ExecutionProof = &proof
 	if storyID != "" {
 		j.StoryID = storyID
 	}
-	j.OutputLog = outputLog
-	j.ErrorMsg = errMsg
+	if outputLog != "" {
+		j.OutputLog = outputLog
+	}
 	j.UpdatedAt = time.Now()
+
+	// If claiming completion, enforce Proof-of-Execution anti-bypass verification
+	if status == StatusCompleted {
+		if err := VerifyExecutionProof(j.Action, proof); err != nil {
+			j.Status = StatusFailed
+			j.ErrorMsg = err.Error()
+			return err
+		}
+	}
+
+	j.Status = status
+	j.ErrorMsg = errMsg
 	return nil
 }
 
@@ -201,6 +286,7 @@ func NewIazioAPIServer(store *QueueStore) *httptest.Server {
 
 	mux.HandleFunc("POST /api/v1/queue/jobs", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
+			ID          string `json:"id"`
 			Action      string `json:"action"`
 			TargetRepo  string `json:"target_repo"`
 			TargetAgent string `json:"target_agent"`
@@ -211,6 +297,14 @@ func NewIazioAPIServer(store *QueueStore) *httptest.Server {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+
+		// Requirement 1: Server-side ID generation strictly enforced.
+		// Reject any client-supplied ID with 400 Bad Request to prevent injection/backfill bypasses.
+		if strings.TrimSpace(req.ID) != "" {
+			http.Error(w, "client-supplied job ID is forbidden; server generates IDs", http.StatusBadRequest)
+			return
+		}
+
 		job := store.Enqueue(req.Action, req.TargetRepo, req.TargetAgent, req.Story, req.StoryID)
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(job)
@@ -257,22 +351,58 @@ func NewIazioAPIServer(store *QueueStore) *httptest.Server {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	mux.HandleFunc("POST /api/v1/queue/jobs/{id}/closeout", func(w http.ResponseWriter, r *http.Request) {
+	// Requirement 2: Real-time stdout/stderr log chunk streaming endpoint
+	mux.HandleFunc("POST /api/v1/queue/jobs/{id}/logs", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			FencingToken uint64    `json:"fencing_token"`
-			Status       JobStatus `json:"status"`
-			StoryID      string    `json:"story_id"`
-			OutputLog    string    `json:"output_log"`
-			ErrorMsg     string    `json:"error_msg"`
+			FencingToken uint64 `json:"fencing_token"`
+			Chunk        string `json:"chunk"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		err := store.Closeout(r.PathValue("id"), req.FencingToken, req.Status, req.StoryID, req.OutputLog, req.ErrorMsg)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		err := store.AppendLogs(r.PathValue("id"), req.FencingToken, req.Chunk)
 		if errors.Is(err, ErrStaleFencingToken) {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
-		if err != nil {
+		if errors.Is(err, ErrJobNotFound) {
 			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Requirement 3: Cryptographic Proof-of-Execution Gate on Closeout
+	mux.HandleFunc("POST /api/v1/queue/jobs/{id}/closeout", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			FencingToken   uint64         `json:"fencing_token"`
+			Status         JobStatus      `json:"status"`
+			StoryID        string         `json:"story_id"`
+			OutputLog      string         `json:"output_log"`
+			ErrorMsg       string         `json:"error_msg"`
+			ExecutionProof ExecutionProof `json:"execution_proof"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		err := store.Closeout(r.PathValue("id"), req.FencingToken, req.Status, req.StoryID, req.OutputLog, req.ErrorMsg, req.ExecutionProof)
+		if errors.Is(err, ErrStaleFencingToken) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		if errors.Is(err, ErrJobNotFound) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, ErrBypassOrNoOpDetected) {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -349,13 +479,51 @@ func (m *IazioMCPClient) QueueAutonomousStoryExecution(ctx context.Context, targ
 type IazioHarness struct {
 	AgyBinaryPath string
 	WorkspaceDir  string
+	APIBaseURL    string
+}
+
+func (h *IazioHarness) captureGitSHAs(ctx context.Context) (headSHA string, treeSHA string, err error) {
+	headOut, err := exec.CommandContext(ctx, "git", "-C", h.WorkspaceDir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("git rev-parse HEAD failed: %w", err)
+	}
+	treeOut, err := exec.CommandContext(ctx, "git", "-C", h.WorkspaceDir, "rev-parse", "HEAD^{tree}").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("git rev-parse HEAD^{tree} failed: %w", err)
+	}
+	return strings.TrimSpace(string(headOut)), strings.TrimSpace(string(treeOut)), nil
+}
+
+func (h *IazioHarness) streamLogChunk(ctx context.Context, jobID string, fencingToken uint64, chunk string) {
+	if h.APIBaseURL == "" {
+		return
+	}
+	body, _ := json.Marshal(map[string]any{
+		"fencing_token": fencingToken,
+		"chunk":         chunk,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		fmt.Sprintf("%s/api/v1/queue/jobs/%s/logs", h.APIBaseURL, jobID),
+		bytes.NewReader(body))
+	if err == nil {
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, doErr := client.Do(req)
+		if doErr == nil {
+			_ = resp.Body.Close()
+		}
+	}
 }
 
 func (h *IazioHarness) Execute(
 	ctx context.Context,
 	job *Job,
 	onStoryAllocated func(string),
-) (allocatedStoryID string, output string, err error) {
+) (allocatedStoryID string, output string, proof ExecutionProof, err error) {
+	startTime := time.Now()
+
+	// Capture Pre-execution Git state
+	preHeadSHA, preTreeSHA, _ := h.captureGitSHAs(ctx)
+
 	cmd := exec.CommandContext(ctx, h.AgyBinaryPath,
 		"--job-id", job.ID,
 		"--fencing-token", fmt.Sprintf("%d", job.FencingToken),
@@ -373,21 +541,34 @@ func (h *IazioHarness) Execute(
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", "", err
+		return "", "", proof, err
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Start(); err != nil {
-		return "", "", err
+		return "", "", proof, err
+	}
+
+	agentPID := 0
+	if cmd.Process != nil {
+		agentPID = cmd.Process.Pid
 	}
 
 	allocatedStoryID = job.StoryID
 	var outBuf bytes.Buffer
+	var stdoutLineCount int
+
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		line := scanner.Text()
-		outBuf.WriteString(line + "\n")
+		stdoutLineCount++
+		chunk := line + "\n"
+		outBuf.WriteString(chunk)
+
+		// Real-time log streaming to iazio-api
+		h.streamLogChunk(ctx, job.ID, job.FencingToken, chunk)
+
 		if strings.HasPrefix(line, "ALLOCATED_STORY_ID:") {
 			id := strings.TrimSpace(strings.TrimPrefix(line, "ALLOCATED_STORY_ID:"))
 			allocatedStoryID = id
@@ -398,7 +579,37 @@ func (h *IazioHarness) Execute(
 	}
 
 	waitErr := cmd.Wait()
-	return allocatedStoryID, outBuf.String() + stderr.String(), waitErr
+	durationMs := time.Since(startTime).Milliseconds()
+
+	// Capture Post-execution Git state
+	postHeadSHA, postTreeSHA, _ := h.captureGitSHAs(ctx)
+
+	rawTranscript := outBuf.String()
+	totalBytes := len(rawTranscript)
+
+	proof = ExecutionProof{
+		PreGitHeadSHA:    preHeadSHA,
+		PostGitHeadSHA:   postHeadSHA,
+		PreGitTreeSHA:    preTreeSHA,
+		PostGitTreeSHA:   postTreeSHA,
+		AllocatedStoryID: allocatedStoryID,
+		StdoutBytes:      totalBytes,
+		StdoutLineCount:  stdoutLineCount,
+		RawTranscript:    rawTranscript,
+		AgentPID:         agentPID,
+		DurationMs:       durationMs,
+	}
+
+	combinedOutput := rawTranscript + stderr.String()
+
+	// If child process exited 0, enforce Proof-of-Execution invariants
+	if waitErr == nil {
+		if poeErr := VerifyExecutionProof(job.Action, proof); poeErr != nil {
+			return allocatedStoryID, combinedOutput, proof, poeErr
+		}
+	}
+
+	return allocatedStoryID, combinedOutput, proof, waitErr
 }
 
 type IazioAgent struct {
@@ -502,7 +713,7 @@ func (a *IazioAgent) ClaimAndExecuteOnce(ctx context.Context) (*Job, error) {
 	}()
 
 	// 3. Execute prompt via iazio-harness -> agy
-	allocatedID, output, execErr := a.Harness.Execute(execCtx, &job, func(newStoryID string) {
+	allocatedID, output, proof, execErr := a.Harness.Execute(execCtx, &job, func(newStoryID string) {
 		storyMu.Lock()
 		currentStoryID = newStoryID
 		storyMu.Unlock()
@@ -518,7 +729,7 @@ func (a *IazioAgent) ClaimAndExecuteOnce(ctx context.Context) (*Job, error) {
 	default:
 	}
 
-	// 4. Closeout job with FencingToken CAS
+	// 4. Closeout job with FencingToken CAS and Proof of Execution
 	finalStatus := StatusCompleted
 	errMsg := ""
 	if execErr != nil {
@@ -527,11 +738,12 @@ func (a *IazioAgent) ClaimAndExecuteOnce(ctx context.Context) (*Job, error) {
 	}
 
 	closeBody, _ := json.Marshal(map[string]any{
-		"fencing_token": job.FencingToken,
-		"status":        finalStatus,
-		"story_id":      allocatedID,
-		"output_log":    output,
-		"error_msg":     errMsg,
+		"fencing_token":   job.FencingToken,
+		"status":          finalStatus,
+		"story_id":        allocatedID,
+		"output_log":      output,
+		"error_msg":       errMsg,
+		"execution_proof": proof,
 	})
 	closeReq, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		fmt.Sprintf("%s/api/v1/queue/jobs/%s/closeout", a.APIBaseURL, job.ID),
@@ -552,6 +764,26 @@ func (a *IazioAgent) ClaimAndExecuteOnce(ctx context.Context) (*Job, error) {
 // 5. MOCK AGY CLI BUILDER & INTEGRATION TESTS
 // ============================================================================
 
+func initGitRepo(t *testing.T, dir string) {
+	t.Helper()
+	runCmd := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+		}
+	}
+	runCmd("init")
+	runCmd("config", "user.name", "test-agent")
+	runCmd("config", "user.email", "test@example.com")
+	initFile := filepath.Join(dir, "README.md")
+	if err := os.WriteFile(initFile, []byte("# Initial Workspace Repo\n"), 0600); err != nil {
+		t.Fatalf("failed to write initial file: %v", err)
+	}
+	runCmd("add", ".")
+	runCmd("commit", "-m", "initial commit")
+}
+
 // buildMockAgyCLI compiles a real executable binary that acts as the `agy` CLI tool.
 func buildMockAgyCLI(t *testing.T) string {
 	t.Helper()
@@ -565,6 +797,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"time"
 )
 
@@ -575,9 +809,21 @@ func main() {
 	story := flag.String("story", "", "Story Title")
 	flag.Parse()
 
-	if *storyID == "pending-allocation" {
-		fmt.Println("ALLOCATED_STORY_ID: STORY-GOV-3712")
+	scenario := os.Getenv("MOCK_AGY_SCENARIO")
+	if scenario == "noop_bypass" {
+		// Simulate fake/noop run: sleep and exit 0 without mutating git or emitting valid telemetry
+		time.Sleep(50 * time.Millisecond)
+		if os.Getenv("MOCK_AGY_SYNTHETIC_OUTPUT") == "1" {
+			fmt.Printf("[+] prompt executed via agy (exit 0)\n")
+		}
+		os.Exit(0)
 	}
+
+	allocatedID := "STORY-GOV-3715"
+	if *storyID != "" && *storyID != "pending-allocation" {
+		allocatedID = *storyID
+	}
+	fmt.Printf("ALLOCATED_STORY_ID: %s\n", allocatedID)
 
 	sleepDuration := 250 * time.Millisecond
 	if envSleep := os.Getenv("MOCK_AGY_SLEEP_MS"); envSleep != "" {
@@ -586,9 +832,22 @@ func main() {
 		}
 	}
 
-	// Simulate silent deep work (e.g. LLM thinking / compiling) across multiple lease intervals
+	// Mutate Git working tree and commit
+	workDir, _ := os.Getwd()
+	storyFile := filepath.Join(workDir, "story_artifact.txt")
+	_ = os.WriteFile(storyFile, []byte(fmt.Sprintf("Story execution artifact for %s\n", allocatedID)), 0644)
+	_ = exec.Command("git", "add", ".").Run()
+	_ = exec.Command("git", "commit", "-m", fmt.Sprintf("feat: implement story %s", allocatedID)).Run()
+
+	// Simulate deep work across multiple lease intervals
 	time.Sleep(sleepDuration)
 
+	// Stream detailed real telemetry (> 256 bytes, >= 5 lines)
+	fmt.Printf("[agy-telemetry] Initializing autonomous story execution engine for job=%s\n", *jobID)
+	fmt.Printf("[agy-telemetry] Fencing token bound: token=%d story=%q\n", *fencingToken, *story)
+	fmt.Printf("[agy-telemetry] Repository mutations committed to git tree successfully\n")
+	fmt.Printf("[agy-telemetry] Running verification gates: validate-local, lint, and unit tests\n")
+	fmt.Printf("[agy-telemetry] All verification checks green: proof of execution ready\n")
 	fmt.Printf("EXECUTED_ON_AGY job=%s token=%d story=%q\n", *jobID, *fencingToken, *story)
 }
 `
@@ -604,15 +863,19 @@ func main() {
 
 // Test 1: Proves full E2E flow (MCP -> API -> Agent -> Harness -> mock-agy)
 // and proves a silent long-running job (300ms > 100ms LeaseTTL) DOES NOT TIMEOUT
-// because decoupled heartbeats renew the lease every 25ms.
+// because decoupled heartbeats renew the lease every 25ms, and satisfies PoE.
 func TestE2E_MCP_Queue_Agent_Harness_MockAgy_NoPrematureTimeout(t *testing.T) {
 	mockAgyBin := buildMockAgyCLI(t)
 	t.Setenv("MOCK_AGY_SLEEP_MS", "300") // 3x longer than the 100ms lease TTL!
+	t.Setenv("MOCK_AGY_SCENARIO", "legitimate")
 
 	leaseTTL := 100 * time.Millisecond
 	store := NewQueueStore(leaseTTL)
 	server := NewIazioAPIServer(store)
 	defer server.Close()
+
+	wsDir := t.TempDir()
+	initGitRepo(t, wsDir)
 
 	// Background Reaper running every 30ms
 	ctx, cancel := context.WithCancel(context.Background())
@@ -654,7 +917,8 @@ func TestE2E_MCP_Queue_Agent_Harness_MockAgy_NoPrematureTimeout(t *testing.T) {
 		MaxExecutionTime:  10 * time.Second,
 		Harness: &IazioHarness{
 			AgyBinaryPath: mockAgyBin,
-			WorkspaceDir:  t.TempDir(),
+			WorkspaceDir:  wsDir,
+			APIBaseURL:    server.URL,
 		},
 	}
 
@@ -674,11 +938,17 @@ func TestE2E_MCP_Queue_Agent_Harness_MockAgy_NoPrematureTimeout(t *testing.T) {
 	if finalJob.Status != StatusCompleted {
 		t.Fatalf("expected job status 'completed', got %q (error: %s)", finalJob.Status, finalJob.ErrorMsg)
 	}
-	if finalJob.StoryID != "STORY-GOV-3712" {
-		t.Fatalf("expected dynamic story ID 'STORY-GOV-3712', got %q", finalJob.StoryID)
+	if finalJob.StoryID != "STORY-GOV-3715" {
+		t.Fatalf("expected dynamic story ID 'STORY-GOV-3715', got %q", finalJob.StoryID)
 	}
 	if !strings.Contains(finalJob.OutputLog, "EXECUTED_ON_AGY") {
 		t.Fatalf("expected mock-agy output in job log, got: %s", finalJob.OutputLog)
+	}
+	if finalJob.ExecutionProof == nil {
+		t.Fatalf("expected execution proof recorded on job")
+	}
+	if finalJob.ExecutionProof.PreGitHeadSHA == finalJob.ExecutionProof.PostGitHeadSHA {
+		t.Fatalf("expected Git HEAD mutation proof, got unchanged SHA")
 	}
 }
 
@@ -688,11 +958,17 @@ func TestE2E_MCP_Queue_Agent_Harness_MockAgy_NoPrematureTimeout(t *testing.T) {
 func TestE2E_FencingTokenCAS_PreventsSplitBrainZombieOverwrite(t *testing.T) {
 	mockAgyBin := buildMockAgyCLI(t)
 	t.Setenv("MOCK_AGY_SLEEP_MS", "400")
+	t.Setenv("MOCK_AGY_SCENARIO", "legitimate")
 
 	leaseTTL := 80 * time.Millisecond
 	store := NewQueueStore(leaseTTL)
 	server := NewIazioAPIServer(store)
 	defer server.Close()
+
+	wsDir1 := t.TempDir()
+	initGitRepo(t, wsDir1)
+	wsDir2 := t.TempDir()
+	initGitRepo(t, wsDir2)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -713,7 +989,8 @@ func TestE2E_FencingTokenCAS_PreventsSplitBrainZombieOverwrite(t *testing.T) {
 		PauseHeartbeats:   true,
 		Harness: &IazioHarness{
 			AgyBinaryPath: mockAgyBin,
-			WorkspaceDir:  t.TempDir(),
+			WorkspaceDir:  wsDir1,
+			APIBaseURL:    server.URL,
 		},
 	}
 
@@ -739,7 +1016,8 @@ func TestE2E_FencingTokenCAS_PreventsSplitBrainZombieOverwrite(t *testing.T) {
 		MaxExecutionTime:  10 * time.Second,
 		Harness: &IazioHarness{
 			AgyBinaryPath: mockAgyBin,
-			WorkspaceDir:  t.TempDir(),
+			WorkspaceDir:  wsDir2,
+			APIBaseURL:    server.URL,
 		},
 	}
 
@@ -790,5 +1068,144 @@ func TestE2E_MCP_ReadAfterWriteVerification(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "hallucination guard triggered") {
 		t.Fatalf("expected error mentioning hallucination guard, got: %v", err)
+	}
+}
+
+// Test 4: Proof-of-Execution Gate catches no-op bypass and marks job failed.
+func TestE2E_MockAgy_NoOpBypass_DetectedAndFailed(t *testing.T) {
+	mockAgyBin := buildMockAgyCLI(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "noop_bypass")
+	t.Setenv("MOCK_AGY_SYNTHETIC_OUTPUT", "1")
+
+	leaseTTL := 2 * time.Second
+	store := NewQueueStore(leaseTTL)
+	server := NewIazioAPIServer(store)
+	defer server.Close()
+
+	wsDir := t.TempDir()
+	initGitRepo(t, wsDir)
+
+	mcpClient := NewIazioMCPClient(server.URL)
+	enqueuedJob, err := mcpClient.QueueAutonomousStoryExecution(
+		context.Background(),
+		".",
+		"agy",
+		"Attempt No-Op Bypass Execution",
+	)
+	if err != nil {
+		t.Fatalf("MCP enqueue failed: %v", err)
+	}
+
+	agent := &IazioAgent{
+		AgentID:           "test-agent-noop",
+		TargetAgent:       "agy",
+		APIBaseURL:        server.URL,
+		HeartbeatInterval: 50 * time.Millisecond,
+		MaxExecutionTime:  5 * time.Second,
+		Harness: &IazioHarness{
+			AgyBinaryPath: mockAgyBin,
+			WorkspaceDir:  wsDir,
+			APIBaseURL:    server.URL,
+		},
+	}
+
+	_, execErr := agent.ClaimAndExecuteOnce(context.Background())
+	if execErr == nil {
+		t.Fatalf("expected ClaimAndExecuteOnce to fail on no-op bypass run")
+	}
+	if !errors.Is(execErr, ErrBypassOrNoOpDetected) && !strings.Contains(execErr.Error(), "BYPASS_OR_NOOP_DETECTED") {
+		t.Fatalf("expected error mentioning BYPASS_OR_NOOP_DETECTED, got: %v", execErr)
+	}
+
+	// Verify job in database is marked failed with BYPASS_OR_NOOP_DETECTED
+	finalJob, err := store.Get(enqueuedJob.ID)
+	if err != nil {
+		t.Fatalf("failed to fetch final job: %v", err)
+	}
+	if finalJob.Status != StatusFailed {
+		t.Fatalf("expected final job status 'failed', got: %s", finalJob.Status)
+	}
+	if !strings.Contains(finalJob.ErrorMsg, "BYPASS_OR_NOOP_DETECTED") {
+		t.Fatalf("expected final job error_msg to contain BYPASS_OR_NOOP_DETECTED, got: %q", finalJob.ErrorMsg)
+	}
+}
+
+// Test 5: POST /api/v1/queue/jobs strictly rejects client-supplied IDs.
+func TestE2E_API_RejectsClientSuppliedJobID(t *testing.T) {
+	store := NewQueueStore(10 * time.Second)
+	server := NewIazioAPIServer(store)
+	defer server.Close()
+
+	payload := map[string]string{
+		"id":           "job_3060a0cb6d5e7c71",
+		"action":       "/autonomous-story-execution",
+		"target_repo":  ".",
+		"target_agent": "agy",
+		"story":        "Inject custom job ID",
+		"story_id":     "STORY-GOV-9999",
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/queue/jobs", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request when client supplies job id, got %d", resp.StatusCode)
+	}
+}
+
+// Test 6: Real-time stdout/stderr log chunk streaming via POST /api/v1/queue/jobs/{id}/logs
+func TestE2E_LiveLogStreaming(t *testing.T) {
+	mockAgyBin := buildMockAgyCLI(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "legitimate")
+	t.Setenv("MOCK_AGY_SLEEP_MS", "50")
+
+	leaseTTL := 2 * time.Second
+	store := NewQueueStore(leaseTTL)
+	server := NewIazioAPIServer(store)
+	defer server.Close()
+
+	wsDir := t.TempDir()
+	initGitRepo(t, wsDir)
+
+	mcpClient := NewIazioMCPClient(server.URL)
+	job, err := mcpClient.QueueAutonomousStoryExecution(context.Background(), ".", "agy", "Live Log Stream Test")
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	agent := &IazioAgent{
+		AgentID:           "test-agent-streaming",
+		TargetAgent:       "agy",
+		APIBaseURL:        server.URL,
+		HeartbeatInterval: 50 * time.Millisecond,
+		MaxExecutionTime:  5 * time.Second,
+		Harness: &IazioHarness{
+			AgyBinaryPath: mockAgyBin,
+			WorkspaceDir:  wsDir,
+			APIBaseURL:    server.URL,
+		},
+	}
+
+	_, err = agent.ClaimAndExecuteOnce(context.Background())
+	if err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+
+	finalJob, err := store.Get(job.ID)
+	if err != nil {
+		t.Fatalf("failed to get job: %v", err)
+	}
+	if !strings.Contains(finalJob.OutputLog, "[agy-telemetry]") {
+		t.Fatalf("expected OutputLog to contain streamed [agy-telemetry] chunks, got: %s", finalJob.OutputLog)
+	}
+	if !strings.Contains(finalJob.OutputLog, "EXECUTED_ON_AGY") {
+		t.Fatalf("expected OutputLog to contain EXECUTED_ON_AGY, got: %s", finalJob.OutputLog)
 	}
 }
