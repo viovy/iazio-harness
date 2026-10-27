@@ -1638,6 +1638,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 	// Capture pre-execution Git state
 	preGitHeadSHA, preGitTreeSHA, _ := proof.CaptureGitSHAs(ctx, targetDir)
+	preSnapshot, _ := proof.CaptureWorktreeSnapshot(targetDir)
 
 	var execRes engines.ExecutionResult
 	var execErr error
@@ -2130,6 +2131,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 
 	// Refresh post-execution Git state after all initial and continuation turns
 	postGitHeadSHA, postGitTreeSHA, _ = proof.CaptureGitSHAs(ctx, targetDir)
+	postSnapshot, _ := proof.CaptureWorktreeSnapshot(targetDir)
 
 	diagFinalStoryID := currentBoundStoryID
 	if diagFinalStoryID == "" || diagFinalStoryID == "pending_harness_creation" {
@@ -2181,6 +2183,8 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			PostGitHeadSHA:   postGitHeadSHA,
 			PreGitTreeSHA:    preGitTreeSHA,
 			PostGitTreeSHA:   postGitTreeSHA,
+			PreSnapshot:      &preSnapshot,
+			PostSnapshot:     &postSnapshot,
 			AllocatedStoryID: allocatedID,
 			StdoutBytes:      len(fullTranscript),
 			StdoutLineCount:  strings.Count(fullTranscript, "\n") + 1,
