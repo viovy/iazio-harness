@@ -2684,6 +2684,49 @@ exit 0
 	}
 }
 
+func TestFormatVersionAndHelpers(t *testing.T) {
+	buildCommitSHA = "abcdef1234567890"
+	buildTimeUTC = "2026-10-27T10:00:00Z"
+	buildDirty = "1"
+	version = "1.0.0"
+
+	commit := resolveCommit()
+	if commit != "abcdef1234567890" {
+		t.Fatalf("unexpected commit: %s", commit)
+	}
+
+	bt := resolveBuildTime()
+	if bt != "2026-10-27T10:00:00Z" {
+		t.Fatalf("unexpected build time: %s", bt)
+	}
+
+	dirty := resolveDirty()
+	if !dirty {
+		t.Fatalf("expected dirty true")
+	}
+
+	jsonStr := formatVersionJSON()
+	if !strings.Contains(jsonStr, "iazio-harness") || !strings.Contains(jsonStr, "abcdef1234567890") {
+		t.Fatalf("unexpected formatVersionJSON: %s", jsonStr)
+	}
+
+	txtStr := formatVersion()
+	if !strings.Contains(txtStr, "iazio-harness 1.0.0+abcdef123456") {
+		t.Fatalf("unexpected formatVersion: %s", txtStr)
+	}
+
+	// Test fallback paths
+	buildCommitSHA = ""
+	buildTimeUTC = ""
+	buildDirty = "false"
+	if resolveDirty() {
+		t.Fatalf("expected dirty false")
+	}
+	if resolveBuildTime() == "" {
+		t.Fatalf("expected non-empty default build time")
+	}
+}
+
 
 
 

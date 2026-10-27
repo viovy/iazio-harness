@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -146,6 +147,214 @@ func TestMockAgy_ScenariosUnit(t *testing.T) {
 		}
 		if _, err := os.Stat(logFile); err != nil {
 			t.Fatalf("expected log file to exist: %v", err)
+		}
+	})
+
+	t.Run("Subcommands", func(t *testing.T) {
+		var stdout bytes.Buffer
+		code := run([]string{"version", "--json"}, "", &stdout, os.Stderr)
+		if code != 0 || !strings.Contains(stdout.String(), "1.15.0-mock") {
+			t.Fatalf("version failed: code %d, out: %s", code, stdout.String())
+		}
+
+		stdout.Reset()
+		code = run([]string{"models", "--json"}, "", &stdout, os.Stderr)
+		if code != 0 || !strings.Contains(stdout.String(), "gemini-2.5-pro") {
+			t.Fatalf("models failed: code %d, out: %s", code, stdout.String())
+		}
+
+		stdout.Reset()
+		code = run([]string{"agents"}, "", &stdout, os.Stderr)
+		if code != 0 || !strings.Contains(stdout.String(), "autonomous") {
+			t.Fatalf("agents failed: code %d, out: %s", code, stdout.String())
+		}
+
+		stdout.Reset()
+		code = run([]string{"help"}, "", &stdout, os.Stderr)
+		if code != 0 || !strings.Contains(stdout.String(), "Usage:") {
+			t.Fatalf("help failed: code %d, out: %s", code, stdout.String())
+		}
+	})
+
+	t.Run("HeadlessPermissionDenied", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		// Missing --dangerously-skip-permissions with permission-requiring prompt
+		code := run([]string{"-p", "please require_permission to edit"}, "", &stdout, &stderr)
+		if code != 1 {
+			t.Fatalf("expected exit 1 on missing permission flag, got %d", code)
+		}
+		if !strings.Contains(stderr.String(), "jetski: no output produced — a tool required the 'command' permission") {
+			t.Fatalf("unexpected stderr: %s", stderr.String())
+		}
+
+		// With --dangerously-skip-permissions, should succeed
+		stdout.Reset()
+		stderr.Reset()
+		code = run([]string{"-p", "please require_permission to edit", "--dangerously-skip-permissions"}, "", &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("expected exit 0 with flag, got %d", code)
+		}
+
+		// Explicit permission_denied scenario
+		stdout.Reset()
+		stderr.Reset()
+		code = run([]string{"-p", "ordinary"}, "permission_denied", &stdout, &stderr)
+		if code != 1 || !strings.Contains(stderr.String(), "jetski: no output produced") {
+			t.Fatalf("expected permission_denied exit 1, got code %d, err: %s", code, stderr.String())
+		}
+	})
+
+	t.Run("FailureScenarios", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-p", "test"}, "session_corrupted", &stdout, &stderr)
+		if code != 1 || !strings.Contains(stderr.String(), "malformed") {
+			t.Fatalf("expected session_corrupted failure, got %d: %s", code, stderr.String())
+		}
+
+		stdout.Reset()
+		stderr.Reset()
+		code = run([]string{"-p", "test"}, "quota_exhausted", &stdout, &stderr)
+		if code != 1 || !strings.Contains(stderr.String(), "429") {
+			t.Fatalf("expected quota_exhausted failure, got %d: %s", code, stderr.String())
+		}
+	})
+
+	t.Run("AdditionalFlagsAndArgs", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		args := []string{
+			"--output-format=stream-json",
+			"--output-format", "json",
+			"--input-format=text",
+			"--input-format", "text",
+			"--mode=chat",
+			"--mode", "chat",
+			"--effort=high",
+			"--effort", "high",
+			"--add-dir=/tmp",
+			"--add-dir", "/tmp",
+			"--continue",
+			"-c",
+			"--print-timeout=120",
+			"--print-timeout", "120",
+			"--print=flag testing",
+		}
+		code := run(args, "", &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("expected exit 0, got %d", code)
+		}
+	})
+
+	t.Run("Scenario7_NoOpBypassEmptyStdout", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"--print=noop test"}, "noop_bypass_empty_stdout", &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("expected exit 0, got %d", code)
+		}
+		if !strings.Contains(stdout.String(), "prompt executed via agy") {
+			t.Fatalf("unexpected stdout: %s", stdout.String())
+		}
+	})
+
+	t.Run("Scenario7b_NoOpBypassZeroMutation", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"--print=noop zero mutation"}, "noop_bypass_zero_mutation", &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("expected exit 0, got %d", code)
+		}
+		if !strings.Contains(stdout.String(), "without git changes") {
+			t.Fatalf("unexpected stdout: %s", stdout.String())
+		}
+	})
+
+	t.Run("Scenario8_LegitimateStoryExecution", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		origWd, _ := os.Getwd()
+		_ = os.Chdir(tmpDir)
+		defer func() { _ = os.Chdir(origWd) }()
+
+		_ = exec.Command("git", "init").Run()
+		_ = exec.Command("git", "config", "user.email", "test@test.local").Run()
+		_ = exec.Command("git", "config", "user.name", "Tester").Run()
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"--print=execute STORY-GOV-3715"}, "legitimate_story_execution", &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("expected exit 0, got %d", code)
+		}
+		if !strings.Contains(stdout.String(), "cryptographic proof of mutation") {
+			t.Fatalf("unexpected stdout: %s", stdout.String())
+		}
+	})
+
+	t.Run("Scenario10_InPlaceHarnessAutoResume", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		origWd, _ := os.Getwd()
+		_ = os.Chdir(tmpDir)
+		defer func() { _ = os.Chdir(origWd) }()
+
+		_ = exec.Command("git", "init").Run()
+		_ = exec.Command("git", "config", "user.email", "test@test.local").Run()
+		_ = exec.Command("git", "config", "user.name", "Tester").Run()
+
+		marker := filepath.Join(os.TempDir(), "mock_agy_inplace_resume.tmp")
+		_ = os.Remove(marker)
+
+		// Turn 1 fails transiently
+		var stdout1, stderr1 bytes.Buffer
+		code1 := run([]string{"--print=start story"}, "in_place_harness_auto_resume", &stdout1, &stderr1)
+		if code1 != 1 {
+			t.Fatalf("turn 1 expected exit 1, got %d", code1)
+		}
+
+		// Turn 2 succeeds
+		var stdout2, stderr2 bytes.Buffer
+		code2 := run([]string{"--conversation=mock-conv-1111-2222-3333-444455556666", "resume"}, "in_place_harness_auto_resume", &stdout2, &stderr2)
+		if code2 != 0 {
+			t.Fatalf("turn 2 expected exit 0, got %d", code2)
+		}
+		if !strings.Contains(stdout2.String(), "In-place auto-resume attempt 2 succeeded cleanly") {
+			t.Fatalf("unexpected stdout2: %s", stdout2.String())
+		}
+	})
+
+	t.Run("Scenario11_EmptyConversationDirtyWorktreeResume", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		origWd, _ := os.Getwd()
+		_ = os.Chdir(tmpDir)
+		defer func() { _ = os.Chdir(origWd) }()
+
+		_ = exec.Command("git", "init").Run()
+		_ = exec.Command("git", "config", "user.email", "test@test.local").Run()
+		_ = exec.Command("git", "config", "user.name", "Tester").Run()
+		_ = os.WriteFile("dirty_worktree_file.tmp", []byte("initial dirty"), 0644)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"resume and complete current /autonomous-story-execution flow"}, "empty_conversation_dirty_worktree_resume", &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("expected exit 0, got %d: %s", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "Unanchored dirty worktree flow completed successfully") {
+			t.Fatalf("unexpected stdout: %s", stdout.String())
+		}
+	})
+
+	t.Run("Scenario12_EmptyConversationCleanWorktreeStoryRestart", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		origWd, _ := os.Getwd()
+		_ = os.Chdir(tmpDir)
+		defer func() { _ = os.Chdir(origWd) }()
+
+		_ = exec.Command("git", "init").Run()
+		_ = exec.Command("git", "config", "user.email", "test@test.local").Run()
+		_ = exec.Command("git", "config", "user.name", "Tester").Run()
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"Execute story STORY-GOV-9999 end-to-end using /autonomous-story-execution."}, "empty_conversation_clean_worktree_story_restart", &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("expected exit 0, got %d: %s", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "Story restarted from scratch on clean worktree successfully") {
+			t.Fatalf("unexpected stdout: %s", stdout.String())
 		}
 	})
 }

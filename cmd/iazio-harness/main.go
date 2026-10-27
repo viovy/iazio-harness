@@ -1427,7 +1427,16 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		"================================================================================\n",
 		attemptNum, triggerReason, prevExitCode, prevError, bannerCID, time.Now().UTC().Format(time.RFC3339),
 	)
+	if len(job.AttemptHistory) > 0 {
+		structuredAttemptBanner += fmt.Sprintf("[iazio] Prior Attempt History (%d recorded attempt(s)):\n", len(job.AttemptHistory))
+		for _, att := range job.AttemptHistory {
+			structuredAttemptBanner += fmt.Sprintf("  - Attempt #%d: tool=%s, exit_code=%d, category=%s, reason=%s, error=%s\n",
+				att.AttemptNumber, att.Tool, att.ExitCode, att.FailureCategory, att.Reason, att.ErrorMessage)
+		}
+		structuredAttemptBanner += "\n"
+	}
 	initialBanner += structuredAttemptBanner
+	fmt.Print(initialBanner)
 	_ = sp.AppendRaw("stdout", []byte(initialBanner))
 	for _, ev := range sp.Flush() {
 		if ev.Type == spool.EventOutputChunk {
@@ -1986,7 +1995,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			}
 		}
 
-		if isASE && os.Getenv("IAZIO_ENABLE_IN_PLACE_AUTO_RESUME") == "1" && execRes.ExitCode != 0 && job.StoryID != "" && !diagReport.ASEComplete {
+		if isASE && execRes.ExitCode != 0 && !diagReport.ASEComplete {
 			return true, []string{"incomplete_ase_flow"}, fmt.Sprintf("exit_code_%d", execRes.ExitCode)
 		}
 
@@ -2010,6 +2019,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			consecutiveStalls++
 			if consecutiveStalls >= 3 {
 				stallMsg := fmt.Sprintf("[iazio-harness] Zero forward progress observed across %d consecutive continuation turns; halting auto-continuation.\n", consecutiveStalls)
+				fmt.Print(stallMsg)
 				_ = sp.AppendRaw("stdout", []byte(stallMsg))
 				_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", stallMsg)
 				break
@@ -2026,9 +2036,6 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		if resumeTargetID == "" && !isControlPlaneResume {
 			resumeTargetID = resolveConversationFallback(worktree, currentBoundStoryID, engineName)
 		}
-		if resumeTargetID == "" {
-			break
-		}
 
 		activeConvID = resumeTargetID
 		confirmedConvID = resumeTargetID
@@ -2041,6 +2048,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			_ = controlplane.PostStoryBinding(context.Background(), api, token, jobID, resolved, "", "", job.FencingToken)
 			bindMsg := fmt.Sprintf("[iazio-harness] Bound active story ID: %s (branch: %s, previously: %s)\n",
 				resolved, resolveLiveGitBranch(worktree), prevStory)
+			fmt.Print(bindMsg)
 			_ = sp.AppendRaw("stdout", []byte(bindMsg))
 			_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", bindMsg)
 		}
@@ -2050,16 +2058,20 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			interruptedNotice = "Notice: A background task (such as make run-review-scheme or make validate-local) was interrupted when the previous turn exited. Immediately resume, verify or restart review/validation checks, and proceed through Phase 4 (review scheme) and Phase 5 (git-flow auto-merge) until origin/main is synced and working tree is clean.\n"
 		}
 
+		targetDesc := resumeTargetID
+		if targetDesc == "" {
+			targetDesc = "new_conversation"
+		}
 		autoResumeMsg := fmt.Sprintf("\n[iazio-harness] Engine turn exited prior to full ASE completion (unmet gates: [%s]). Initiating in-job continuation turn (#%d/%d) on conversation %s (trigger: %s)...\n"+
 			"[ASE-SUPERVISOR] Active Story: %s (branch: %s)\n"+
 			"[ASE-SUPERVISOR] Fleet Git State: %d dirty file(s) preserved\n"+
 			"[ASE-SUPERVISOR] Injecting continuation prompt into %s --conversation=%s...\n\n",
 			strings.Join(unmetGatesList, ", "),
 			autoResumeCount, maxAutoResumes,
-			resumeTargetID, triggerReason,
+			targetDesc, triggerReason,
 			currentBoundStoryID, resolveLiveGitBranch(worktree),
 			len(dirtyFiles),
-			engineName, resumeTargetID,
+			engineName, targetDesc,
 		)
 		turnAttemptNum := attemptNum + autoResumeCount
 		prevTurnExitCode := execRes.ExitCode
@@ -2067,12 +2079,17 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		if prevTurnError == "" {
 			prevTurnError = "turn_interrupted"
 		}
+		bannerTargetID := resumeTargetID
+		if bannerTargetID == "" {
+			bannerTargetID = "none"
+		}
 		turnAttemptBanner := fmt.Sprintf("\n================================================================================\n"+
 			"[iazio] Starting Attempt #%d (trigger_reason: %s, previous_exit_code: %d, previous_error: %s, conversation_id: %s, timestamp: %s)\n"+
 			"================================================================================\n",
-			turnAttemptNum, triggerReason, prevTurnExitCode, prevTurnError, resumeTargetID, time.Now().UTC().Format(time.RFC3339),
+			turnAttemptNum, triggerReason, prevTurnExitCode, prevTurnError, bannerTargetID, time.Now().UTC().Format(time.RFC3339),
 		)
 		autoResumeMsg += turnAttemptBanner
+		fmt.Print(autoResumeMsg)
 		_ = sp.AppendRaw("stdout", []byte(autoResumeMsg))
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", autoResumeMsg)
 		childProcsNow, _ := watchdog.GetDescendantProcesses(activePID)
@@ -2080,14 +2097,29 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		_ = controlplane.PostTurnContinued(context.Background(), api, token, jobID, autoResumeCount, resumeTargetID, unmetGatesList, activeChildSummary)
 
 		resumeReq := execReq
-		resumeReq.Prompt = fmt.Sprintf("resume — continue autonomous story execution until all story completion gates pass.\n"+
-			"Active Story: %s (branch: %s)\n"+
-			"Unmet ASE Gates: [%s]\n"+
-			"Working Tree: %d modified/untracked file(s) present.\n%s",
-			currentBoundStoryID, resolveLiveGitBranch(worktree),
-			strings.Join(unmetGatesList, ", "), len(dirtyFiles),
-			interruptedNotice,
-		)
+		resumeReq.ResumeConversationID = resumeTargetID
+		resumeReq.Argv = nil // force re-building argv with resolved prompt
+		if resumeTargetID != "" {
+			resumeReq.Prompt = fmt.Sprintf("resume — continue autonomous story execution until all story completion gates pass.\n"+
+				"Active Story: %s (branch: %s)\n"+
+				"Unmet ASE Gates: [%s]\n"+
+				"Working Tree: %d modified/untracked file(s) present.\n%s",
+				currentBoundStoryID, resolveLiveGitBranch(worktree),
+				strings.Join(unmetGatesList, ", "), len(dirtyFiles),
+				interruptedNotice,
+			)
+		} else {
+			// No conversation ID: enforce rule:
+			// If fleet git status is dirty: use prompt that completes current ASE flow
+			// Otherwise: use initial prompt that required creating the story
+			if len(dirtyFiles) > 0 {
+				resumeReq.Prompt = "resume and complete current /autonomous-story-execution flow, inspecting existing changes, running tests, review scheme, and git flow"
+			} else if currentBoundStoryID != "" {
+				resumeReq.Prompt = fmt.Sprintf("Execute story %s end-to-end using /autonomous-story-execution.", currentBoundStoryID)
+			} else {
+				resumeReq.Prompt = prepRes.Prompt
+			}
+		}
 		resumeReq.ResumeConversationID = resumeTargetID
 		resumeReq.PrintTimeout = "0"
 		resumeReq.Argv = nil
@@ -2123,6 +2155,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 
 		if execRes.ExitCode == 0 && (diagReport.ASEComplete || len(collectWorkspaceDirtyFiles(worktree)) == 0) {
 			successMsg := "[ASE-SUPERVISOR] In-place auto-resume completed successfully!\n"
+			fmt.Print(successMsg)
 			_ = sp.AppendRaw("stdout", []byte(successMsg))
 			_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", successMsg)
 			break
@@ -2148,20 +2181,24 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	if len(diagReport.Findings) > 0 {
 		for _, f := range diagReport.Findings {
 			diagMsg := fmt.Sprintf("[iazio-harness] Anomaly detected: [%s] (%s): %s Remediation: %s\n", f.Code, f.Severity, f.Message, f.Remediation)
+			fmt.Print(diagMsg)
 			_ = sp.AppendRaw("stdout", []byte(diagMsg))
 			_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", diagMsg)
 		}
 		if diagReport.SIR != nil {
 			sirMsg := fmt.Sprintf("[iazio-harness] Emitted Structured Intervention Request (SIR): %s (category: %s, auto-healable: %v)\n", diagReport.SIR.ID, diagReport.SIR.Category, diagReport.SIR.AutoHealable)
+			fmt.Print(sirMsg)
 			_ = sp.AppendRaw("stdout", []byte(sirMsg))
 			_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", sirMsg)
 			if diagReport.SIRPath != "" {
 				persMsg := fmt.Sprintf("[iazio-harness] SIR report persisted to: %s\n", diagReport.SIRPath)
+				fmt.Print(persMsg)
 				_ = sp.AppendRaw("stdout", []byte(persMsg))
 				_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", persMsg)
 			}
 		}
 		summaryText := "\n" + diagReport.TroubleshootingSummary() + "\n"
+		fmt.Print(summaryText)
 		_ = sp.AppendRaw("stdout", []byte(summaryText))
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", summaryText)
 	}
