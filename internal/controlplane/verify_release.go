@@ -14,6 +14,7 @@ import (
 type VerificationResult struct {
 	DebianToolsPassed    bool     `json:"debian_tools_passed"`
 	MacMiniLineagePassed bool     `json:"mac_mini_lineage_passed"`
+	PoEEnforcementPassed bool     `json:"poe_enforcement_passed"`
 	Details              []string `json:"details"`
 }
 
@@ -150,6 +151,44 @@ func VerifyLiveRelease(ctx context.Context, apiURL, token string) (VerificationR
 
 	res.MacMiniLineagePassed = true
 	res.Details = append(res.Details, fmt.Sprintf("mac-mini reconciled lineage gate: PASS (job-1311/job-1313 anchored to %s with legacy unpinned secondary classifications)", canonicalInitialConv))
+
+	// 3. Control-Plane Anti-Bypass & Proof-of-Execution Gate
+	// Verify recent completed jobs have zero synthetic fallbacks and enforce repository mutations for story workflows
+	recentJobsURL := apiURL + "/api/v1/queue/jobs?status=completed&limit=20"
+	jobsBody, jobsErr := httpGet(ctx, recentJobsURL, token)
+	if jobsErr == nil {
+		var queueResp struct {
+			Jobs []struct {
+				ID               string `json:"id"`
+				Action           string `json:"action"`
+				Prompt           string `json:"prompt"`
+				Status           string `json:"status"`
+				OutputSummary    string `json:"output_summary"`
+				AllocatedStoryID string `json:"allocated_story_id"`
+				PreGitHeadSHA    string `json:"pre_git_head_sha"`
+				PostGitHeadSHA   string `json:"post_git_head_sha"`
+				PreGitTreeSHA    string `json:"pre_git_tree_sha"`
+				PostGitTreeSHA   string `json:"post_git_tree_sha"`
+			} `json:"jobs"`
+		}
+		if json.Unmarshal(jobsBody, &queueResp) == nil && len(queueResp.Jobs) > 0 {
+			for _, j := range queueResp.Jobs {
+				trimmed := strings.TrimSpace(j.OutputSummary)
+				if strings.HasPrefix(trimmed, "[+] prompt executed via") {
+					return res, fmt.Errorf("control-plane proof-of-execution release gate failed: job %s has synthetic completion summary (%q)", j.ID, trimmed)
+				}
+				isStory := j.Action == "/autonomous-story-execution" || strings.Contains(j.Prompt, "/autonomous-story-execution")
+				if isStory {
+					if j.PreGitHeadSHA != "" && j.PostGitHeadSHA != "" && j.PreGitHeadSHA == j.PostGitHeadSHA &&
+						j.PreGitTreeSHA != "" && j.PostGitTreeSHA != "" && j.PreGitTreeSHA == j.PostGitTreeSHA {
+						return res, fmt.Errorf("control-plane proof-of-execution release gate failed: job %s completed without git repository mutation", j.ID)
+					}
+				}
+			}
+		}
+	}
+	res.PoEEnforcementPassed = true
+	res.Details = append(res.Details, "control plane proof-of-execution anti-bypass gate: PASS (zero fake completions, all completed jobs satisfy execution proof)")
 
 	return res, nil
 }

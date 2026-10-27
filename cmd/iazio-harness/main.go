@@ -30,6 +30,7 @@ import (
 	"github.com/viovy/iazio-harness/internal/diagnostics"
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/prompt"
+	"github.com/viovy/iazio-harness/internal/proof"
 	"github.com/viovy/iazio-harness/internal/repolock"
 	"github.com/viovy/iazio-harness/internal/service"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
@@ -974,6 +975,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 	ctx, span := telemetry.StartSpan(ctx, "harness.execute_job", spanOpts...)
 	defer span.End()
+	jobStartTime := time.Now()
 
 	var kindOverride, resumeConvOverride string
 	var attachToolPID int
@@ -1634,6 +1636,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			}(cid, isFallback, fallbackReason, role, asePhase)
 		},
 	}
+	// Capture pre-execution Git state
+	preGitHeadSHA, preGitTreeSHA, _ := proof.CaptureGitSHAs(ctx, targetDir)
+
 	var execRes engines.ExecutionResult
 	var execErr error
 	if attachToolPID > 0 && watchdog.IsProcessAlive(attachToolPID) {
@@ -1644,6 +1649,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 	span.AddAnnotation(fmt.Sprintf("engine_process_exited:code=%d", execRes.ExitCode))
 	stopFlush()
+
+	// Capture post-execution Git state
+	postGitHeadSHA, postGitTreeSHA, _ := proof.CaptureGitSHAs(ctx, targetDir)
 
 	// Wait for any in-flight conversation ID registrations with a bounded timeout
 	convDone := make(chan struct{})
@@ -2120,6 +2128,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 	}
 
+	// Refresh post-execution Git state after all initial and continuation turns
+	postGitHeadSHA, postGitTreeSHA, _ = proof.CaptureGitSHAs(ctx, targetDir)
+
 	diagFinalStoryID := currentBoundStoryID
 	if diagFinalStoryID == "" || diagFinalStoryID == "pending_harness_creation" {
 		diagFinalStoryID = resolveLiveStoryID(worktree, combinedOutput, job.StoryID)
@@ -2152,6 +2163,39 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		_ = sp.AppendRaw("stdout", []byte(summaryText))
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stdout", summaryText)
 	}
+	// Enforce Proof-of-Execution (PoE) contract
+	isASEJob := job.Kind == "ase" || job.Kind == "story" || strings.Contains(job.Prompt, "/autonomous-story-execution") || strings.Contains(job.Kind, "story")
+	if isASEJob {
+		allocatedID := sessionstore.ExtractStoryID(storyID)
+		if allocatedID == "" {
+			allocatedID = sessionstore.ExtractStoryID(job.StoryID)
+		}
+		fullTranscript := strings.TrimSpace(engineLogStr)
+		if fullTranscript == "" {
+			fullTranscript = strings.TrimSpace(string(spoolLogData))
+		} else if len(spoolLogData) > 0 {
+			fullTranscript = fullTranscript + "\n" + strings.TrimSpace(string(spoolLogData))
+		}
+		execProof := proof.ExecutionProof{
+			PreGitHeadSHA:    preGitHeadSHA,
+			PostGitHeadSHA:   postGitHeadSHA,
+			PreGitTreeSHA:    preGitTreeSHA,
+			PostGitTreeSHA:   postGitTreeSHA,
+			AllocatedStoryID: allocatedID,
+			StdoutBytes:      len(fullTranscript),
+			StdoutLineCount:  strings.Count(fullTranscript, "\n") + 1,
+			RawTranscript:    fullTranscript,
+			DurationMs:       time.Since(jobStartTime).Milliseconds(),
+		}
+		if poeErr := proof.VerifyExecutionProof("/autonomous-story-execution", execProof); poeErr != nil {
+			log.Printf("[iazio-harness] Proof-of-Execution FAILED: %v", poeErr)
+			execRes.ExitCode = 1
+			execErr = poeErr
+			diagReport.Healthy = false
+			diagReport.ASEComplete = false
+		}
+	}
+
 	if diagReport.ASEComplete && diagReport.Healthy && execRes.ExitCode != 0 {
 		overMsg := fmt.Sprintf("[iazio-harness] ASE verified complete on origin/main with clean worktree. Reconciling exit code %d to 0 (COMPLETED).\n", execRes.ExitCode)
 		_ = sp.AppendRaw("stdout", []byte(overMsg))
@@ -2169,7 +2213,12 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		ASEComplete: diagReport.ASEComplete,
 	}
 	if execRes.ExitCode != 0 || !diagReport.Healthy {
-		if len(diagReport.Findings) > 0 {
+		if errors.Is(execErr, proof.ErrBypassOrNoOpDetected) {
+			exitOpts.DiagnosticCode = "BYPASS_OR_NOOP_DETECTED"
+			exitOpts.Reason = "BYPASS_OR_NOOP_DETECTED"
+			exitOpts.ErrorMessage = execErr.Error()
+			exitOpts.Remediation = "Ensure agent actually executes the story, mutates repository files/commits, and emits full streaming telemetry."
+		} else if len(diagReport.Findings) > 0 {
 			f := diagReport.Findings[0]
 			exitOpts.DiagnosticCode = string(f.Code)
 			exitOpts.Reason = string(f.Code)

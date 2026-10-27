@@ -585,3 +585,269 @@ func TestMockAgy_Scenario6_DirtyWorktreeResumeAndQueueUnblock(t *testing.T) {
 		t.Fatalf("expected dirty file to be removed after resume")
 	}
 }
+
+// Scenario 7: noop_bypass_empty_stdout (job_3060a0cb6d5e7c71 regression test)
+// mock-agy exits 0 with a synthetic wrapper string and zero git repository mutations.
+// Proof-of-Execution (PoE) gate catches the fake completion and transitions the job to failed (BYPASS_OR_NOOP_DETECTED).
+func TestMockAgy_Scenario7_NoOpBypass_CaughtByPoE(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "noop_bypass_empty_stdout")
+
+	var mu sync.Mutex
+	var postedExitCode = -1
+	var postedReason = ""
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:       "job-3060a0cb6d5e7c71",
+				Prompt:   "/autonomous-story-execution STORY-GOV-3715",
+				Kind:     "ase",
+				Engine:   "mock-agy",
+				Agent:    "mock-agy",
+				Status:   "RUNNING",
+				StoryID:  "STORY-GOV-3715",
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ticks"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+			var body struct {
+				ExitCode              int    `json:"exit_code"`
+				Reason                string `json:"reason"`
+				TerminationReasonCode string `json:"termination_reason_code"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedExitCode = body.ExitCode
+			postedReason = body.Reason
+			if postedReason == "" {
+				postedReason = body.TerminationReasonCode
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	worktree := initTestGitWorktree(t)
+
+	// Make an initial commit so rev-parse HEAD works
+	initFile := filepath.Join(worktree, "init.txt")
+	_ = os.WriteFile(initFile, []byte("init"), 0644)
+	_ = exec.Command("git", "-C", worktree, "add", ".").Run()
+	_ = exec.Command("git", "-C", worktree, "commit", "-m", "init commit").Run()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	_ = executeJob(ctx, srv.URL, "job-3060a0cb6d5e7c71", worktree, "", "ase", "", "")
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if postedExitCode != 1 {
+		t.Fatalf("expected no-op bypass to be failed with exit code 1, got: %d", postedExitCode)
+	}
+	if postedReason != "BYPASS_OR_NOOP_DETECTED" {
+		t.Fatalf("expected reason BYPASS_OR_NOOP_DETECTED, got: %q", postedReason)
+	}
+}
+
+// Scenario 8: legitimate_story_execution
+// mock-agy performs actual repository file creation, commits changes, and emits rich streaming logs.
+// Proof-of-Execution (PoE) gate verifies pre != post Git SHAs and transitions job to COMPLETED_SUCCESS.
+func TestMockAgy_Scenario8_LegitimateStoryMutation_PoEVerified(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "legitimate_story_execution")
+
+	var mu sync.Mutex
+	var postedExitCode = -1
+	var postedReason = ""
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:       "job-legit-3715",
+				Prompt:   "/autonomous-story-execution STORY-GOV-3715",
+				Kind:     "ase",
+				Engine:   "mock-agy",
+				Agent:    "mock-agy",
+				Status:   "RUNNING",
+				StoryID:  "STORY-GOV-3715",
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ticks"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+			var body struct {
+				ExitCode              int    `json:"exit_code"`
+				Reason                string `json:"reason"`
+				TerminationReasonCode string `json:"termination_reason_code"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedExitCode = body.ExitCode
+			postedReason = body.Reason
+			if postedReason == "" {
+				postedReason = body.TerminationReasonCode
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	worktree := initTestGitWorktree(t)
+
+	// Initial commit
+	initFile := filepath.Join(worktree, "init.txt")
+	_ = os.WriteFile(initFile, []byte("init"), 0644)
+	_ = exec.Command("git", "-C", worktree, "add", ".").Run()
+	_ = exec.Command("git", "-C", worktree, "commit", "-m", "init commit").Run()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	err := executeJob(ctx, srv.URL, "job-legit-3715", worktree, "", "ase", "", "")
+	if err != nil {
+		t.Fatalf("expected legitimate story execution to succeed, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if postedExitCode != 0 {
+		t.Fatalf("expected exit code 0, got: %d", postedExitCode)
+	}
+	if postedReason != "COMPLETED_SUCCESS" {
+		t.Fatalf("expected reason COMPLETED_SUCCESS, got: %q", postedReason)
+	}
+}
+
+// Scenario 9: downstream release gate verification
+// Verifies that post-release / downstream release verification gate rejects unproven / fake-completed jobs.
+func TestMockAgy_Scenario9_DownstreamReleaseGate_RejectsUnprovenJobs(t *testing.T) {
+	var returnFakeJob bool
+	const canonicalInitialConv = "aad902c8-bda6-44c7-8a68-c468a1562399"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/tools"):
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"host": "debian",
+				"supported_capabilities": []string{
+					"user_service_watchdog_v2",
+					"deterministic_resume_4tuple_v1",
+				},
+				"version":    "v1.0.0",
+				"commit_sha": "abc1234",
+				"tools": []map[string]interface{}{
+					{
+						"name":              "iazio-agent",
+						"installed":         true,
+						"installation_type": "systemd-user",
+						"active_state":      "active",
+						"watchdog_enabled":  true,
+						"config_status":     "synced",
+					},
+					{
+						"name":              "iazio-harvester",
+						"installed":         true,
+						"installation_type": "systemd-user",
+						"active_state":      "active",
+						"watchdog_enabled":  true,
+						"config_status":     "synced",
+					},
+				},
+			})
+		case strings.HasSuffix(r.URL.Path, "/jobs/job-1311"):
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":                      "job-1311",
+				"initial_conversation_id": canonicalInitialConv,
+			})
+		case strings.HasSuffix(r.URL.Path, "/jobs/job-1313"):
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":                      "job-1313",
+				"parent_job_id":           "job-1311",
+				"initial_conversation_id": canonicalInitialConv,
+				"conversation_lineage": []map[string]interface{}{
+					{
+						"conversation_id": canonicalInitialConv,
+						"role":            "root_initial",
+					},
+					{
+						"conversation_id": "1d446877-5bf9-44eb-9db5-e1c007a9fe31",
+						"role":            "legacy_unpinned_secondary",
+					},
+					{
+						"conversation_id": "14de9a1f-5679-4f11-a08f-f32bc7e47663",
+						"role":            "legacy_unpinned_secondary",
+					},
+				},
+			})
+		case strings.HasSuffix(r.URL.Path, "/api/v1/queue/jobs"):
+			if returnFakeJob {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"jobs": []map[string]interface{}{
+						{
+							"id":             "job_3060a0cb6d5e7c71",
+							"action":         "/autonomous-story-execution",
+							"status":         "completed",
+							"output_summary": "[+] prompt executed via agy (exit 0)",
+						},
+					},
+				})
+			} else {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"jobs": []map[string]interface{}{
+						{
+							"id":                 "job-legit-3715",
+							"action":             "/autonomous-story-execution",
+							"status":             "completed",
+							"output_summary":     "Verified story execution",
+							"allocated_story_id": "STORY-GOV-3715",
+							"pre_git_head_sha":   "head1",
+							"post_git_head_sha":  "head2",
+							"pre_git_tree_sha":   "tree1",
+							"post_git_tree_sha":  "tree2",
+						},
+					},
+				})
+			}
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// 1. When a fake-completed job exists, release gate must FAIL
+	returnFakeJob = true
+	_, err := controlplane.VerifyLiveRelease(ctx, srv.URL, "test-token")
+	if err == nil {
+		t.Fatalf("expected release gate to fail when fake completed job is present")
+	}
+	if !strings.Contains(err.Error(), "proof-of-execution release gate failed") {
+		t.Fatalf("expected error to cite proof-of-execution release gate, got: %v", err)
+	}
+
+	// 2. When only validly proven jobs exist, release gate must PASS
+	returnFakeJob = false
+	res, err := controlplane.VerifyLiveRelease(ctx, srv.URL, "test-token")
+	if err != nil {
+		t.Fatalf("expected release gate to pass with proven jobs, got: %v", err)
+	}
+	if !res.PoEEnforcementPassed {
+		t.Fatalf("expected PoEEnforcementPassed to be true")
+	}
+}

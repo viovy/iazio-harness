@@ -88,6 +88,15 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	if logFile != "" {
+		_ = os.MkdirAll(filepath.Dir(logFile), 0755)
+		if f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+			defer f.Close()
+			stdout = io.MultiWriter(stdout, f)
+			stderr = io.MultiWriter(stderr, f)
+		}
+	}
+
 	switch scenario {
 	case "ordinary_prompt_with_mcp_daemons":
 		// Scenario 1: Print normal output, spawn persistent background child daemon that keeps
@@ -141,6 +150,9 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			// Turn 2 (resumed in-place)
 			_ = os.Remove("ase_worktree_change.tmp")
 			_ = os.Remove(stateMarker)
+			_ = os.WriteFile("ase_committed_feature.txt", []byte("feature committed"), 0644)
+			_ = exec.Command("git", "add", "ase_committed_feature.txt").Run()
+			_ = exec.Command("git", "commit", "-m", "feat: complete ASE story flow").Run()
 			fmt.Fprintf(stdout, "[mock-agy] Turn 2 resumed in-place with conversation %s.\n", conversationID)
 			fmt.Fprintln(stdout, "[mock-agy] Committed changes, cleaned worktree, and satisfied ASE gates.")
 			fmt.Fprintln(stdout, "[mock-agy] Story flow complete. Exit 0.")
@@ -155,6 +167,9 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 
 		if isTurn2 {
 			_ = os.Remove(stateMarker)
+			_ = os.WriteFile("bg_hang_recovered_commit.txt", []byte("recovery committed"), 0644)
+			_ = exec.Command("git", "add", "bg_hang_recovered_commit.txt").Run()
+			_ = exec.Command("git", "commit", "-m", "chore: finish tasks after bg hang").Run()
 			fmt.Fprintf(stdout, "[mock-agy] Resumed after background task hang was reaped on conversation %s.\n", conversationID)
 			fmt.Fprintln(stdout, "[mock-agy] Finished remaining tasks.")
 			return 0
@@ -196,6 +211,34 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		_ = os.Remove(stateMarker)
 		_ = os.Remove("dirty_file_1324.tmp")
 		fmt.Fprintln(stdout, "[mock-agy] Resume on existing worktree succeeded. Worktree clean.")
+		return 0
+
+	case "noop_bypass_empty_stdout":
+		// Scenario 7: No-Op Bypass with empty stdout / synthetic wrapper summary
+		fmt.Fprintln(stdout, "[+] prompt executed via agy (exit 0)")
+		return 0
+
+	case "noop_bypass_zero_mutation":
+		// Scenario 7b: No-Op Bypass where stdout volume exists but zero git changes occur
+		fmt.Fprintln(stdout, "[mock-agy] Executing story flow without performing repository mutations...")
+		for i := 1; i <= 6; i++ {
+			fmt.Fprintf(stdout, "[mock-agy] Step %d: simulating story execution without git changes...\n", i)
+		}
+		fmt.Fprintln(stdout, "[mock-agy] Pretending all story gates passed with zero git commits. Exit 0.")
+		return 0
+
+	case "legitimate_story_execution":
+		// Scenario 8: Legitimate Mutating Story Execution
+		fmt.Fprintln(stdout, "[mock-agy] Starting legitimate autonomous story execution for STORY-GOV-3715...")
+		fmt.Fprintln(stdout, "[mock-agy] Allocating and verifying story id: STORY-GOV-3715")
+		testFile := "legitimate_story_mutation.txt"
+		_ = os.WriteFile(testFile, []byte("Verified story mutation content\n"), 0644)
+		_ = exec.Command("git", "add", testFile).Run()
+		_ = exec.Command("git", "commit", "-m", "feat(story): legitimate story execution [STORY-GOV-3715]").Run()
+		for i := 1; i <= 6; i++ {
+			fmt.Fprintf(stdout, "[mock-agy] Progress checkpoint %d: verified test gates passing...\n", i)
+		}
+		fmt.Fprintln(stdout, "[mock-agy] Story STORY-GOV-3715 executed successfully with cryptographic proof of mutation.")
 		return 0
 
 	default:

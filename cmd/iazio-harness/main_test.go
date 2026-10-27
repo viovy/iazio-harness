@@ -2207,7 +2207,7 @@ func TestExecuteJob_AutoResume_EnginePrintTimeout(t *testing.T) {
 	mockAgy := filepath.Join(mockDir, "agy")
 
 	// Script simulates turn 1 exiting code 0 with agy print timeout and terminated background task
-	// turn 2 resuming cleanly with exit 0
+	// turn 2 resuming cleanly with exit 0, creating a git commit and outputting valid telemetry
 	script := fmt.Sprintf(`#!/bin/sh
 echo "run" >> "%s"
 echo "$@" >> "%s"
@@ -2219,6 +2219,14 @@ if [ "$RUNS" -eq 1 ]; then
   exit 0
 else
   echo "Resumed turn 2 cleanly"
+  echo "line 2: executing story flow for STORY-GOV-3691"
+  echo "line 3: verifying gates"
+  echo "line 4: running checks"
+  echo "line 5: story complete"
+  echo "padding: $(head -c 300 /dev/zero | tr '\0' 'A')"
+  echo "mutation" > mutation.txt
+  git add mutation.txt
+  git commit -m "feat: complete story mutation"
   exit 0
 fi
 `, countFile, argsFile, countFile)
@@ -2227,6 +2235,12 @@ fi
 	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
 
 	workDir := t.TempDir()
+	_ = exec.Command("git", "init", workDir).Run()
+	_ = exec.Command("git", "-C", workDir, "config", "user.name", "Test").Run()
+	_ = exec.Command("git", "-C", workDir, "config", "user.email", "test@example.com").Run()
+	_ = os.WriteFile(filepath.Join(workDir, "init.txt"), []byte("init"), 0644)
+	_ = exec.Command("git", "-C", workDir, "add", ".").Run()
+	_ = exec.Command("git", "-C", workDir, "commit", "-m", "init").Run()
 	var postedExitCode int
 	var postedChunks []string
 	var postedBindings []map[string]any
