@@ -979,7 +979,8 @@ func TestExecuteJob_DeterministicResume_PostRunAttachError_SingleFallback(t *tes
 	argsFile := filepath.Join(mockDir, "args.txt")
 	mockAgy := filepath.Join(mockDir, "agy")
 	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
-echo "$@" >> "%s"
+echo "$*" | tr '\n' ' ' >> "%s"
+echo "" >> "%s"
 if ! grep -q "run1" "%s" 2>/dev/null; then
     echo "run1" >> "%s"
     PREV=""
@@ -996,7 +997,7 @@ else
     echo "Conversation ID: %s"
     exit 0
 fi
-`, argsFile, countFile, countFile, countFile, fallbackConvID)), 0755)
+`, argsFile, argsFile, countFile, countFile, countFile, fallbackConvID)), 0755)
 
 	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
 

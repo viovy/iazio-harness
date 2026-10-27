@@ -2,6 +2,7 @@
 package service
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -661,6 +662,84 @@ func ReviveCheck(home string, run func(name string, args ...string) error) error
 		}
 	}
 	return nil
+}
+
+// ReconcileServiceConfiguration inspects user service units for iazio-harness and corrects missing or drifted configuration.
+func ReconcileServiceConfiguration(home, bin string, run func(name string, args ...string) error) error {
+	if home == "" {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		home = h
+	}
+	if run == nil {
+		run = execCommand
+	}
+	if bin == "" {
+		bin = filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		if runtime.GOOS == "windows" {
+			bin += ".exe"
+		}
+	}
+
+	switch runtime.GOOS {
+	case "darwin":
+		launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
+		_ = os.MkdirAll(launchAgentsDir, 0o755)
+		logDir := filepath.Join(home, ".iazio", "logs")
+		_ = os.MkdirAll(logDir, 0o755)
+		logPath := filepath.Join(logDir, "harness.log")
+
+		harnessPlist := filepath.Join(launchAgentsDir, harnessLabel+".plist")
+		data, err := os.ReadFile(harnessPlist)
+		domain := "gui/" + strconv.Itoa(os.Getuid())
+		target := domain + "/" + harnessLabel
+		if err != nil || !strings.Contains(string(data), bin) {
+			_ = os.WriteFile(harnessPlist, []byte(darwinPlist(bin, logPath)), 0o644)
+			_ = run("launchctl", "bootout", target)
+			_ = run("launchctl", "bootstrap", domain, harnessPlist)
+			_ = run("launchctl", "enable", target)
+		}
+		_ = InstallDarwinResilience(home, bin, run)
+		return nil
+	case "windows":
+		tasksDir := filepath.Join(home, ".iazio", "tasks")
+		batPath := filepath.Join(tasksDir, "iazio-harness.bat")
+		xmlPath := filepath.Join(tasksDir, "iazio-harness.xml")
+		needsInstall := false
+		if data, err := os.ReadFile(batPath); err != nil || !strings.Contains(string(data), bin) {
+			needsInstall = true
+		} else if xData, err := os.ReadFile(xmlPath); err != nil || (!strings.Contains(string(xData), "PT1M") && !bytes.Contains(xData, []byte{'P', 0, 'T', 0, '1', 0, 'M', 0})) {
+			needsInstall = true
+		}
+		if needsInstall {
+			return InstallWindowsAt(home, bin, windowsLogonUser(), run)
+		}
+		return nil
+	default:
+		if IsSystemdAvailable() {
+			unitDir := filepath.Join(home, ".config", "systemd", "user")
+			_ = os.MkdirAll(unitDir, 0o755)
+			serviceFile := filepath.Join(unitDir, "iazio-harness.service")
+			needsReload := false
+			expectedService := linuxUnit(bin)
+			data, err := os.ReadFile(serviceFile)
+			if err != nil || !strings.Contains(string(data), bin) || !strings.Contains(string(data), "daemon") {
+				if err := os.WriteFile(serviceFile, []byte(expectedService), 0o644); err != nil {
+					return fmt.Errorf("write iazio-harness.service: %w", err)
+				}
+				needsReload = true
+			}
+			if needsReload {
+				_ = run("systemctl", "--user", "daemon-reload")
+			}
+			_ = run("systemctl", "--user", "enable", "iazio-harness.service")
+			_ = InstallLinuxResilience(home, bin, run)
+			return nil
+		}
+		return InstallUserDaemonAt(home, bin, run)
+	}
 }
 
 // PauseService sets maintenance mode and stops the supervisor.

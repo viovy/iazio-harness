@@ -927,8 +927,8 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		strings.EqualFold(trimmedPrompt, "/autonomous-story-execution resume")
 
 	if req.ResumeConversationID != "" {
-		// "resume" prompt is only valid when resuming an existing conversation with --conversation
-		if isEmptyOrBareResume || req.Kind == "resume" {
+		// "resume" prompt is only used when prompt is empty or bare resume
+		if isEmptyOrBareResume {
 			req.Prompt = "resume"
 		}
 	} else {

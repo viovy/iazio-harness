@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -349,6 +350,24 @@ func (ac *AgentWorkspaceController) DiscardChanges(repoName string, forceKillAct
 	return CaptureWorktreeSnapshot(repoDir)
 }
 
+// DiscardAll executes DiscardChanges across all registered repositories for this agent.
+func (ac *AgentWorkspaceController) DiscardAll(forceKillActive bool) ([]string, error) {
+	ac.mu.Lock()
+	var repos []string
+	for r := range ac.RepoPaths {
+		repos = append(repos, r)
+	}
+	ac.mu.Unlock()
+
+	sort.Strings(repos)
+	for _, r := range repos {
+		if _, err := ac.DiscardChanges(r, forceKillActive); err != nil {
+			return nil, err
+		}
+	}
+	return repos, nil
+}
+
 // ============================================================================
 // 4. IAZIO CONTROL PLANE SERVER (Jobs, Schedules, History, Buttons, Zipkin)
 // ============================================================================
@@ -667,6 +686,47 @@ func (cp *IazioControlPlane) BuildHTTPHandler() http.Handler {
 			"trace_id":         traceID,
 		})
 	})
+
+	// POST /v1/hosts/{agent}/repos/discard-all and POST /api/v1/agents/{agent}/repos/discard-all
+	discardAllHandler := func(w http.ResponseWriter, r *http.Request) {
+		agent := r.PathValue("agent")
+		force := r.URL.Query().Get("force") == "true"
+		traceID := newHexID("") + newHexID("")
+
+		// Abort any running jobs for this host/agent if force is set
+		if force {
+			cp.mu.Lock()
+			for _, j := range cp.jobs {
+				if j.Status == StatusRunning {
+					j.Status = StatusCancelled
+					j.ErrorMsg = "ABORTED_BY_DISCARD_ALL"
+				}
+			}
+			cp.mu.Unlock()
+		}
+
+		repos, err := cp.agentCtrl.DiscardAll(force)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		cp.zipkin.EmitSpan(traceID, "agent.control.discard_all_repos", 10*time.Millisecond, map[string]string{
+			"iazio.agent.id": agent,
+			"repos.count":    fmt.Sprintf("%d", len(repos)),
+		})
+
+		cp.mu.Lock()
+		cp.recordHistory("", "", traceID, "WORKSPACE_DISCARD_ALL_REPOS", "clean", fmt.Sprintf("All %d repos reset to clean on agent %s", len(repos), agent))
+		cp.mu.Unlock()
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"count": len(repos),
+			"repos": repos,
+		})
+	}
+	mux.HandleFunc("POST /v1/hosts/{agent}/repos/discard-all", discardAllHandler)
+	mux.HandleFunc("POST /api/v1/agents/{agent}/repos/discard-all", discardAllHandler)
 
 	// POST /api/v1/global-queue/jobs/{id}/cancel
 	mux.HandleFunc("POST /api/v1/global-queue/jobs/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
@@ -1093,5 +1153,113 @@ func TestE2E_AgentRepoQueue_DiscardChangesButton_AndAllQueueButtons(t *testing.T
 	_ = histResp.Body.Close()
 	if len(history) < 3 {
 		t.Fatalf("expected audit events in /global-queue/history, got %d", len(history))
+	}
+}
+
+// Test 4: Tests the "Discard All" functionality across all repositories on an agent (STORY-GOV-3729).
+// Verifies that when an in-progress job is running and multiple repositories are dirty or locked,
+// calling POST /v1/hosts/{agent}/repos/discard-all with force=true aborts in-progress jobs,
+// removes index locks, restores all tracked files, removes all untracked files, and leaves all repos clean.
+func TestE2E_AgentRepo_DiscardAllRepos_AndInProgressJobCancellation(t *testing.T) {
+	repoDirA := initTestGitRepo(t)
+	repoDirB := initTestGitRepo(t)
+	zipkin, zipkinSrv := NewZipkinCollectorServer()
+	defer zipkinSrv.Close()
+
+	agentCtrl := &AgentWorkspaceController{
+		AgentID: "mac-mini",
+		RepoPaths: map[string]string{
+			"repo-alpha": repoDirA,
+			"repo-beta":  repoDirB,
+		},
+	}
+	cp := NewIazioControlPlane(agentCtrl, zipkin, 5*time.Second)
+	apiSrv := httptest.NewServer(cp.BuildHTTPHandler())
+	defer apiSrv.Close()
+
+	// 1. Enqueue a job on repo-alpha and mark it StatusRunning
+	runningJob := cp.EnqueueJob("/autonomous-story-execution", "repo-alpha", "agy", "STORY-GOV-3729", "In-flight task", "", "", 120)
+	cp.mu.Lock()
+	cp.jobs[runningJob.ID].Status = StatusRunning
+	cp.mu.Unlock()
+
+	// 2. Dirty repo-alpha
+	_ = os.WriteFile(filepath.Join(repoDirA, "README.md"), []byte("DIRTY ALPHA CONTENT\n"), 0644)
+	_ = os.WriteFile(filepath.Join(repoDirA, "untracked_alpha.tmp"), []byte("junk A\n"), 0644)
+
+	// 3. Dirty repo-beta with untracked files and a stale .git/index.lock
+	_ = os.WriteFile(filepath.Join(repoDirB, "README.md"), []byte("DIRTY BETA CONTENT\n"), 0644)
+	_ = os.WriteFile(filepath.Join(repoDirB, "untracked_beta.tmp"), []byte("junk B\n"), 0644)
+	_ = os.WriteFile(filepath.Join(repoDirB, ".git", "index.lock"), []byte("locked"), 0644)
+
+	snapA, _ := CaptureWorktreeSnapshot(repoDirA)
+	snapB, _ := CaptureWorktreeSnapshot(repoDirB)
+	if snapA.DirtyFileCount == 0 || snapB.DirtyFileCount == 0 || !snapB.HasIndexLock {
+		t.Fatalf("expected both repos to be dirty before Discard All")
+	}
+
+	// 4. Trigger Discard All via POST /v1/hosts/mac-mini/repos/discard-all?force=true
+	discardResp, err := http.Post(apiSrv.URL+"/v1/hosts/mac-mini/repos/discard-all?force=true", "application/json", nil)
+	if err != nil {
+		t.Fatalf("discard-all call failed: %v", err)
+	}
+	defer discardResp.Body.Close()
+
+	if discardResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", discardResp.StatusCode)
+	}
+
+	var res struct {
+		Count int      `json:"count"`
+		Repos []string `json:"repos"`
+	}
+	if err := json.NewDecoder(discardResp.Body).Decode(&res); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if res.Count != 2 || len(res.Repos) != 2 {
+		t.Fatalf("expected count 2 and 2 repos, got %+v", res)
+	}
+
+	// 5. Verify the in-progress job was cancelled / aborted
+	cp.mu.Lock()
+	j := cp.jobs[runningJob.ID]
+	cp.mu.Unlock()
+	if j.Status != StatusCancelled {
+		t.Fatalf("expected in-progress job to be cancelled, got %s", j.Status)
+	}
+
+	// 6. Verify worktrees are clean for both repos
+	snapCleanA, err := CaptureWorktreeSnapshot(repoDirA)
+	if err != nil {
+		t.Fatalf("failed to capture snapA: %v", err)
+	}
+	if snapCleanA.DirtyFileCount != 0 || snapCleanA.HasIndexLock {
+		t.Fatalf("expected repoA to be completely clean, got %+v", snapCleanA)
+	}
+
+	snapCleanB, err := CaptureWorktreeSnapshot(repoDirB)
+	if err != nil {
+		t.Fatalf("failed to capture snapB: %v", err)
+	}
+	if snapCleanB.DirtyFileCount != 0 || snapCleanB.HasIndexLock {
+		t.Fatalf("expected repoB to be completely clean, got %+v", snapCleanB)
+	}
+
+	// 7. Verify file contents restored and untracked files deleted
+	readmeA, _ := os.ReadFile(filepath.Join(repoDirA, "README.md"))
+	if string(readmeA) != "# Iazio Repo\n" {
+		t.Fatalf("repoA README.md not restored: %q", string(readmeA))
+	}
+	if _, err := os.Stat(filepath.Join(repoDirA, "untracked_alpha.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("expected untracked_alpha.tmp to be deleted")
+	}
+
+	readmeB, _ := os.ReadFile(filepath.Join(repoDirB, "README.md"))
+	if string(readmeB) != "# Iazio Repo\n" {
+		t.Fatalf("repoB README.md not restored: %q", string(readmeB))
+	}
+	if _, err := os.Stat(filepath.Join(repoDirB, "untracked_beta.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("expected untracked_beta.tmp to be deleted")
 	}
 }

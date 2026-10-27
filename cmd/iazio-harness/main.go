@@ -1306,7 +1306,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	if resumeConvID != "" {
 		_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] Conversation resolved: %s --conversation=%s (source: sessionstore/metadata)\n", engineName, resumeConvID)))
 	} else {
-		_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] Starting new conversation session for story %s...\n", storyID)))
+		if storyID != "" {
+			_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] Starting new conversation session for story %s...\n", storyID)))
+		} else {
+			_ = sp.AppendRaw("stdout", []byte("[ASE-SUPERVISOR] Starting new conversation session for prompt execution...\n"))
+		}
 	}
 	initAsePhase := "START"
 	if job.InterruptedASEState != nil {
@@ -1314,7 +1318,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			initAsePhase = p
 		}
 	}
-	_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] ASE State: story=%s, phase=%s\n", storyID, initAsePhase)))
+	if storyID != "" {
+		_ = sp.AppendRaw("stdout", []byte(fmt.Sprintf("[ASE-SUPERVISOR] ASE State: story=%s, phase=%s\n", storyID, initAsePhase)))
+	} else {
+		_ = sp.AppendRaw("stdout", []byte("[ASE-SUPERVISOR] ASE State: N/A (ordinary prompt execution)\n"))
+	}
 	initDirtySummary := "clean"
 	if dFiles := collectWorkspaceDirtyFiles(worktree); len(dFiles) > 0 {
 		initDirtySummary = fmt.Sprintf("dirty (%d files modified/untracked)", len(dFiles))
@@ -2687,6 +2695,16 @@ func runServiceCommand(args []string) error {
 			return nil
 		}
 		return service.ReviveCheck(home, nil)
+	case "reconcile":
+		if dry {
+			fmt.Println("reconcile user service configuration and watchdog units")
+			return nil
+		}
+		if err := service.ReconcileServiceConfiguration(home, bin, nil); err != nil {
+			return err
+		}
+		fmt.Println("iazio-harness user service configuration reconciled")
+		return nil
 	case "start", "stop", "restart", "uninstall":
 		if dry {
 			fmt.Println(service.ActionText(goos, action, bin, force))
@@ -2740,6 +2758,15 @@ func runDaemonCommand(args []string) error {
 	defer cancel()
 
 	log.Printf("[iazio-harness] Starting execution supervisor daemon (pid: %d, interval: %v)...", os.Getpid(), interval)
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		binPath := filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		if runtime.GOOS == "windows" {
+			binPath += ".exe"
+		}
+		go func() {
+			_ = service.ReconcileServiceConfiguration(home, binPath, nil)
+		}()
+	}
 	wd := watchdog.New(watchdog.Options{})
 	return wd.Run(ctx, interval)
 }
