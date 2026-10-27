@@ -203,13 +203,13 @@ func KillChildProcess(pid int) error {
 	return killProcessPlatform(pid)
 }
 
-// Background task activity defaults.
+// Background task activity defaults (0 = unbounded by default to prevent premature task termination).
 const (
-	DefaultBackgroundIdleGrace     = 45 * time.Second
-	DefaultBackgroundSubagentStall = 90 * time.Second
-	DefaultIdleTaskThreshold       = 15 * time.Second
-	DefaultMaxCeilingDuration      = 5 * time.Minute
-	DefaultActivityCheckInterval   = 5 * time.Second
+	DefaultBackgroundIdleGrace     time.Duration = 0
+	DefaultBackgroundSubagentStall time.Duration = 0
+	DefaultIdleTaskThreshold       time.Duration = 0
+	DefaultMaxCeilingDuration      time.Duration = 0
+	DefaultActivityCheckInterval                 = 5 * time.Second
 )
 
 // TaskSupervisor monitors engine output for root agent idle states and supervises background tasks.
@@ -266,7 +266,7 @@ func NewTaskSupervisor(parentPID int, stream EventStream, timeout ...time.Durati
 		}
 
 		idleThreshold = DefaultIdleTaskThreshold
-		if inactTimeout < idleThreshold {
+		if idleThreshold <= 0 || inactTimeout < idleThreshold {
 			idleThreshold = inactTimeout / 2
 		}
 
@@ -425,11 +425,6 @@ func (s *TaskSupervisor) executeReap(tasks []BackgroundTaskInfo, inactiveDur, to
 
 	// Sleep 500ms to allow parent process to notice child exit
 	time.Sleep(500 * time.Millisecond)
-
-	// If parent process is still alive waiting on background barrier, signal it to complete turn
-	if s.ParentPID > 0 {
-		_ = KillChildProcess(s.ParentPID)
-	}
 }
 
 // ActiveTasks returns currently tracked background tasks.
