@@ -35,6 +35,7 @@ import (
 	"github.com/viovy/iazio-harness/internal/service"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 	"github.com/viovy/iazio-harness/internal/spool"
+	"github.com/viovy/iazio-harness/internal/story"
 	"github.com/viovy/iazio-harness/internal/telemetry"
 	"github.com/viovy/iazio-harness/internal/watchdog"
 )
@@ -1109,6 +1110,56 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 	defer sp.Close()
 
+	// Enterprise-grade pre-execution validation: if a specific story ID is requested, verify it exists
+	if isASE && storyID != "" && storyID != fallbackResumeStoryID && storyID != "pending_harness_creation" {
+		if pfErr := story.MaterializePendingStories(ctx, targetDir, storyID); pfErr != nil {
+			if errors.Is(pfErr, story.ErrStoryNotFound) || strings.Contains(strings.ToLower(pfErr.Error()), "not found") || strings.Contains(pfErr.Error(), "404") {
+				errMsg := fmt.Sprintf("story %q was not found in backlog: cannot execute nonexistent story. Create it first using create_story or verify it exists in docs/stories/.", storyID)
+				errDiagMsg := fmt.Sprintf("[iazio-harness] Validation Failure: %s (error: %v)\n", errMsg, pfErr)
+				log.Printf("%s", errDiagMsg)
+				_ = sp.AppendRaw("stderr", []byte(errDiagMsg))
+				_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", errDiagMsg)
+
+				dirtyFiles := collectWorkspaceDirtyFiles(targetDir)
+
+				exitOpts := controlplane.ExitOptions{
+					ExitCode:                 1,
+					DiagnosticCode:           string(diagnostics.CodeStoryNotFound),
+					Reason:                   string(diagnostics.CodeStoryNotFound),
+					TerminationReasonCode:    string(diagnostics.CodeStoryNotFound),
+					TerminationReasonMessage: errMsg,
+					ErrorMessage:             errMsg,
+					Remediation:              "Scaffold the story first using create_story or verify that the story file exists in docs/stories/ before requesting execution.",
+					Resumable:                false,
+					NonResumableReason:       fmt.Sprintf("Story %s does not exist in backlog or control plane", storyID),
+					WorkspaceDirtyFiles:      dirtyFiles,
+				}
+
+				_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
+					JobID:                    job.ID,
+					ScheduleID:               job.ScheduleID,
+					Engine:                   job.Engine,
+					WorktreePath:             worktree,
+					StoryID:                  storyID,
+					StepIndex:                1,
+					StartedAt:                time.Now().UTC().Format(time.RFC3339),
+					Status:                   "FAILED",
+					ExitCode:                 1,
+					TerminationReasonCode:    string(diagnostics.CodeStoryNotFound),
+					TerminationReasonMessage: errMsg,
+					Resumable:                false,
+					NonResumableReason:       exitOpts.NonResumableReason,
+					WorkspaceDirtyFiles:      dirtyFiles,
+				})
+
+				_ = lock.Release()
+				_ = controlplane.PostExitWithOptions(context.Background(), api, token, jobID, exitOpts)
+				wd.Fail(job.ID, 1, errMsg)
+				return fmt.Errorf("story validation failed: %w", pfErr)
+			}
+		}
+	}
+
 	engineName := job.Engine
 	if engineName == "" {
 		engineName = "agy"
@@ -1941,6 +1992,15 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	consecutiveStalls := 0
 
 	isContinuationTrigger := func() (shouldResume bool, unmetGates []string, triggerReason string) {
+		// Never resume on missing story or unrecoverable backlog validation errors
+		for _, f := range diagReport.Findings {
+			if f.Code == diagnostics.CodeStoryNotFound {
+				return false, nil, ""
+			}
+		}
+		if execErr != nil && (errors.Is(execErr, story.ErrStoryNotFound) || strings.Contains(strings.ToLower(execErr.Error()), "not found in backlog") || strings.Contains(strings.ToLower(execErr.Error()), "cannot execute nonexistent story")) {
+			return false, nil, ""
+		}
 		// 1. If print timeout or background task terminated occurred
 		hasPrintTimeout := strings.Contains(combinedOutput, "print timeout after") ||
 			strings.Contains(combinedOutput, "with turn in progress; returning partial output")

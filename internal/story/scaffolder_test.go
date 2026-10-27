@@ -2,6 +2,7 @@ package story
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -398,6 +399,46 @@ func TestMaterializePendingStories(t *testing.T) {
 	// Verify engines.PreFlightHook is wired
 	if engines.PreFlightHook == nil {
 		t.Error("expected engines.PreFlightHook to be wired")
+	}
+}
+
+func TestStoryExistsOnDiskAndMissingStoryHandling(t *testing.T) {
+	tmpDir := t.TempDir()
+	storiesDir := filepath.Join(tmpDir, "docs", "stories")
+	if err := os.MkdirAll(storiesDir, 0o755); err != nil {
+		t.Fatalf("mkdir stories: %v", err)
+	}
+
+	// 1. STORY-ROOT-12288 does not exist initially
+	if StoryExistsOnDisk(tmpDir, "STORY-ROOT-12288") {
+		t.Errorf("expected STORY-ROOT-12288 not to exist on disk initially")
+	}
+
+	// 2. Mock 404 from API
+	srv404 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"story not found"}`, http.StatusNotFound)
+	}))
+	defer srv404.Close()
+	t.Setenv("IAZIO_HARNESS_API_URL", srv404.URL)
+
+	err := MaterializePendingStories(context.Background(), tmpDir, "STORY-ROOT-12288")
+	if err == nil {
+		t.Fatalf("expected error for missing story, got nil")
+	}
+	if !errors.Is(err, ErrStoryNotFound) {
+		t.Errorf("expected ErrStoryNotFound, got: %v", err)
+	}
+
+	// 3. Create a slug-prefixed story file
+	slugFile := filepath.Join(storiesDir, "2026-10-27-gov-8888-test-slug.story.md")
+	if err := os.WriteFile(slugFile, []byte("# GOV-8888\n"), 0o644); err != nil {
+		t.Fatalf("write slug file: %v", err)
+	}
+	if !StoryExistsOnDisk(tmpDir, "STORY-GOV-8888") {
+		t.Errorf("expected StoryExistsOnDisk to find STORY-GOV-8888 by slug substring")
+	}
+	if !StoryExistsOnDisk(tmpDir, "GOV-8888") {
+		t.Errorf("expected StoryExistsOnDisk to find GOV-8888 by slug substring")
 	}
 }
 

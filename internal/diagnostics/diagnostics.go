@@ -31,6 +31,7 @@ const (
 	CodeTestFailed            = "TEST_FAILED"
 	CodeNonZeroExit           = "NON_ZERO_EXIT"
 	CodeIncompleteASEFlow     = "incomplete_ase_flow"
+	CodeStoryNotFound         = "STORY_NOT_FOUND"
 )
 
 // Finding represents one detected issue or anomaly.
@@ -483,6 +484,25 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 		})
 	}
 
+	outputLower := strings.ToLower(input.OutputText)
+	hasStoryNotFound := strings.Contains(outputLower, "story_not_found") ||
+		strings.Contains(outputLower, "cannot execute nonexistent story") ||
+		strings.Contains(outputLower, "not found in backlog") ||
+		strings.Contains(outputLower, "pre-flight story materialization failed")
+
+	if hasStoryNotFound {
+		targetID := input.StoryID
+		if targetID == "" {
+			targetID = "unknown"
+		}
+		report.Findings = append(report.Findings, Finding{
+			Code:        CodeStoryNotFound,
+			Severity:    "ERROR",
+			Message:     fmt.Sprintf("Story %q was not found in backlog or control plane: cannot execute nonexistent story.", targetID),
+			Remediation: "Scaffold the story first using create_story or verify it exists in docs/stories/ before requesting execution.",
+		})
+	}
+
 	// 5. Worktree cleanliness check after exit
 	if input.ExitCode == 0 && report.Porcelain != "" {
 		lines := strings.Split(strings.TrimSpace(report.Porcelain), "\n")
@@ -630,6 +650,11 @@ func createSIR(input DiagnosticInput, report DiagnosticReport) *SIRRecord {
 			category = "MERGE_CONFLICT"
 			remediation = f.Remediation
 			summary = f.Message
+		} else if f.Code == CodeStoryNotFound {
+			category = "STORY_NOT_FOUND"
+			remediation = f.Remediation
+			summary = f.Message
+			autoHeal = false
 		}
 	}
 

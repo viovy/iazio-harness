@@ -423,6 +423,39 @@ func TestDiagnose_DefaultGitRunner(t *testing.T) {
 	}
 }
 
+func TestDiagnose_StoryNotFound(t *testing.T) {
+	dir := t.TempDir()
+	report := Diagnose(DiagnosticInput{
+		JobID:        "job-missing-story",
+		StoryID:      "STORY-ROOT-12288",
+		WorktreePath: dir,
+		ExitCode:     1,
+		OutputText:   "[iazio-harness] Validation Failure: story \"STORY-ROOT-12288\" not found in backlog or control plane: 404 not found",
+		GitRunner: func(args ...string) (string, error) {
+			return "", nil
+		},
+	})
+	if report.Healthy {
+		t.Fatalf("expected unhealthy report")
+	}
+	found := false
+	for _, f := range report.Findings {
+		if f.Code == CodeStoryNotFound {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected CodeStoryNotFound in findings: %+v", report.Findings)
+	}
+	if report.SIR == nil || report.SIR.Category != "STORY_NOT_FOUND" {
+		t.Fatalf("expected SIR category STORY_NOT_FOUND, got: %+v", report.SIR)
+	}
+	if report.SIR.AutoHealable {
+		t.Fatalf("expected STORY_NOT_FOUND to not be auto-healable")
+	}
+}
+
 func TestDiagnose_WriteSIREmptyStoryID(t *testing.T) {
 	dir := t.TempDir()
 	report := Diagnose(DiagnosticInput{

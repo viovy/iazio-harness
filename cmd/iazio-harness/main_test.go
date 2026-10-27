@@ -2727,6 +2727,101 @@ func TestFormatVersionAndHelpers(t *testing.T) {
 	}
 }
 
+func TestExecuteJob_MissingStoryValidation_NoGitPollution(t *testing.T) {
+	workDir := t.TempDir()
+	// Initialize a clean git repository in workDir
+	cmdInit := exec.Command("git", "init")
+	cmdInit.Dir = workDir
+	if err := cmdInit.Run(); err != nil {
+		t.Fatalf("failed to git init in workDir: %v", err)
+	}
+
+	var exitOptionsPosted controlplane.ExitOptions
+	var exitPosted bool
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/jobs/job-missing-12288":
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:           "job-missing-12288",
+				Kind:         "ase",
+				Engine:       "agy",
+				Prompt:       "Execute autonomous story flow for STORY-ROOT-12288 in .",
+				StoryID:      "STORY-ROOT-12288",
+				WorktreePath: workDir,
+			})
+			return
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/stories/STORY-ROOT-12288":
+			http.Error(w, `{"error":"story not found"}`, http.StatusNotFound)
+			return
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+			exitPosted = true
+			_ = json.NewDecoder(r.Body).Decode(&exitOptionsPosted)
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/readiness"):
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ticks"):
+			w.WriteHeader(http.StatusOK)
+			return
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("IAZIO_HARNESS_API_URL", srv.URL)
+
+	err := executeJob(context.Background(), srv.URL, "job-missing-12288", workDir, "")
+	if err == nil {
+		t.Fatalf("expected executeJob to fail when story is missing, got nil")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if !exitPosted {
+		t.Fatalf("expected exit options to be posted to control plane")
+	}
+	if exitOptionsPosted.ExitCode != 1 {
+		t.Errorf("expected ExitCode 1, got %d", exitOptionsPosted.ExitCode)
+	}
+	if exitOptionsPosted.DiagnosticCode != "STORY_NOT_FOUND" {
+		t.Errorf("expected DiagnosticCode STORY_NOT_FOUND, got %q", exitOptionsPosted.DiagnosticCode)
+	}
+	if exitOptionsPosted.Reason != "STORY_NOT_FOUND" {
+		t.Errorf("expected Reason STORY_NOT_FOUND, got %q", exitOptionsPosted.Reason)
+	}
+	if exitOptionsPosted.TerminationReasonCode != "STORY_NOT_FOUND" {
+		t.Errorf("expected TerminationReasonCode STORY_NOT_FOUND, got %q", exitOptionsPosted.TerminationReasonCode)
+	}
+	if exitOptionsPosted.Resumable {
+		t.Errorf("expected Resumable to be false for nonexistent story")
+	}
+	if len(exitOptionsPosted.WorkspaceDirtyFiles) > 0 {
+		t.Errorf("expected zero workspace dirty files, got: %v", exitOptionsPosted.WorkspaceDirtyFiles)
+	}
+
+	// Verify working tree on disk was not polluted with dirty files
+	cmdStatus := exec.Command("git", "status", "--porcelain")
+	cmdStatus.Dir = workDir
+	out, err := cmdStatus.Output()
+	if err != nil {
+		t.Fatalf("git status failed: %v", err)
+	}
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("git context polluted with dirty files: %s", string(out))
+	}
+}
+
 
 
 
