@@ -160,11 +160,11 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		args = []string{"story", "run", "--story", storyID}
 	} else {
 		args = []string{"prompt", "run", "--file", tmpPath}
-		if targetAgent != "" && targetAgent != "auto" {
-			args = append(args, "--target-agent", targetAgent)
-		} else {
-			args = append(args, "--target-agent", "agy")
+		effectiveAgent := targetAgent
+		if effectiveAgent == "" || effectiveAgent == "auto" || (storyID == "" && effectiveAgent == "autopilot") {
+			effectiveAgent = "agy"
 		}
+		args = append(args, "--target-agent", effectiveAgent)
 		if opts.Title != "" {
 			args = append(args, "--title", opts.Title)
 		}
