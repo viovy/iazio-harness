@@ -386,6 +386,9 @@ func TestMaterializePendingStories(t *testing.T) {
 	if !strings.Contains(string(idxBytes), "STORY-REMOTE-001") {
 		t.Errorf("expected index.yml to contain STORY-REMOTE-001, got: %s", string(idxBytes))
 	}
+	if !strings.Contains(string(idxBytes), "status: READY") {
+		t.Errorf("expected index.yml to normalize status to READY, got: %s", string(idxBytes))
+	}
 	if !strings.Contains(string(idxBytes), "path: docs/stories/story-remote-001.story.md") {
 		t.Errorf("expected index.yml to contain path: docs/stories/..., got: %s", string(idxBytes))
 	}
