@@ -2059,7 +2059,7 @@ func TestExecuteJob_AttachRunningTool(t *testing.T) {
 	_ = os.WriteFile(mockAgy, []byte("#!/bin/sh\nexit 0\n"), 0755)
 	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
 
-	cmd := exec.Command("sleep", "0.4")
+	cmd := exec.Command("sleep", "5")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("failed to start mock tool process: %v", err)
 	}

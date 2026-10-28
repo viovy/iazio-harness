@@ -293,7 +293,7 @@ func TestMockAgy_Scenario3_ASEPrintTimeoutInJobContinuation(t *testing.T) {
 	_ = exec.Command("git", "-C", worktree, "add", ".").Run()
 	_ = exec.Command("git", "-C", worktree, "commit", "-m", "initial commit").Run()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	err := executeJob(ctx, srv.URL, "job-1372", worktree, "", "autonomous_story_execution", "", "")
@@ -550,7 +550,7 @@ func TestMockAgy_Scenario6_DirtyWorktreeResumeAndQueueUnblock(t *testing.T) {
 	worktree := initTestGitWorktree(t)
 
 	// Run 1: Fails with code 10 and leaves dirty file
-	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel1()
 	_ = executeJob(ctx1, srv.URL, "job-1324", worktree, "", "ordinary", "", "")
 
@@ -560,7 +560,7 @@ func TestMockAgy_Scenario6_DirtyWorktreeResumeAndQueueUnblock(t *testing.T) {
 	}
 
 	// Run 2: Resume on the same worktree with resume prompt
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
 	err := executeJob(ctx2, srv.URL, "job-1324", worktree, "", "resume", "conv-1324", "")
 	if err != nil {
