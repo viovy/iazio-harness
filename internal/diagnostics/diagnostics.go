@@ -426,7 +426,7 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 			Code:        CodeBinaryNotFound,
 			Severity:    "ERROR",
 			Message:     "Required tool executable or binary was not found on host PATH.",
-			Remediation: "Ensure tool binary is installed in ~/.local/bin or ~/.iazio/bin and present in the agent host PATH.",
+			Remediation: "Ensure tool binary is installed in ~/.local/bin (or %USERPROFILE%\\bin on Windows) and present in the agent host PATH.",
 		})
 	}
 
