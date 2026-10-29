@@ -114,6 +114,7 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 		PromptID:    payload.PromptID,
 		StoryID:     payload.StoryID,
 		Repo:        payload.Repo,
+		Branch:      strings.TrimSpace(payload.Branch),
 		Title:       payload.Title,
 		Prompt:      payload.Prompt,
 		TargetAgent: payload.TargetAgent,

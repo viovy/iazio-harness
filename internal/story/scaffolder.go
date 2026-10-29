@@ -172,7 +172,16 @@ func EnsureStoriesIndexBootstrap(storiesDir string) error {
 	return nil
 }
 
-// MaterializeStoryFile writes a story markdown file to docs/stories/<file> and ensures docs/stories/ exists.
+// DefaultMaterializeClient optionally overrides the autopilot.Client used during lazy story materialization.
+var DefaultMaterializeClient autopilot.Client
+
+// MaterializeStoryFile delegates story scaffolding and index registration to the canonical autopilot CLI via ScaffoldStory.
+func (s *Scaffolder) MaterializeStoryFile(ctx context.Context, payload StoryPayload) (*autopilot.StoryResult, error) {
+	return s.ScaffoldStory(ctx, payload)
+}
+
+// MaterializeStoryFile writes a pre-rendered canonical story file to docs/stories/<file> when content is provided,
+// without synthesizing story frontmatter or allocating story IDs inside iazio-harness (ADR-006).
 func MaterializeStoryFile(repoRoot, storyID, filename, content string) error {
 	if strings.TrimSpace(storyID) == "" {
 		return errors.New("storyID cannot be empty")
@@ -373,15 +382,12 @@ func fetchStoryDetail(ctx context.Context, storyID string) (remoteStoryDetail, e
 	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
 		return remoteStoryDetail{}, fmt.Errorf("decode story detail: %w", err)
 	}
-	if detail.Content == "" {
-		detail.Content = fmt.Sprintf("# %s: %s\n\nStatus: %s\n", detail.ID, detail.Title, detail.Status)
-	}
 	return detail, nil
 }
 
 // MaterializePendingStories verifies whether the story markdown file exists on disk.
 // If missing, it fetches the story detail from the control plane API (lazy materialization)
-// and writes docs/stories/<file> and ensures docs/stories/index.yml contains the entry.
+// and delegates scaffolding to the canonical autopilot CLI when DefaultMaterializeClient is configured or content is empty.
 func MaterializePendingStories(ctx context.Context, repoRoot, storyID string) error {
 	storyID = strings.TrimSpace(storyID)
 	if storyID == "" {
@@ -403,6 +409,25 @@ func MaterializePendingStories(ctx context.Context, repoRoot, storyID string) er
 		return err
 	}
 
+	var sub string
+	if len(detail.Submodules) > 0 {
+		sub = detail.Submodules[0]
+	}
+
+	if DefaultMaterializeClient != nil || strings.TrimSpace(detail.Content) == "" {
+		targetSub := sub
+		if targetSub == "" {
+			targetSub = "."
+		}
+		scaffolder := NewScaffolder(repoRoot, DefaultMaterializeClient)
+		_, err := scaffolder.MaterializeStoryFile(ctx, StoryPayload{
+			Submodule: targetSub,
+			Title:     detail.Title,
+			Priority:  detail.Priority,
+		})
+		return err
+	}
+
 	targetName := filepath.Base(detail.Path)
 	if targetName == "." || targetName == "" {
 		targetName = fmt.Sprintf("%s%s", strings.ToLower(storyID), storyFileExt)
@@ -413,10 +438,6 @@ func MaterializePendingStories(ctx context.Context, repoRoot, storyID string) er
 	}
 
 	storiesDir := filepath.Join(repoRoot, "docs", "stories")
-	var sub string
-	if len(detail.Submodules) > 0 {
-		sub = detail.Submodules[0]
-	}
 	ensureStoryInIndexWithPriority(storiesDir, storyID, detail.Title, filepath.Join("docs", "stories", targetName), detail.Status, detail.Priority, sub)
 	return nil
 }

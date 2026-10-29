@@ -476,3 +476,46 @@ func TestIsSubmoduleInGitmodules(t *testing.T) {
 	}
 }
 
+func TestMaterializeStoryFileDelegatesToAutopilotCLI(t *testing.T) {
+	fleetRoot, subDir := setupTestFleet(t)
+	var called bool
+	var capturedOpts autopilot.CreateStoryOptions
+
+	mockAP := &mockAutopilot{
+		createStoryFunc: func(ctx context.Context, opts autopilot.CreateStoryOptions) (*autopilot.StoryResult, error) {
+			called = true
+			capturedOpts = opts
+			return &autopilot.StoryResult{
+				StoryID:      "STORY-CANONICAL-001",
+				Submodule:    opts.Submodule,
+				StoryPath:    "docs/stories/2026-10-30-canonical-001.story.md",
+				IndexUpdated: true,
+			}, nil
+		},
+	}
+
+	scaffolder := NewScaffolder(fleetRoot, mockAP)
+	scaffolder.SetLockDir(filepath.Join(fleetRoot, ".locks"))
+
+	res, err := scaffolder.MaterializeStoryFile(context.Background(), StoryPayload{
+		Submodule:          "iazio-mcp",
+		Title:              "Delegate Materialization to Autopilot",
+		Priority:           "P1",
+		Problem:            "No synthetic frontmatter in iazio-harness",
+		AcceptanceCriteria: []string{"Autopilot CLI invoked"},
+		TargetFiles:        []string{"internal/story/scaffolder.go"},
+	})
+	if err != nil {
+		t.Fatalf("MaterializeStoryFile failed: %v", err)
+	}
+	if !called {
+		t.Fatalf("expected MaterializeStoryFile to delegate to autopilot.Client.CreateStory")
+	}
+	if res.StoryID != "STORY-CANONICAL-001" {
+		t.Fatalf("expected STORY-CANONICAL-001 from autopilot CLI, got %s", res.StoryID)
+	}
+	if capturedOpts.WorkingDir != subDir {
+		t.Fatalf("expected WorkingDir %s, got %s", subDir, capturedOpts.WorkingDir)
+	}
+}
+
