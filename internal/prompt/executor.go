@@ -21,7 +21,6 @@ type PromptPayload struct {
 	PromptID       string `json:"prompt_id"`
 	StoryID        string `json:"story_id,omitempty"`
 	Repo           string `json:"repo"`
-	Branch         string `json:"branch,omitempty"`
 	Title          string `json:"title,omitempty"`
 	Prompt         string `json:"prompt"`
 	TargetAgent    string `json:"target_agent,omitempty"`

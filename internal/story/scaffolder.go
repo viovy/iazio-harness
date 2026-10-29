@@ -208,7 +208,6 @@ type remoteStoryDetail struct {
 	ID         string   `json:"id"`
 	Title      string   `json:"title"`
 	Status     string   `json:"status"`
-	Priority   string   `json:"priority"`
 	Path       string   `json:"path"`
 	Content    string   `json:"content"`
 	Submodules []string `json:"submodules,omitempty"`
@@ -333,13 +332,10 @@ func storyExistsOnDisk(repoRoot, storyID string) bool {
 func getHarnessAPIURL() string {
 	apiURL := os.Getenv("IAZIO_HARNESS_API_URL")
 	if apiURL == "" {
-		apiURL = os.Getenv("IAZIO_HARNESS_URL")
-	}
-	if apiURL == "" {
 		apiURL = os.Getenv("IAZIO_API_URL")
 	}
 	if apiURL == "" {
-		apiURL = "http://127.0.0.1:8090"
+		apiURL = "http://127.0.0.1:8080"
 	}
 	return strings.TrimRight(apiURL, "/")
 }
@@ -417,15 +413,11 @@ func MaterializePendingStories(ctx context.Context, repoRoot, storyID string) er
 	if len(detail.Submodules) > 0 {
 		sub = detail.Submodules[0]
 	}
-	ensureStoryInIndexWithPriority(storiesDir, storyID, detail.Title, filepath.Join("docs", "stories", targetName), detail.Status, detail.Priority, sub)
+	ensureStoryInIndex(storiesDir, storyID, detail.Title, filepath.Join("docs", "stories", targetName), sub)
 	return nil
 }
 
 func ensureStoryInIndex(storiesDir, storyID, title, relativePath string, submodules ...string) {
-	ensureStoryInIndexWithPriority(storiesDir, storyID, title, relativePath, "READY", "P1", submodules...)
-}
-
-func ensureStoryInIndexWithPriority(storiesDir, storyID, title, relativePath, status, priority string, submodules ...string) {
 	indexPath := filepath.Join(storiesDir, "index.yml")
 	content, err := os.ReadFile(indexPath)
 	if err != nil {
@@ -434,20 +426,12 @@ func ensureStoryInIndexWithPriority(storiesDir, storyID, title, relativePath, st
 	if strings.Contains(string(content), storyID) {
 		return
 	}
-	normStatus := strings.ToUpper(strings.TrimSpace(status))
-	if normStatus == "" || normStatus == "PENDING" || normStatus == "PENDING_INDEX" || normStatus == "BACKLOG" {
-		normStatus = "READY"
-	}
-	normPriority := strings.ToUpper(strings.TrimSpace(priority))
-	if normPriority == "" {
-		normPriority = "P1"
-	}
 	subStr := ""
 	if len(submodules) > 0 && submodules[0] != "" {
 		subStr = fmt.Sprintf("      submodules:\n        - %s\n", submodules[0])
 	}
-	entry := fmt.Sprintf("\n    - id: %s\n      title: %q\n      status: %s\n      priority: %s\n      path: %s\n%s      created_at: %q\n      updated_at: %q\n",
-		storyID, title, normStatus, normPriority, filepath.ToSlash(relativePath), subStr, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
+	entry := fmt.Sprintf("\n    - id: %s\n      title: %q\n      status: pending\n      priority: P3\n      path: %s\n%s      created_at: %q\n      updated_at: %q\n",
+		storyID, title, filepath.ToSlash(relativePath), subStr, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
 	_ = os.WriteFile(indexPath, append(content, []byte(entry)...), 0o644)
 }
 
