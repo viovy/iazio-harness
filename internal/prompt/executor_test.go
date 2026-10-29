@@ -576,3 +576,30 @@ func TestValidateRelativeRepoPath_AndIsSubmoduleRegistered(t *testing.T) {
 	}
 }
 
+func TestExecutorForwardsBranchToPromptRunner(t *testing.T) {
+	fleetRoot, _, _ := setupTestFleet(t)
+	runner := &mockPromptRunner{}
+	exec := NewExecutor(fleetRoot, runner)
+	exec.SetLockDir(t.TempDir())
+
+	_, err := exec.Execute(context.Background(), PromptPayload{
+		PromptID:    "branch-test-001",
+		Repo:        "iazio-mcp",
+		Branch:      "feat/custom-branch-001",
+		Title:       "Forward Branch",
+		Prompt:      "Execute on branch",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	runner.mu.Lock()
+	opts := runner.lastOpts
+	runner.mu.Unlock()
+
+	if opts.Branch != "feat/custom-branch-001" {
+		t.Fatalf("expected RunPromptOptions.Branch to be %q, got %q", "feat/custom-branch-001", opts.Branch)
+	}
+}
+
