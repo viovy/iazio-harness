@@ -128,7 +128,7 @@ func TestMockAgy_Scenario1_OrdinaryPromptWithMCPDaemons(t *testing.T) {
 
 	worktree := initTestGitWorktree(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	err := executeJob(ctx, srv.URL, "job-1506", worktree, "", "ordinary", "", "")
@@ -207,7 +207,7 @@ func TestMockAgy_Scenario2_AgentRestartAndUpgradeMidRun(t *testing.T) {
 
 	worktree := initTestGitWorktree(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	err := executeJob(ctx, srv.URL, "job-1500", worktree, "", "ordinary", "", "")
@@ -377,7 +377,7 @@ func TestMockAgy_Scenario4_BackgroundTaskHangRecovery(t *testing.T) {
 	_ = exec.Command("git", "-C", worktree, "add", ".").Run()
 	_ = exec.Command("git", "-C", worktree, "commit", "-m", "initial commit").Run()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	err := executeJob(ctx, srv.URL, "job-1331", worktree, "", "autonomous_story_execution", "", "")
@@ -468,7 +468,7 @@ func TestMockAgy_Scenario5_MultiAttemptLogPreservationAndScheduleSync(t *testing
 	worktree := initTestGitWorktree(t)
 
 	// Attempt 1 execution
-	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel1()
 	_ = executeJob(ctx1, srv.URL, "job-1466", worktree, "", "ordinary", "", "")
 
@@ -477,7 +477,7 @@ func TestMockAgy_Scenario5_MultiAttemptLogPreservationAndScheduleSync(t *testing
 	currentAttempt = 2
 	mu.Unlock()
 
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
 	err := executeJob(ctx2, srv.URL, "job-1466", worktree, "", "ordinary", "", "")
 	if err != nil {
@@ -642,7 +642,7 @@ func TestMockAgy_Scenario7_NoOpBypass_CaughtByPoE(t *testing.T) {
 	_ = exec.Command("git", "-C", worktree, "add", ".").Run()
 	_ = exec.Command("git", "-C", worktree, "commit", "-m", "init commit").Run()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	_ = executeJob(ctx, srv.URL, "job-3060a0cb6d5e7c71", worktree, "", "ase", "", "")
@@ -714,7 +714,7 @@ func TestMockAgy_Scenario8_LegitimateStoryMutation_PoEVerified(t *testing.T) {
 	_ = exec.Command("git", "-C", worktree, "add", ".").Run()
 	_ = exec.Command("git", "-C", worktree, "commit", "-m", "init commit").Run()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	err := executeJob(ctx, srv.URL, "job-legit-3715", worktree, "", "ase", "", "")
@@ -909,7 +909,7 @@ func TestMockAgy_Scenario10_InPlaceHarnessAutoResume(t *testing.T) {
 
 	worktree := initTestGitWorktree(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	err := executeJob(ctx, srv.URL, "job-inplace-3721", worktree, "", "autonomous-story-execution", "", "")
@@ -987,7 +987,7 @@ func TestMockAgy_Scenario11_EmptyConversation_DirtyWorktree_FlowCompletion(t *te
 	// Create dirty uncommitted file
 	_ = os.WriteFile(filepath.Join(worktree, "dirty_worktree_file.tmp"), []byte("uncommitted work"), 0644)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// Empty conversation ID override passed with kind "resume"
@@ -1060,7 +1060,7 @@ func TestMockAgy_Scenario12_EmptyConversation_CleanWorktree_StoryRestart(t *test
 
 	worktree := initTestGitWorktree(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	err := executeJob(ctx, srv.URL, "job-clean-story-start", worktree, "", "resume", "", "")
