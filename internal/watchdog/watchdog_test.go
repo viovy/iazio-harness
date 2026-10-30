@@ -287,4 +287,3 @@ func TestIsProcessAlive_AndScanPSDescendants(t *testing.T) {
 		}
 	}
 }
-

@@ -850,7 +850,6 @@ func resolveLiveStoryID(workspacePath string, outputText string, currentStoryID 
 	return ""
 }
 
-
 func attachRunningTool(
 	ctx context.Context,
 	api, token, jobID string,
@@ -1090,26 +1089,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		return executePureCodeAction(ctx, api, token, job, targetDir, docsHub, sp, wd)
 	}
 
-	prepRes, err := prompt.Prepare(prompt.Input{
-		Kind:       job.Kind,
-		JobID:      job.ID,
-		Body:       job.Prompt,
-		Transcript: job.Transcript,
-		SpoolDir:   spool.DefaultDir(),
-		Values: prompt.Values{
-			StoryID:        storyID,
-			TargetLeafName: filepath.Base(worktree),
-			WorktreePath:   worktree,
-			DocsHubPath:    docsHub,
-		},
-	})
-	if err != nil {
-		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: prepare prompt for job %s: %v\n", jobID, err))
-		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
-		return fmt.Errorf("prepare prompt: %w", err)
-	}
-
-	// Enterprise-grade pre-execution validation: if a specific story ID is requested, verify it exists
+	// Enterprise-grade pre-execution validation: if a specific story ID is requested, materialize and verify it exists BEFORE prompt.Prepare
 	if isASE && storyID != "" && storyID != fallbackResumeStoryID && storyID != "pending_harness_creation" {
 		if pfErr := story.MaterializePendingStories(ctx, targetDir, storyID); pfErr != nil {
 			if errors.Is(pfErr, story.ErrStoryNotFound) || strings.Contains(strings.ToLower(pfErr.Error()), "not found") || strings.Contains(pfErr.Error(), "404") {
@@ -1157,6 +1137,25 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 				return fmt.Errorf("story validation failed: %w", pfErr)
 			}
 		}
+	}
+
+	prepRes, err := prompt.Prepare(prompt.Input{
+		Kind:       job.Kind,
+		JobID:      job.ID,
+		Body:       job.Prompt,
+		Transcript: job.Transcript,
+		SpoolDir:   spool.DefaultDir(),
+		Values: prompt.Values{
+			StoryID:        storyID,
+			TargetLeafName: filepath.Base(worktree),
+			WorktreePath:   worktree,
+			DocsHubPath:    docsHub,
+		},
+	})
+	if err != nil {
+		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: prepare prompt for job %s: %v\n", jobID, err))
+		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
+		return fmt.Errorf("prepare prompt: %w", err)
 	}
 
 	engineName := job.Engine

@@ -519,3 +519,49 @@ func TestMaterializeStoryFileDelegatesToAutopilotCLI(t *testing.T) {
 	}
 }
 
+func TestScaffolder_ExecuteStoryMaterializesPendingBeforeResolve(t *testing.T) {
+	tmpDir := t.TempDir()
+	storiesDir := filepath.Join(tmpDir, "docs", "stories")
+	if err := EnsureStoriesIndexBootstrap(storiesDir); err != nil {
+		t.Fatalf("EnsureStoriesIndexBootstrap: %v", err)
+	}
+
+	// Simulate an index.yml entry whose file is NOT yet materialized on disk
+	ensureStoryInIndexWithPriority(storiesDir, "STORY-PENDING-3806", "Pending Materialization Story", "docs/stories/story-pending-3806.story.md", "PENDING_MATERIALIZATION", "P0")
+
+	if StoryExistsOnDisk(tmpDir, "STORY-PENDING-3806") {
+		t.Fatalf("expected StoryExistsOnDisk to be false when index.yml points to unmaterialized file")
+	}
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/stories/STORY-PENDING-3806" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"id": "STORY-PENDING-3806",
+				"title": "Pending Materialization Story",
+				"status": "PENDING_MATERIALIZATION",
+				"priority": "P0",
+				"path": "docs/stories/story-pending-3806.story.md",
+				"content": "# STORY-PENDING-3806\n\nMaterialized before resolveStoryFile."
+			}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer mockServer.Close()
+	t.Setenv("IAZIO_HARNESS_API_URL", mockServer.URL)
+
+	scaffolder := NewScaffolder(tmpDir, nil)
+	resolvedPath, err := scaffolder.ExecuteStory(context.Background(), tmpDir, "STORY-PENDING-3806")
+	if err != nil {
+		t.Fatalf("ExecuteStory failed: %v", err)
+	}
+	if !strings.HasSuffix(strings.ToLower(resolvedPath), "story-pending-3806.story.md") {
+		t.Fatalf("expected resolvedPath ending with story-pending-3806.story.md, got %s", resolvedPath)
+	}
+	data, err := os.ReadFile(resolvedPath)
+	if err != nil || !strings.Contains(string(data), "Materialized before resolveStoryFile") {
+		t.Fatalf("unexpected materialized file content: %q (err=%v)", string(data), err)
+	}
+}

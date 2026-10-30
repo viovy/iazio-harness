@@ -98,12 +98,12 @@ func TestMockAgy_Scenario1_OrdinaryPromptWithMCPDaemons(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
 			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
-				ID:          "job-1506",
-				Prompt:      "update tools and check MCP health",
-				Kind:        "ordinary",
-				Engine:      "mock-agy",
-				Agent:       "mock-agy",
-				Status:      "RUNNING",
+				ID:     "job-1506",
+				Prompt: "update tools and check MCP health",
+				Kind:   "ordinary",
+				Engine: "mock-agy",
+				Agent:  "mock-agy",
+				Status: "RUNNING",
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
 			var body struct {
@@ -172,12 +172,12 @@ func TestMockAgy_Scenario2_AgentRestartAndUpgradeMidRun(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
 			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
-				ID:          "job-1500",
-				Prompt:      "run resilience test during agent upgrade",
-				Kind:        "ordinary",
-				Engine:      "mock-agy",
-				Agent:       "mock-agy",
-				Status:      "RUNNING",
+				ID:     "job-1500",
+				Prompt: "run resilience test during agent upgrade",
+				Kind:   "ordinary",
+				Engine: "mock-agy",
+				Agent:  "mock-agy",
+				Status: "RUNNING",
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
 			var body struct {
@@ -257,13 +257,13 @@ func TestMockAgy_Scenario3_ASEPrintTimeoutInJobContinuation(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
 			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
-				ID:          "job-1372",
-				StoryID:     "STORY-TEST-1372",
-				Prompt:      "/autonomous-story-execution execute story",
-				Kind:        "autonomous_story_execution",
-				Engine:      "mock-agy",
-				Agent:       "mock-agy",
-				Status:      "RUNNING",
+				ID:      "job-1372",
+				StoryID: "STORY-TEST-1372",
+				Prompt:  "/autonomous-story-execution execute story",
+				Kind:    "autonomous_story_execution",
+				Engine:  "mock-agy",
+				Agent:   "mock-agy",
+				Status:  "RUNNING",
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
 			var body struct {
@@ -341,13 +341,13 @@ func TestMockAgy_Scenario4_BackgroundTaskHangRecovery(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
 			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
-				ID:          "job-1331",
-				StoryID:     "STORY-TEST-1331",
-				Prompt:      "/autonomous-story-execution execute story",
-				Kind:        "autonomous_story_execution",
-				Engine:      "mock-agy",
-				Agent:       "mock-agy",
-				Status:      "RUNNING",
+				ID:      "job-1331",
+				StoryID: "STORY-TEST-1331",
+				Prompt:  "/autonomous-story-execution execute story",
+				Kind:    "autonomous_story_execution",
+				Engine:  "mock-agy",
+				Agent:   "mock-agy",
+				Status:  "RUNNING",
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
 			var body struct {
@@ -524,12 +524,12 @@ func TestMockAgy_Scenario6_DirtyWorktreeResumeAndQueueUnblock(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
 			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
-				ID:          "job-1324",
-				Prompt:      "execute step 1 and leave dirty worktree",
-				Kind:        "ordinary",
-				Engine:      "mock-agy",
-				Agent:       "mock-agy",
-				Status:      "RUNNING",
+				ID:     "job-1324",
+				Prompt: "execute step 1 and leave dirty worktree",
+				Kind:   "ordinary",
+				Engine: "mock-agy",
+				Agent:  "mock-agy",
+				Status: "RUNNING",
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
 			w.WriteHeader(http.StatusOK)
@@ -604,13 +604,13 @@ func TestMockAgy_Scenario7_NoOpBypass_CaughtByPoE(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
 			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
-				ID:       "job-3060a0cb6d5e7c71",
-				Prompt:   "/autonomous-story-execution STORY-GOV-3715",
-				Kind:     "ase",
-				Engine:   "mock-agy",
-				Agent:    "mock-agy",
-				Status:   "RUNNING",
-				StoryID:  "STORY-GOV-3715",
+				ID:      "job-3060a0cb6d5e7c71",
+				Prompt:  "/autonomous-story-execution STORY-GOV-3715",
+				Kind:    "ase",
+				Engine:  "mock-agy",
+				Agent:   "mock-agy",
+				Status:  "RUNNING",
+				StoryID: "STORY-GOV-3715",
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
 			w.WriteHeader(http.StatusOK)
@@ -676,13 +676,13 @@ func TestMockAgy_Scenario8_LegitimateStoryMutation_PoEVerified(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
 			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
-				ID:       "job-legit-3715",
-				Prompt:   "/autonomous-story-execution STORY-GOV-3715",
-				Kind:     "ase",
-				Engine:   "mock-agy",
-				Agent:    "mock-agy",
-				Status:   "RUNNING",
-				StoryID:  "STORY-GOV-3715",
+				ID:      "job-legit-3715",
+				Prompt:  "/autonomous-story-execution STORY-GOV-3715",
+				Kind:    "ase",
+				Engine:  "mock-agy",
+				Agent:   "mock-agy",
+				Status:  "RUNNING",
+				StoryID: "STORY-GOV-3715",
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
 			w.WriteHeader(http.StatusOK)
@@ -874,13 +874,13 @@ func TestMockAgy_Scenario10_InPlaceHarnessAutoResume(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
 			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
-				ID:          "job-inplace-3721",
-				Prompt:      "/autonomous-story-execution verify-in-place-resume",
-				Kind:        "autonomous-story-execution",
-				Engine:      "mock-agy",
-				Agent:       "mock-agy",
-				StoryID:     "STORY-GOV-3721",
-				Status:      "RUNNING",
+				ID:      "job-inplace-3721",
+				Prompt:  "/autonomous-story-execution verify-in-place-resume",
+				Kind:    "autonomous-story-execution",
+				Engine:  "mock-agy",
+				Agent:   "mock-agy",
+				StoryID: "STORY-GOV-3721",
+				Status:  "RUNNING",
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
 			var body struct {
@@ -951,13 +951,13 @@ func TestMockAgy_Scenario11_EmptyConversation_DirtyWorktree_FlowCompletion(t *te
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
 			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
-				ID:          "job-dirty-unanchored",
-				Prompt:      "resume",
-				Kind:        "resume",
-				Engine:      "mock-agy",
-				Agent:       "mock-agy",
-				StoryID:     "STORY-GOV-3721",
-				Status:      "RUNNING",
+				ID:      "job-dirty-unanchored",
+				Prompt:  "resume",
+				Kind:    "resume",
+				Engine:  "mock-agy",
+				Agent:   "mock-agy",
+				StoryID: "STORY-GOV-3721",
+				Status:  "RUNNING",
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
 			var body struct {
@@ -1027,13 +1027,13 @@ func TestMockAgy_Scenario12_EmptyConversation_CleanWorktree_StoryRestart(t *test
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
 			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
-				ID:          "job-clean-story-start",
-				Prompt:      "resume",
-				Kind:        "resume",
-				Engine:      "mock-agy",
-				Agent:       "mock-agy",
-				StoryID:     "STORY-GOV-3721",
-				Status:      "RUNNING",
+				ID:      "job-clean-story-start",
+				Prompt:  "resume",
+				Kind:    "resume",
+				Engine:  "mock-agy",
+				Agent:   "mock-agy",
+				StoryID: "STORY-GOV-3721",
+				Status:  "RUNNING",
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
 			var body struct {

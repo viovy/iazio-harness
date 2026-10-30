@@ -44,6 +44,9 @@ type EventStream interface {
 	AppendRaw(stream string, p []byte) error
 }
 
+// ErrStoryNotFound is returned when a requested story does not exist in the backlog or control plane.
+var ErrStoryNotFound = errors.New("story not found in backlog or control plane")
+
 // PreFlightHook is executed prior to child execution if set.
 var PreFlightHook func(ctx context.Context, workDir, storyID string) error
 

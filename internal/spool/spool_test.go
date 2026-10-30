@@ -332,5 +332,3 @@ func TestSpool_MultiAttemptAppendPreservesInitialLogs(t *testing.T) {
 		t.Errorf("Attempt 2 startup log missing from disk log")
 	}
 }
-
-

@@ -376,4 +376,3 @@ func TestPostStoryBinding_AndPostTurnContinued(t *testing.T) {
 		t.Errorf("expected chunks path, got %s", paths[1])
 	}
 }
-

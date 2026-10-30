@@ -191,37 +191,37 @@ func PostJobReadiness(ctx context.Context, baseURL, token, jobID string, reapRes
 
 // JobDetail carries the execution specification from iazio-harness-api.
 type JobDetail struct {
-	ID                          string            `json:"id"`
-	ScheduleID                  string            `json:"schedule_id"`
-	Kind                        string            `json:"kind"`
-	Status                      string            `json:"status"`
-	Engine                      string            `json:"engine"`
-	Prompt                      string            `json:"prompt"`
-	StoryID                     string            `json:"story_id"`
-	SourceIdeaID                string            `json:"source_idea_id"`
-	Transcript                  string            `json:"transcript"`
-	WorktreePath                string            `json:"worktree_path"`
-	DocsHubPath                 string            `json:"docs_hub_path"`
-	EnvVars                     map[string]string `json:"env_vars"`
-	MaxExecutionDurationSeconds int               `json:"max_execution_duration_seconds"`
-	ResumeConversationID        string            `json:"resume_conversation_id,omitempty"`
-	Model                       string            `json:"model,omitempty"`
-	Agent                       string            `json:"agent,omitempty"`
-	DisableSlashCommands        *bool             `json:"disable_slash_commands,omitempty"`
-	HostID                      string            `json:"host_id,omitempty"`
-	TargetHost                  string            `json:"target_host,omitempty"`
-	ParentJobID                 string            `json:"parent_job_id,omitempty"`
-	RootJobID                   string            `json:"root_job_id,omitempty"`
-	ExecutionAttempt            int               `json:"execution_attempt,omitempty"`
-	ExecutionChain              []string          `json:"execution_chain,omitempty"`
-	InitialConversationID       string            `json:"initial_conversation_id,omitempty"`
-	ActiveConversationID        string            `json:"active_conversation_id,omitempty"`
-	ResumeMode                  string            `json:"resume_mode,omitempty"`
-	ResumeFallbackReason        string            `json:"resume_fallback_reason,omitempty"`
-	InterruptedASEState         map[string]any    `json:"interrupted_ase_state,omitempty"`
-	ConversationIDs             []string          `json:"conversation_ids,omitempty"`
-	Reason                      string            `json:"reason,omitempty"`
-	ExitCode                    int               `json:"exit_code,omitempty"`
+	ID                          string                 `json:"id"`
+	ScheduleID                  string                 `json:"schedule_id"`
+	Kind                        string                 `json:"kind"`
+	Status                      string                 `json:"status"`
+	Engine                      string                 `json:"engine"`
+	Prompt                      string                 `json:"prompt"`
+	StoryID                     string                 `json:"story_id"`
+	SourceIdeaID                string                 `json:"source_idea_id"`
+	Transcript                  string                 `json:"transcript"`
+	WorktreePath                string                 `json:"worktree_path"`
+	DocsHubPath                 string                 `json:"docs_hub_path"`
+	EnvVars                     map[string]string      `json:"env_vars"`
+	MaxExecutionDurationSeconds int                    `json:"max_execution_duration_seconds"`
+	ResumeConversationID        string                 `json:"resume_conversation_id,omitempty"`
+	Model                       string                 `json:"model,omitempty"`
+	Agent                       string                 `json:"agent,omitempty"`
+	DisableSlashCommands        *bool                  `json:"disable_slash_commands,omitempty"`
+	HostID                      string                 `json:"host_id,omitempty"`
+	TargetHost                  string                 `json:"target_host,omitempty"`
+	ParentJobID                 string                 `json:"parent_job_id,omitempty"`
+	RootJobID                   string                 `json:"root_job_id,omitempty"`
+	ExecutionAttempt            int                    `json:"execution_attempt,omitempty"`
+	ExecutionChain              []string               `json:"execution_chain,omitempty"`
+	InitialConversationID       string                 `json:"initial_conversation_id,omitempty"`
+	ActiveConversationID        string                 `json:"active_conversation_id,omitempty"`
+	ResumeMode                  string                 `json:"resume_mode,omitempty"`
+	ResumeFallbackReason        string                 `json:"resume_fallback_reason,omitempty"`
+	InterruptedASEState         map[string]any         `json:"interrupted_ase_state,omitempty"`
+	ConversationIDs             []string               `json:"conversation_ids,omitempty"`
+	Reason                      string                 `json:"reason,omitempty"`
+	ExitCode                    int                    `json:"exit_code,omitempty"`
 	TerminationReasonMessage    string                 `json:"termination_reason_message,omitempty"`
 	FailureReasonSummary        string                 `json:"failure_reason_summary,omitempty"`
 	FencingToken                int64                  `json:"fencing_token,omitempty"`
@@ -407,12 +407,12 @@ func PostStoryBinding(ctx context.Context, baseURL, token, jobID, storyID, story
 // PostTurnContinued emits a structured turn auto-continuation event to the control plane.
 func PostTurnContinued(ctx context.Context, baseURL, token, jobID string, turn int, conversationID string, unmetGates []string, activeChildSummary string) error {
 	payload := map[string]any{
-		"type":                 "TURN_AUTO_CONTINUED",
-		"continuation_turn":    turn,
-		"conversation_id":      conversationID,
-		"unmet_gates":          unmetGates,
-		"active_child_tasks":   activeChildSummary,
-		"continued_at":         time.Now().UTC(),
+		"type":               "TURN_AUTO_CONTINUED",
+		"continuation_turn":  turn,
+		"conversation_id":    conversationID,
+		"unmet_gates":        unmetGates,
+		"active_child_tasks": activeChildSummary,
+		"continued_at":       time.Now().UTC(),
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -420,4 +420,3 @@ func PostTurnContinued(ctx context.Context, baseURL, token, jobID string, turn i
 	}
 	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/chunks", token, raw, "turn continued post")
 }
-

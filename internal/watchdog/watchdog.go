@@ -436,4 +436,3 @@ func FormatActiveChildProcessesSummary(procs []ProcessInfo) (summary string, pid
 	}
 	return strings.Join(descriptions, ", "), pidList
 }
-

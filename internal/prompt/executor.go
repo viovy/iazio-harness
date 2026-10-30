@@ -80,7 +80,7 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 
 	timeout := time.Duration(payload.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
-		timeout = 900 * time.Second
+		timeout = autopilot.ResolveDefaultPromptTimeout()
 	}
 
 	lockCtx, cancelLock := context.WithTimeout(ctx, timeout)

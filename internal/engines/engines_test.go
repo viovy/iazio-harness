@@ -1417,5 +1417,3 @@ func TestRawWriter_OnStoryAllocated(t *testing.T) {
 		t.Fatalf("expected STORY-GOV-9999, got %q", got)
 	}
 }
-
-
