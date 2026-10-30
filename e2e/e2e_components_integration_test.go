@@ -529,6 +529,14 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 		repoDir := initTestGitRepo(t)
 		_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Gov3799 Runner").Run()
 		_ = exec.Command("git", "-C", repoDir, "config", "user.email", "gov3799@iazio.local").Run()
+		_ = os.MkdirAll(filepath.Join(repoDir, "docs", "stories"), 0o755)
+		_ = os.WriteFile(
+			filepath.Join(repoDir, "docs", "stories", "2026-10-30-gov-3799.story.md"),
+			[]byte("---\nid: STORY-GOV-3799\nstatus: IN_PROGRESS\ntitle: Remediate macOS LaunchAgents and Queue E2E\n---\n# STORY-GOV-3799\n"),
+			0o644,
+		)
+		_ = exec.Command("git", "-C", repoDir, "add", ".").Run()
+		_ = exec.Command("git", "-C", repoDir, "commit", "-m", "chore: seed STORY-GOV-3799 in test repo").Run()
 
 		var (
 			mu                  sync.Mutex
