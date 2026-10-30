@@ -72,6 +72,20 @@ func TestPrepareOrdinaryKindDoesNotInjectStoryID(t *testing.T) {
 	if res.Prompt != "update tools" {
 		t.Fatalf("expected clean prompt 'update tools', got %q", res.Prompt)
 	}
+
+	resWithPlaceholder, err := Prepare(Input{
+		JobID: "job-1560", Kind: "ordinary",
+		Body: "update tools {{.StoryID}}",
+	})
+	if err != nil {
+		t.Fatalf("expected Prepare to succeed when StoryID is empty on ordinary prompt containing {{.StoryID}}, got: %v", err)
+	}
+	if strings.Contains(resWithPlaceholder.Prompt, "STORY-RESUME-INPLACE") || strings.Contains(resWithPlaceholder.Prompt, "{{.StoryID}}") {
+		t.Fatalf("expected clean prompt without unresolved placeholder or fake StoryID, got %q", resWithPlaceholder.Prompt)
+	}
+	if resWithPlaceholder.Prompt != "update tools" {
+		t.Fatalf("expected clean prompt 'update tools', got %q", resWithPlaceholder.Prompt)
+	}
 }
 
 func TestPrepareResumeEmptyStoryID(t *testing.T) {

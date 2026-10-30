@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/controlplane"
+	"github.com/viovy/iazio-harness/internal/engines"
+	"github.com/viovy/iazio-harness/internal/service"
 )
 
 // buildMockAgy compiles cmd/mock-agy into a temporary directory and sets PATH.
@@ -1078,5 +1080,197 @@ func TestMockAgy_Scenario12_EmptyConversation_CleanWorktree_StoryRestart(t *test
 	allOutput := strings.Join(postedChunks, "\n")
 	if !strings.Contains(allOutput, "Story restarted from scratch on clean worktree successfully") {
 		t.Fatalf("expected clean worktree story restart notice, got: %s", allOutput)
+	}
+}
+
+// Scenario 13: Ordinary prompt execution ("update tools") with {{.StoryID}} placeholder when StoryID is empty
+func TestMockAgy_Scenario13_OrdinaryPromptWithEmptyStoryIDPlaceholder(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "ordinary_prompt_with_mcp_daemons")
+
+	var mu sync.Mutex
+	var postedChunks []string
+	var postedExitCode = -1
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:      "job-1560",
+				Prompt:  "update tools {{.StoryID}}",
+				Kind:    "ordinary",
+				Engine:  "mock-agy",
+				Agent:   "mock-agy",
+				StoryID: "",
+				Status:  "RUNNING",
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			var body struct {
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedChunks = append(postedChunks, body.Text)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ticks"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+			var body struct {
+				ExitCode int `json:"exit_code"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedExitCode = body.ExitCode
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	worktree := initTestGitWorktree(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err := executeJob(ctx, srv.URL, "job-1560", worktree, "", "ordinary", "", "")
+	if err != nil {
+		t.Fatalf("expected executeJob to succeed when StoryID is empty with {{.StoryID}} placeholder, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if postedExitCode != 0 {
+		t.Fatalf("expected exit code 0 reported to control plane, got %d", postedExitCode)
+	}
+
+	allOutput := strings.Join(postedChunks, "\n")
+	if strings.Contains(allOutput, "STORY-RESUME-INPLACE") || strings.Contains(allOutput, "{{.StoryID}}") {
+		t.Fatalf("expected clean prompt without unresolved placeholder or fake StoryID, got: %s", allOutput)
+	}
+	if !strings.Contains(allOutput, "[mock-agy] Prompt: update tools") {
+		t.Fatalf("expected mock-agy to receive clean 'update tools' prompt, got: %s", allOutput)
+	}
+}
+
+// Scenario 14: Child engine (mock-agy) exiting with non-zero code (exit 1, 2, 10) triggering in-place continuation / auto-resume to completion
+func TestMockAgy_Scenario14_NonZeroExitCodes_InPlaceAutoResume(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "nonzero_exit_inplace_resume")
+
+	for _, code := range []string{"1", "2", "10"} {
+		t.Run("exit_"+code, func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "mock_agy_inplace_resume_"+code+".tmp")
+			t.Setenv("MOCK_AGY_STATE_MARKER", marker)
+			t.Setenv("MOCK_AGY_EXIT_CODE", code)
+
+			var mu sync.Mutex
+			var postedChunks []string
+			var postedExitCode = -1
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
+					_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+						ID:      "job-nonzero-" + code,
+						Prompt:  "/autonomous-story-execution verify-nonzero-resume",
+						Kind:    "autonomous-story-execution",
+						Engine:  "mock-agy",
+						Agent:   "mock-agy",
+						StoryID: "STORY-GOV-3799",
+						Status:  "RUNNING",
+					})
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+					var body struct {
+						Text string `json:"text"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					postedChunks = append(postedChunks, body.Text)
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ticks"):
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/conversations"):
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/continued"):
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+					var body struct {
+						ExitCode int `json:"exit_code"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					postedExitCode = body.ExitCode
+					w.WriteHeader(http.StatusOK)
+				default:
+					w.WriteHeader(http.StatusOK)
+				}
+			}))
+			defer srv.Close()
+
+			worktree := initTestGitWorktree(t)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			err := executeJob(ctx, srv.URL, "job-nonzero-"+code, worktree, "", "autonomous-story-execution", "", "")
+			if err != nil {
+				t.Fatalf("expected executeJob with exit %s to auto-resume and succeed, got: %v", code, err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if postedExitCode != 0 {
+				t.Fatalf("expected final exit code 0 after auto-resuming from exit %s, got %d", code, postedExitCode)
+			}
+
+			allOutput := strings.Join(postedChunks, "\n")
+			if !strings.Contains(allOutput, "trigger_reason: exit_code_"+code) {
+				t.Fatalf("expected output to record trigger_reason: exit_code_%s, got:\n%s", code, allOutput)
+			}
+			if !strings.Contains(allOutput, "In-place auto-resume attempt 2 succeeded cleanly") {
+				t.Fatalf("expected Turn 2 completion output for exit %s, got:\n%s", code, allOutput)
+			}
+		})
+	}
+}
+
+// Scenario 15: Canonical ~/.local/bin/iazio-harness path resolution
+func TestMockAgy_Scenario15_CanonicalLocalBinPathResolution(t *testing.T) {
+	mockAgyBin := buildMockAgy(t)
+	tmpHome := os.Getenv("HOME")
+	localBinDir := filepath.Join(tmpHome, ".local", "bin")
+	if err := os.MkdirAll(localBinDir, 0o755); err != nil {
+		t.Fatalf("failed to create ~/.local/bin: %v", err)
+	}
+
+	cleanup := service.SetExecCommandForTest(func(name string, args ...string) error {
+		return nil
+	})
+	defer cleanup()
+
+	// 1. Verify DevInstall installs into canonical ~/.local/bin/iazio-harness
+	if err := service.DevInstall(mockAgyBin, tmpHome, nil); err != nil {
+		t.Fatalf("DevInstall failed: %v", err)
+	}
+	canonicalBin := filepath.Join(localBinDir, "iazio-harness")
+	if _, err := os.Stat(canonicalBin); err != nil {
+		t.Fatalf("expected canonical binary at %s: %v", canonicalBin, err)
+	}
+	legacyBin := filepath.Join(tmpHome, ".iazio", "bin", "iazio-harness")
+	if _, err := os.Stat(legacyBin); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy ~/.iazio/bin/iazio-harness not to be created, got err=%v", err)
+	}
+
+	// 2. Verify ChildEnv injects ~/.local/bin and not ~/.iazio/bin
+	env := engines.ChildEnv(nil, nil, "")
+	pathVal, ok := engines.EnvLookup(env, "PATH")
+	if !ok || !strings.Contains(pathVal, localBinDir) {
+		t.Fatalf("expected ChildEnv PATH to include %s, got %q", localBinDir, pathVal)
+	}
+	if strings.Contains(pathVal, filepath.Join(tmpHome, ".iazio", "bin")) {
+		t.Fatalf("expected ChildEnv PATH not to include legacy .iazio/bin, got %q", pathVal)
 	}
 }

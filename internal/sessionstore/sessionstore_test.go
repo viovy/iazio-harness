@@ -302,6 +302,7 @@ func TestIsValidConversationID(t *testing.T) {
 }
 
 func TestSessionExists(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	brainDir := t.TempDir()
 	r := &Resolver{
 		BrainDir: brainDir,

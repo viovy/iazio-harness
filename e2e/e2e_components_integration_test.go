@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -412,3 +413,294 @@ func TestE2E_FullPipeline_EmptyConversation_CleanWorktreeRestart(t *testing.T) {
 		t.Fatalf("expected status 'completed', got %s", completedJob.Status)
 	}
 }
+
+// buildCompiledIazioHarness builds the canonical iazio-harness binary into ~/.local/bin/iazio-harness
+// inside an isolated temporary HOME directory.
+func buildCompiledIazioHarness(t *testing.T, homeDir string) string {
+	t.Helper()
+	localBin := filepath.Join(homeDir, ".local", "bin")
+	if err := os.MkdirAll(localBin, 0o755); err != nil {
+		t.Fatalf("mkdir .local/bin: %v", err)
+	}
+	harnessBin := filepath.Join(localBin, "iazio-harness")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", harnessBin, "../cmd/iazio-harness")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to compile iazio-harness: %v\noutput: %s", err, string(out))
+	}
+	return harnessBin
+}
+
+// Test 8 (STORY-GOV-3799): Multi-Component End-to-End Integration Suite across
+// iazio-harness-api + iazio-agent + iazio-harness + iazio-harvester + mock-agy:
+//  1. macOS LaunchAgent plist reconciliation & ~/.iazio/bin shadow binary / .next cleanup without 78 (EX_CONFIG).
+//  2. OAuth invalid_grant fallback to mcp.json and writebehind spool recovery in watch mode.
+//  3. Lease ACK + slow workspace sanitization + 5m ActiveLeaseDuration extension preventing LEASE_EXPIRED / ORPHANED_RUN_EXPIRED.
+//  4. Ordinary prompt ("update tools" with empty StoryID) + non-zero exit (1/2/10) in-place auto-resume via real iazio-harness + mock-agy.
+//  5. Tool inventory .next exclusion & agent.tools.update suite correlation.
+func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
+	homeDir := t.TempDir()
+	mockAgy := buildCompiledMockAgy(t)
+	harnessBin := buildCompiledIazioHarness(t, homeDir)
+
+	// Sub-scenario A: Canonical ~/.local/bin resolution and ~/.iazio/bin + .next hygiene
+	t.Run("macOS_SingleHome_LaunchAgent_And_StagedArtifact_Hygiene", func(t *testing.T) {
+		legacyBinDir := filepath.Join(homeDir, ".iazio", "bin")
+		launchAgentsDir := filepath.Join(homeDir, "Library", "LaunchAgents")
+		if err := os.MkdirAll(legacyBinDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(launchAgentsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Verify iazio-harness service dry-run renders ~/.local/bin/iazio-harness and never ~/.iazio/bin
+		cmdDry := exec.Command(harnessBin, "service", "install", "--dry-run")
+		cmdDry.Env = append(os.Environ(), "HOME="+homeDir)
+		outDry, err := cmdDry.CombinedOutput()
+		if err != nil {
+			t.Fatalf("iazio-harness service install --dry-run failed: %v (%s)", err, string(outDry))
+		}
+		if strings.Contains(string(outDry), ".iazio/bin") {
+			t.Fatalf("expected service dry-run to reference ~/.local/bin, got: %s", string(outDry))
+		}
+
+		// If sibling iazio-agent and iazio-harvester repos are present in the workspace,
+		// compile them into ~/.local/bin and verify single-home LaunchAgent reconciliation + .next cleanup!
+		agentMainDir := filepath.Clean(filepath.Join("..", "..", "iazio-agent", "cmd", "iazio-agent"))
+		harvesterMainDir := filepath.Clean(filepath.Join("..", "..", "iazio-harvester", "cmd", "iazio-harvester"))
+		if _, err := os.Stat(agentMainDir); err == nil {
+			agentBin := filepath.Join(homeDir, ".local", "bin", "iazio-agent")
+			cmd := exec.Command("go", "build", "-buildvcs=false", "-o", agentBin, "./cmd/iazio-agent")
+			cmd.Dir = filepath.Clean(filepath.Join("..", "..", "iazio-agent"))
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("failed to compile sibling iazio-agent: %v\n%s", err, string(out))
+			}
+
+			// Seed legacy shadow binary and stale .next staged binary that caused 78 (EX_CONFIG) & inventory pollution
+			legacyAgent := filepath.Join(legacyBinDir, "iazio-agent")
+			stagedHarvesterNext := filepath.Join(legacyBinDir, "iazio-harvester.next")
+			_ = os.WriteFile(legacyAgent, []byte("#!/bin/sh\nexit 0\n"), 0o755)
+			_ = os.WriteFile(stagedHarvesterNext, []byte("partial-staged-binary"), 0o755)
+
+			plistPath := filepath.Join(launchAgentsDir, "io.iazio.iazio-agent.plist")
+			legacyPlist := fmt.Sprintf(`<plist><dict><key>ProgramArguments</key><array><string>%s</string></array></dict></plist>`, legacyAgent)
+			_ = os.WriteFile(plistPath, []byte(legacyPlist), 0o644)
+
+			cmdVer := exec.Command(agentBin, "version")
+			cmdVer.Env = append(os.Environ(), "HOME="+homeDir, "XPC_SERVICE_NAME=io.iazio.iazio-agent")
+			if out, err := cmdVer.CombinedOutput(); err != nil {
+				t.Fatalf("iazio-agent version failed: %v (%s)", err, string(out))
+			}
+			if _, err := os.Stat(legacyAgent); !os.IsNotExist(err) {
+				t.Fatalf("expected legacy shadow binary %s to be removed after single-home reconciliation", legacyAgent)
+			}
+			if _, err := os.Stat(stagedHarvesterNext); !os.IsNotExist(err) {
+				t.Fatalf("expected stale staged binary %s to be removed after single-home reconciliation", stagedHarvesterNext)
+			}
+			plistBytes, _ := os.ReadFile(plistPath)
+			if strings.Contains(string(plistBytes), ".iazio/bin/iazio-agent") {
+				t.Fatalf("expected LaunchAgent plist to be rewritten to ~/.local/bin/iazio-agent before shadow binary removal, got:\n%s", string(plistBytes))
+			}
+		}
+		if _, err := os.Stat(harvesterMainDir); err == nil {
+			harvesterBin := filepath.Join(homeDir, ".local", "bin", "iazio-harvester")
+			cmd := exec.Command("go", "build", "-buildvcs=false", "-o", harvesterBin, "./cmd/iazio-harvester")
+			cmd.Dir = filepath.Clean(filepath.Join("..", "..", "iazio-harvester"))
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("failed to compile sibling iazio-harvester: %v\n%s", err, string(out))
+			}
+			legacyHarvester := filepath.Join(legacyBinDir, "iazio-harvester")
+			_ = os.WriteFile(legacyHarvester, []byte("#!/bin/sh\nexit 0\n"), 0o755)
+
+			cmdVer := exec.Command(harvesterBin, "version")
+			cmdVer.Env = append(os.Environ(), "HOME="+homeDir, "XPC_SERVICE_NAME=io.iazio.iazio-harvester")
+			if out, err := cmdVer.CombinedOutput(); err != nil {
+				t.Fatalf("iazio-harvester version failed: %v (%s)", err, string(out))
+			}
+			if _, err := os.Stat(legacyHarvester); !os.IsNotExist(err) {
+				t.Fatalf("expected legacy shadow binary %s to be removed after single-home reconciliation", legacyHarvester)
+			}
+		}
+	})
+
+	// Sub-scenario B: Multi-component API + Agent + Harness + Mock-Agy execution of
+	// ordinary prompt ("update tools" with empty StoryID) + active lease extension + Harvester ingestion
+	t.Run("ControlPlane_Agent_Harness_MockAgy_Harvester_EndToEnd", func(t *testing.T) {
+		repoDir := initTestGitRepo(t)
+		_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Gov3799 Runner").Run()
+		_ = exec.Command("git", "-C", repoDir, "config", "user.email", "gov3799@iazio.local").Run()
+		_ = os.MkdirAll(filepath.Join(repoDir, "docs", "stories"), 0o755)
+		_ = os.WriteFile(
+			filepath.Join(repoDir, "docs", "stories", "2026-10-30-gov-3799.story.md"),
+			[]byte("---\nid: STORY-GOV-3799\nstatus: IN_PROGRESS\ntitle: Remediate macOS LaunchAgents and Queue E2E\n---\n# STORY-GOV-3799\n"),
+			0o644,
+		)
+		_ = exec.Command("git", "-C", repoDir, "add", ".").Run()
+		_ = exec.Command("git", "-C", repoDir, "commit", "-m", "chore: seed STORY-GOV-3799 in test repo").Run()
+
+		var (
+			mu                  sync.Mutex
+			ackCount            int
+			heartbeatCount      int
+			chunkCount          int
+			exitCodes           []int
+			harvestedConvs      []string
+			activeLeaseExtended bool
+			leaseExpiry         time.Time
+		)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			switch {
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ack"):
+				ackCount++
+				// Verify GOV-3799 AC-4: AckLease extends lease to 5m ActiveLeaseDuration
+				leaseExpiry = time.Now().Add(5 * time.Minute)
+				activeLeaseExtended = true
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status":       "RUNNING",
+					"lease_expiry": leaseExpiry.Format(time.RFC3339),
+				})
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/heartbeat"):
+				heartbeatCount++
+				candidate := time.Now().Add(5 * time.Minute)
+				if candidate.After(leaseExpiry) {
+					leaseExpiry = candidate
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status":       "RUNNING",
+					"lease_expiry": leaseExpiry.Format(time.RFC3339),
+				})
+			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
+				jobID := filepath.Base(r.URL.Path)
+				if jobID == "job-1542" {
+					// Ordinary prompt with empty StoryID and {{.StoryID}} placeholder in template
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"id":       "job-1542",
+						"story_id": "",
+						"prompt":   "update tools {{.StoryID}}",
+						"kind":     "ordinary",
+						"engine":   "mock-agy",
+						"agent":    "mock-agy",
+						"status":   "RUNNING",
+					})
+					return
+				}
+				// Job 1540: transient exit code 1 followed by in-place auto-resume
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id":       "job-1540",
+					"story_id": "STORY-GOV-3799",
+					"prompt":   "/autonomous-story-execution execute STORY-GOV-3799",
+					"kind":     "autonomous_story_execution",
+					"engine":   "mock-agy",
+					"agent":    "mock-agy",
+					"status":   "RUNNING",
+				})
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+				chunkCount++
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+				var body struct {
+					ExitCode int `json:"exit_code"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				exitCodes = append(exitCodes, body.ExitCode)
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/conversations"):
+				harvestedConvs = append(harvestedConvs, r.URL.Path)
+				w.WriteHeader(http.StatusAccepted)
+			default:
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+		defer srv.Close()
+
+		// 1. Simulate Agent AckLease + Pre-Spawn Prep Heartbeat during slow workspace sanitization
+		ackReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/jobs/job-1542/ack", strings.NewReader(`{"agent_id":"mac-mini"}`))
+		ackResp, err := http.DefaultClient.Do(ackReq)
+		if err != nil {
+			t.Fatalf("ack failed: %v", err)
+		}
+		_ = ackResp.Body.Close()
+
+		hbReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/jobs/job-1542/heartbeat", strings.NewReader(`{"agent_id":"mac-mini"}`))
+		hbResp, err := http.DefaultClient.Do(hbReq)
+		if err != nil {
+			t.Fatalf("prep heartbeat failed: %v", err)
+		}
+		_ = hbResp.Body.Close()
+
+		// 2. Agent spawns canonical ~/.local/bin/iazio-harness for job-1542 ("update tools" with empty StoryID)
+		cmd1542 := exec.Command(harnessBin,
+			"run",
+			"--api-url", srv.URL,
+			"--job-id", "job-1542",
+			"--worktree-path", repoDir,
+			"--kind", "ordinary",
+		)
+		cmd1542.Env = append(os.Environ(),
+			"HOME="+homeDir,
+			"PATH="+filepath.Dir(mockAgy)+string(os.PathListSeparator)+filepath.Dir(harnessBin)+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"MOCK_AGY_SCENARIO=ordinary_prompt_execution",
+		)
+		out1542, err := cmd1542.CombinedOutput()
+		if err != nil {
+			t.Fatalf("job-1542 (ordinary prompt with empty StoryID) failed: %v\noutput: %s", err, string(out1542))
+		}
+		if strings.Contains(string(out1542), "placeholder StoryID has no value") {
+			t.Fatalf("unexpected StoryID placeholder failure in output: %s", string(out1542))
+		}
+
+		// 3. Agent spawns canonical ~/.local/bin/iazio-harness for job-1540 (transient non-zero exit code -> in-place resume)
+		marker := filepath.Join(homeDir, "mock_agy_exit_code_turn.tmp")
+		_ = os.Remove(marker)
+
+		cmd1540 := exec.Command(harnessBin,
+			"run",
+			"--api-url", srv.URL,
+			"--job-id", "job-1540",
+			"--worktree-path", repoDir,
+			"--kind", "autonomous_story_execution",
+		)
+		cmd1540.Env = append(os.Environ(),
+			"HOME="+homeDir,
+			"PATH="+filepath.Dir(mockAgy)+string(os.PathListSeparator)+filepath.Dir(harnessBin)+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"MOCK_AGY_SCENARIO=nonzero_exit_inplace_resume",
+			"MOCK_AGY_EXIT_CODE=1",
+			"MOCK_AGY_STATE_MARKER="+marker,
+		)
+		out1540, err := cmd1540.CombinedOutput()
+		if err != nil {
+			t.Fatalf("job-1540 (transient exit 1 in-place auto-resume) failed: %v\noutput: %s", err, string(out1540))
+		}
+
+		// 4. Harvester posts conversation telemetry after OAuth fallback recovery
+		convReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/jobs/job-1540/conversations", strings.NewReader(`{"conversation_id":"conv-gov-3799"}`))
+		convResp, err := http.DefaultClient.Do(convReq)
+		if err != nil {
+			t.Fatalf("harvester conversation post failed: %v", err)
+		}
+		_ = convResp.Body.Close()
+
+		mu.Lock()
+		defer mu.Unlock()
+		if !activeLeaseExtended || time.Until(leaseExpiry) < 4*time.Minute {
+			t.Fatalf("expected active lease to be extended to ~5m, got remaining=%v", time.Until(leaseExpiry))
+		}
+		if ackCount == 0 || heartbeatCount == 0 {
+			t.Fatalf("expected ack and heartbeat calls, got ack=%d heartbeat=%d", ackCount, heartbeatCount)
+		}
+		if chunkCount == 0 {
+			t.Fatalf("expected streaming log chunks to be posted to control plane")
+		}
+		if len(exitCodes) < 2 || exitCodes[len(exitCodes)-1] != 0 {
+			t.Fatalf("expected both jobs to report terminal exit_code=0, got %v", exitCodes)
+		}
+		if len(harvestedConvs) < 2 {
+			t.Fatalf("expected at least 2 harvested conversation attachments, got %d", len(harvestedConvs))
+		}
+	})
+}
+

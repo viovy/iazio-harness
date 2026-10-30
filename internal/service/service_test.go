@@ -89,7 +89,7 @@ func TestDevInstall_AtomicSwap(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		binName += ".exe"
 	}
-	destPath := filepath.Join(tempDir, ".iazio", "bin", binName)
+	destPath := filepath.Join(tempDir, ".local", "bin", binName)
 	data, err := os.ReadFile(destPath)
 	if err != nil {
 		t.Fatalf("destination binary missing: %v", err)
@@ -180,7 +180,7 @@ func TestUserDaemon_Fallback(t *testing.T) {
 		t.Fatalf("InstallUserDaemonAt failed: %v", err)
 	}
 
-	runnerScript := filepath.Join(tempDir, ".iazio", "bin", "iazio-harness-runner.sh")
+	runnerScript := filepath.Join(tempDir, ".local", "bin", "iazio-harness-runner.sh")
 	data, err := os.ReadFile(runnerScript)
 	if err != nil {
 		t.Fatalf("runner script missing: %v", err)
@@ -505,7 +505,8 @@ func TestUserDaemon_StopAndStatus(t *testing.T) {
 	}
 
 	// UninstallUserDaemonAt
-	runnerPath := filepath.Join(tempDir, ".iazio", "bin", "iazio-harness-runner.sh")
+	runnerPath := filepath.Join(tempDir, ".local", "bin", "iazio-harness-runner.sh")
+	_ = os.MkdirAll(filepath.Dir(runnerPath), 0o755)
 	_ = os.WriteFile(runnerPath, []byte("#!/bin/sh\n"), 0o755)
 	if err := UninstallUserDaemonAt(tempDir); err != nil {
 		t.Fatalf("UninstallUserDaemonAt failed: %v", err)
@@ -611,7 +612,7 @@ func TestReviveCheck_DisabledSystemd(t *testing.T) {
 	t.Setenv("IAZIO_DISABLE_SYSTEMD", "1")
 
 	// Create bin and runner script so StartUserDaemonAt works
-	binDir := filepath.Join(tempDir, ".iazio", "bin")
+	binDir := filepath.Join(tempDir, ".local", "bin")
 	_ = os.MkdirAll(binDir, 0o755)
 	bin := filepath.Join(binDir, "iazio-harness")
 	_ = os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755)
@@ -637,7 +638,7 @@ func TestPauseAndResume_DisabledSystemd(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv("IAZIO_DISABLE_SYSTEMD", "1")
 
-	binDir := filepath.Join(tempDir, ".iazio", "bin")
+	binDir := filepath.Join(tempDir, ".local", "bin")
 	_ = os.MkdirAll(binDir, 0o755)
 	bin := filepath.Join(binDir, "iazio-harness")
 	_ = os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755)

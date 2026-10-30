@@ -571,7 +571,7 @@ func DevInstall(srcBinary, home string, run func(name string, args ...string) er
 		return fmt.Errorf("source binary is a directory: %s", srcBinary)
 	}
 
-	destDir := filepath.Join(home, ".iazio", "bin")
+	destDir := filepath.Join(home, ".local", "bin")
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return err
 	}
@@ -584,8 +584,6 @@ func DevInstall(srcBinary, home string, run func(name string, args ...string) er
 	if err := copyBinaryAtomic(srcBinary, dest); err != nil {
 		return fmt.Errorf("atomic binary swap failed: %w", err)
 	}
-	localBin := filepath.Join(home, ".local", "bin", binName)
-	_ = copyBinaryAtomic(srcBinary, localBin)
 
 	// Remove maintenance lock if present
 	_ = os.Remove(filepath.Join(home, ".iazio", "maintenance.lock"))
@@ -628,6 +626,16 @@ func ReviveCheck(home string, run func(name string, args ...string) error) error
 		return nil
 	}
 
+	if os.Getenv("IAZIO_DISABLE_SYSTEMD") == "1" {
+		running, _ := StatusUserDaemonAt(home)
+		if !running {
+			binName := "iazio-harness"
+			bin := filepath.Join(home, ".local", "bin", binName)
+			_ = StartUserDaemonAt(home, bin, run)
+		}
+		return nil
+	}
+
 	switch runtime.GOOS {
 	case "darwin":
 		domain := "gui/" + strconv.Itoa(os.Getuid())
@@ -653,10 +661,7 @@ func ReviveCheck(home string, run func(name string, args ...string) error) error
 			running, _ := StatusUserDaemonAt(home)
 			if !running {
 				binName := "iazio-harness"
-				bin := filepath.Join(home, ".iazio", "bin", binName)
-				if _, err := os.Stat(bin); err != nil {
-					bin = filepath.Join(home, ".local", "bin", binName)
-				}
+				bin := filepath.Join(home, ".local", "bin", binName)
 				_ = StartUserDaemonAt(home, bin, run)
 			}
 		}
@@ -677,7 +682,7 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 		run = execCommand
 	}
 	if bin == "" {
-		bin = filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		bin = filepath.Join(home, ".local", "bin", "iazio-harness")
 		if runtime.GOOS == "windows" {
 			bin += ".exe"
 		}
@@ -759,6 +764,10 @@ func PauseService(home string, run func(name string, args ...string) error) erro
 	if err := os.WriteFile(filepath.Join(iazioDir, "maintenance.lock"), []byte(time.Now().Format(time.RFC3339)), 0o644); err != nil {
 		return err
 	}
+	if os.Getenv("IAZIO_DISABLE_SYSTEMD") == "1" {
+		_ = StopUserDaemonAt(home)
+		return nil
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		domain := "gui/" + strconv.Itoa(os.Getuid())
@@ -788,6 +797,13 @@ func ResumeService(home string, run func(name string, args ...string) error) err
 		run = execCommand
 	}
 	_ = os.Remove(filepath.Join(home, ".iazio", "maintenance.lock"))
+	if os.Getenv("IAZIO_DISABLE_SYSTEMD") == "1" {
+		binName := "iazio-harness"
+		bin := filepath.Join(home, ".local", "bin", binName)
+		_ = StartUserDaemonAt(home, bin, run)
+		return nil
+	}
+
 	switch runtime.GOOS {
 	case "darwin":
 		domain := "gui/" + strconv.Itoa(os.Getuid())
@@ -799,10 +815,7 @@ func ResumeService(home string, run func(name string, args ...string) error) err
 			_ = run("systemctl", "--user", "start", "iazio-harness.service")
 		} else {
 			binName := "iazio-harness"
-			bin := filepath.Join(home, ".iazio", "bin", binName)
-			if _, err := os.Stat(bin); err != nil {
-				bin = filepath.Join(home, ".local", "bin", binName)
-			}
+			bin := filepath.Join(home, ".local", "bin", binName)
 			_ = StartUserDaemonAt(home, bin, run)
 		}
 	}
@@ -887,7 +900,7 @@ func InstallUserDaemonAt(home, bin string, run func(name string, args ...string)
 	if run == nil {
 		run = execCommand
 	}
-	dir := filepath.Join(home, ".iazio", "bin")
+	dir := filepath.Join(home, ".local", "bin")
 	logDir := filepath.Join(home, ".iazio", "logs")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -928,7 +941,7 @@ func StartUserDaemonAt(home, bin string, run func(name string, args ...string) e
 	if run == nil {
 		run = execCommand
 	}
-	runnerPath := filepath.Join(home, ".iazio", "bin", "iazio-harness-runner.sh")
+	runnerPath := filepath.Join(home, ".local", "bin", "iazio-harness-runner.sh")
 	if _, err := os.Stat(runnerPath); err != nil {
 		return fmt.Errorf("runner script missing; run 'service install' first")
 	}
@@ -985,7 +998,7 @@ func StatusUserDaemonAt(home string) (bool, int) {
 // UninstallUserDaemonAt cleans up fallback runner scripts and terminates daemon.
 func UninstallUserDaemonAt(home string, run ...func(name string, args ...string) error) error {
 	_ = StopUserDaemonAt(home)
-	runnerPath := filepath.Join(home, ".iazio", "bin", "iazio-harness-runner.sh")
+	runnerPath := filepath.Join(home, ".local", "bin", "iazio-harness-runner.sh")
 	_ = os.Remove(runnerPath)
 	return nil
 }
