@@ -86,10 +86,12 @@ func TestDevInstall_AtomicSwap(t *testing.T) {
 	}
 
 	binName := "iazio-harness"
+	destDir := filepath.Join(tempDir, ".local", "bin")
 	if runtime.GOOS == "windows" {
 		binName += ".exe"
+		destDir = filepath.Join(tempDir, "bin")
 	}
-	destPath := filepath.Join(tempDir, ".local", "bin", binName)
+	destPath := filepath.Join(destDir, binName)
 	data, err := os.ReadFile(destPath)
 	if err != nil {
 		t.Fatalf("destination binary missing: %v", err)
@@ -99,12 +101,51 @@ func TestDevInstall_AtomicSwap(t *testing.T) {
 	}
 }
 
+func TestReconcileServiceConfiguration_PurgesLegacyServicesADR002(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Seed legacy service descriptors across Linux, Darwin, and Windows layouts
+	unitDir := filepath.Join(tempDir, ".config", "systemd", "user")
+	_ = os.MkdirAll(unitDir, 0o755)
+	legacyUnit := filepath.Join(unitDir, "iazio-harness.service")
+	_ = os.WriteFile(legacyUnit, []byte("[Unit]\n"), 0o644)
+
+	launchDir := filepath.Join(tempDir, "Library", "LaunchAgents")
+	_ = os.MkdirAll(launchDir, 0o755)
+	legacyPlist := filepath.Join(launchDir, harnessLabel+".plist")
+	_ = os.WriteFile(legacyPlist, []byte("<plist/>\n"), 0o644)
+
+	tasksDir := filepath.Join(tempDir, ".iazio", "tasks")
+	_ = os.MkdirAll(tasksDir, 0o755)
+	legacyBat := filepath.Join(tasksDir, "iazio-harness.bat")
+	legacyXML := filepath.Join(tasksDir, "iazio-harness.xml")
+	_ = os.WriteFile(legacyBat, []byte("@echo off\r\n"), 0o755)
+	_ = os.WriteFile(legacyXML, []byte("<Task/>\r\n"), 0o644)
+
+	cleanup := SetExecCommandForTest(func(name string, args ...string) error {
+		return nil
+	})
+	defer cleanup()
+
+	if err := ReconcileServiceConfiguration(tempDir, "", nil); err != nil {
+		t.Fatalf("ReconcileServiceConfiguration failed: %v", err)
+	}
+
+	for _, p := range []string{legacyUnit, legacyPlist, legacyBat, legacyXML} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("ADR-002 violation: expected legacy service artifact %s to be purged, err=%v", p, err)
+		}
+	}
+}
+
 func TestPauseAndResumeService(t *testing.T) {
 	tempDir := t.TempDir()
 	calls := []string{}
 	cleanup := SetExecCommandForTest(func(name string, args ...string) error {
 		calls = append(calls, name+" "+strings.Join(args, " "))
 		return nil
+	}, func(name string, args ...string) ([]byte, error) {
+		return []byte("TaskName: \\iazio-harness\nStatus: Ready\n"), nil
 	})
 	defer cleanup()
 
@@ -141,6 +182,8 @@ func TestLinuxResilienceUnits(t *testing.T) {
 	cleanup := SetExecCommandForTest(func(name string, args ...string) error {
 		calls = append(calls, name+" "+strings.Join(args, " "))
 		return nil
+	}, func(name string, args ...string) ([]byte, error) {
+		return []byte("TaskName: \\iazio-harness\nStatus: Ready\n"), nil
 	})
 	defer cleanup()
 
@@ -173,6 +216,8 @@ func TestUserDaemon_Fallback(t *testing.T) {
 	cleanup := SetExecCommandForTest(func(name string, args ...string) error {
 		calls = append(calls, name+" "+strings.Join(args, " "))
 		return nil
+	}, func(name string, args ...string) ([]byte, error) {
+		return []byte("TaskName: \\iazio-harness\nStatus: Ready\n"), nil
 	})
 	defer cleanup()
 
@@ -180,7 +225,7 @@ func TestUserDaemon_Fallback(t *testing.T) {
 		t.Fatalf("InstallUserDaemonAt failed: %v", err)
 	}
 
-	runnerScript := filepath.Join(tempDir, ".local", "bin", "iazio-harness-runner.sh")
+	runnerScript := filepath.Join(tempDir, ".iazio", "bin", "iazio-harness-runner.sh")
 	data, err := os.ReadFile(runnerScript)
 	if err != nil {
 		t.Fatalf("runner script missing: %v", err)
@@ -505,8 +550,7 @@ func TestUserDaemon_StopAndStatus(t *testing.T) {
 	}
 
 	// UninstallUserDaemonAt
-	runnerPath := filepath.Join(tempDir, ".local", "bin", "iazio-harness-runner.sh")
-	_ = os.MkdirAll(filepath.Dir(runnerPath), 0o755)
+	runnerPath := filepath.Join(tempDir, ".iazio", "bin", "iazio-harness-runner.sh")
 	_ = os.WriteFile(runnerPath, []byte("#!/bin/sh\n"), 0o755)
 	if err := UninstallUserDaemonAt(tempDir); err != nil {
 		t.Fatalf("UninstallUserDaemonAt failed: %v", err)
@@ -535,6 +579,7 @@ func TestResolveHarnessAPIURL_ConfigFiles(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv("IAZIO_HARNESS_API_URL", "")
 	t.Setenv("HOME", tempDir)
+	t.Setenv("USERPROFILE", tempDir)
 
 	// initially empty -> DefaultFleetAPI
 	if u := resolveHarnessAPIURL(); u != DefaultFleetAPI {
@@ -612,7 +657,7 @@ func TestReviveCheck_DisabledSystemd(t *testing.T) {
 	t.Setenv("IAZIO_DISABLE_SYSTEMD", "1")
 
 	// Create bin and runner script so StartUserDaemonAt works
-	binDir := filepath.Join(tempDir, ".local", "bin")
+	binDir := filepath.Join(tempDir, ".iazio", "bin")
 	_ = os.MkdirAll(binDir, 0o755)
 	bin := filepath.Join(binDir, "iazio-harness")
 	_ = os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755)
@@ -623,6 +668,8 @@ func TestReviveCheck_DisabledSystemd(t *testing.T) {
 	cleanup := SetExecCommandForTest(func(name string, args ...string) error {
 		calls = append(calls, name+" "+strings.Join(args, " "))
 		return nil
+	}, func(name string, args ...string) ([]byte, error) {
+		return []byte("TaskName: \\iazio-harness\nStatus: Ready\n"), nil
 	})
 	defer cleanup()
 
@@ -638,7 +685,7 @@ func TestPauseAndResume_DisabledSystemd(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv("IAZIO_DISABLE_SYSTEMD", "1")
 
-	binDir := filepath.Join(tempDir, ".local", "bin")
+	binDir := filepath.Join(tempDir, ".iazio", "bin")
 	_ = os.MkdirAll(binDir, 0o755)
 	bin := filepath.Join(binDir, "iazio-harness")
 	_ = os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755)
@@ -649,6 +696,8 @@ func TestPauseAndResume_DisabledSystemd(t *testing.T) {
 	cleanup := SetExecCommandForTest(func(name string, args ...string) error {
 		calls = append(calls, name+" "+strings.Join(args, " "))
 		return nil
+	}, func(name string, args ...string) ([]byte, error) {
+		return []byte("TaskName: \\iazio-harness\nStatus: Ready\n"), nil
 	})
 	defer cleanup()
 
@@ -671,6 +720,7 @@ func TestIsWSL_Call(t *testing.T) {
 func TestInstallWrappers(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv("HOME", tempDir)
+	t.Setenv("USERPROFILE", tempDir)
 	cleanup := SetExecCommandForTest(func(name string, args ...string) error {
 		return nil
 	})
@@ -711,6 +761,7 @@ func TestDevInstall_ErrorsAndStartDaemonErrors(t *testing.T) {
 func TestInstallDarwin_And_InstallWindows(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
+	t.Setenv("USERPROFILE", tempHome)
 	t.Setenv("WINDIR", tempHome)
 
 	_ = InstallDarwin("/usr/local/bin/iazio-harness")

@@ -2651,17 +2651,9 @@ func runServiceCommand(args []string) error {
 			fmt.Println(service.ActionText(goos, action, bin, force))
 			return nil
 		}
-		switch goos {
-		case "darwin":
-			return service.InstallDarwin(bin)
-		case "windows":
-			return service.InstallWindows(bin)
-		default:
-			if service.IsSystemdAvailable() {
-				return service.InstallLinux(bin)
-			}
-			return service.InstallUserDaemon(bin)
-		}
+		_ = service.ReconcileServiceConfiguration(home, bin, nil)
+		fmt.Println("ADR-002 policy: iazio-harness is an ephemeral job runner and must never be installed as a user or system service (purged any legacy service units).")
+		return nil
 	case "dev-install":
 		src := bin
 		if len(extraArgs) > 0 {
@@ -2674,7 +2666,7 @@ func runServiceCommand(args []string) error {
 		if err := service.DevInstall(src, home, nil); err != nil {
 			return err
 		}
-		fmt.Println("iazio-harness dev version installed and supervisor active")
+		fmt.Println("iazio-harness dev binary installed to canonical bin directory (no service installed per ADR-002)")
 		return nil
 	case "pause":
 		if dry {
