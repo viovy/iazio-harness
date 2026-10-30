@@ -368,9 +368,21 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			return failCode
 		}
 		_ = os.Remove(stateMarker)
+		if entries, err := os.ReadDir(filepath.Join("docs", "stories")); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() && strings.HasSuffix(e.Name(), ".story.md") {
+					p := filepath.Join("docs", "stories", e.Name())
+					if b, err := os.ReadFile(p); err == nil && strings.Contains(string(b), "status: IN_PROGRESS") {
+						updated := strings.ReplaceAll(string(b), "status: IN_PROGRESS", "status: DONE")
+						_ = os.WriteFile(p, []byte(updated), 0644)
+						_ = exec.Command("git", "add", p).Run()
+					}
+				}
+			}
+		}
 		_ = os.WriteFile("inplace_resumed_file.txt", []byte("inplace recovery content\n"), 0644)
 		_ = exec.Command("git", "add", "inplace_resumed_file.txt").Run()
-		_ = exec.Command("git", "commit", "-m", "chore: auto-resumed in-place").Run()
+		_ = exec.Command("git", "commit", "-m", "chore: auto-resumed in-place (STORY-GOV-3799)").Run()
 		if conversationID != "" {
 			fmt.Fprintf(stdout, "Resumed conversation %s\n", conversationID)
 		}

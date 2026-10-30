@@ -2217,7 +2217,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		combinedOutput = engineLogStr + "\n" + string(spoolLogData)
 
 		diagStoryID := currentBoundStoryID
-		if diagStoryID == "" || diagStoryID == "pending_harness_creation" {
+		if isASE && (diagStoryID == "" || diagStoryID == "pending_harness_creation") {
 			diagStoryID = resolveLiveStoryID(worktree, combinedOutput, job.StoryID)
 		}
 		diagReport = diagnostics.Diagnose(diagnostics.DiagnosticInput{
@@ -2242,7 +2242,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	postSnapshot, _ := proof.CaptureWorktreeSnapshot(targetDir)
 
 	diagFinalStoryID := currentBoundStoryID
-	if diagFinalStoryID == "" || diagFinalStoryID == "pending_harness_creation" {
+	if isASE && (diagFinalStoryID == "" || diagFinalStoryID == "pending_harness_creation") {
 		diagFinalStoryID = resolveLiveStoryID(worktree, combinedOutput, job.StoryID)
 	}
 	diagReport = diagnostics.Diagnose(diagnostics.DiagnosticInput{
