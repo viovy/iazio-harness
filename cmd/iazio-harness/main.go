@@ -2470,9 +2470,15 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 
 func resolveCommit() string {
 	if sha := strings.TrimSpace(buildCommitSHA); sha != "" && sha != "unknown" {
+		if len(sha) > 7 {
+			return sha[:7]
+		}
 		return sha
 	}
 	if sha := strings.TrimSpace(commit); sha != "" && sha != "unknown" {
+		if len(sha) > 7 {
+			return sha[:7]
+		}
 		return sha
 	}
 	return "unknown"
@@ -2517,8 +2523,8 @@ func formatVersion() string {
 	if sha == "" || sha == "unknown" {
 		return "iazio-harness " + version
 	}
-	if len(sha) > 12 {
-		sha = sha[:12]
+	if len(sha) > 7 {
+		sha = sha[:7]
 	}
 	return "iazio-harness " + version + "+" + sha
 }

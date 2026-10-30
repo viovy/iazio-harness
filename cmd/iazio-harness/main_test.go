@@ -77,8 +77,8 @@ func TestFormatVersion(t *testing.T) {
 	defer func() { commit = origCommit }()
 	commit = "1234567890abcdef1234"
 	vWithCommit := formatVersion()
-	if !strings.Contains(vWithCommit, "+1234567890ab") {
-		t.Fatalf("expected truncated commit in formatVersion, got %s", vWithCommit)
+	if !strings.Contains(vWithCommit, "+1234567") || strings.Contains(vWithCommit, "+12345678") {
+		t.Fatalf("expected 7-char truncated commit in formatVersion, got %s", vWithCommit)
 	}
 }
 
@@ -2662,7 +2662,7 @@ func TestFormatVersionAndHelpers(t *testing.T) {
 	version = "1.0.0"
 
 	commit := resolveCommit()
-	if commit != "abcdef1234567890" {
+	if commit != "abcdef1" {
 		t.Fatalf("unexpected commit: %s", commit)
 	}
 
@@ -2677,12 +2677,12 @@ func TestFormatVersionAndHelpers(t *testing.T) {
 	}
 
 	jsonStr := formatVersionJSON()
-	if !strings.Contains(jsonStr, "iazio-harness") || !strings.Contains(jsonStr, "abcdef1234567890") {
+	if !strings.Contains(jsonStr, "iazio-harness") || !strings.Contains(jsonStr, "abcdef1") {
 		t.Fatalf("unexpected formatVersionJSON: %s", jsonStr)
 	}
 
 	txtStr := formatVersion()
-	if !strings.Contains(txtStr, "iazio-harness 1.0.0+abcdef123456") {
+	if !strings.Contains(txtStr, "iazio-harness 1.0.0+abcdef1") {
 		t.Fatalf("unexpected formatVersion: %s", txtStr)
 	}
 
