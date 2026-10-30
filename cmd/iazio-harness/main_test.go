@@ -1652,27 +1652,12 @@ func TestWriteErrorHelpers(t *testing.T) {
 	_ = run([]string{"heal-ase", "--repo=" + tmpFleet})
 	_ = run([]string{"heal-ase", "--worktree-path", tmpFleet})
 
-	// Service commands dry-run and actions
-	if err := run([]string{"service", "install", "--dry-run"}); err != nil {
-		t.Errorf("unexpected error on service install --dry-run: %v", err)
+	// Service and daemon commands are rejected: iazio-harness is a short-lived CLI runner
+	if err := run([]string{"service", "status"}); err == nil {
+		t.Errorf("expected error on service command")
 	}
-	if err := run([]string{"service", "dev-install", "--dry-run"}); err != nil {
-		t.Errorf("unexpected error on service dev-install --dry-run: %v", err)
-	}
-	if err := run([]string{"service", "pause", "--dry-run"}); err != nil {
-		t.Errorf("unexpected error on service pause --dry-run: %v", err)
-	}
-	if err := run([]string{"service", "resume", "--dry-run"}); err != nil {
-		t.Errorf("unexpected error on service resume --dry-run: %v", err)
-	}
-	if err := run([]string{"service", "revive-check", "--dry-run"}); err != nil {
-		t.Errorf("unexpected error on service revive-check --dry-run: %v", err)
-	}
-	if err := run([]string{"service", "status"}); err != nil {
-		t.Errorf("unexpected error on service status: %v", err)
-	}
-	if err := run([]string{"service", "invalid-action"}); err == nil {
-		t.Errorf("expected error on unknown service action")
+	if err := run([]string{"daemon"}); err == nil {
+		t.Errorf("expected error on daemon command")
 	}
 }
 
@@ -1898,18 +1883,12 @@ func TestHasRunningGitProcess(t *testing.T) {
 	}
 }
 
-func TestRunServiceCommand(t *testing.T) {
-	// Status
-	if err := runServiceCommand([]string{"status"}); err != nil {
-		t.Fatalf("unexpected error running service status: %v", err)
+func TestRunServiceAndDaemonRejected(t *testing.T) {
+	if err := run([]string{"service", "install"}); err == nil {
+		t.Fatalf("expected error for service subcommand, got nil")
 	}
-
-	// Dry run install
-	_ = runServiceCommand([]string{"install", "--dry-run"})
-
-	// Unknown action
-	if err := runServiceCommand([]string{"unknown-action-xyz"}); err == nil {
-		t.Fatalf("expected error for unknown action, got nil")
+	if err := run([]string{"daemon"}); err == nil {
+		t.Fatalf("expected error for daemon subcommand, got nil")
 	}
 }
 
@@ -2151,16 +2130,6 @@ func TestRunJobWithContext_Chunk(t *testing.T) {
 	if err := runJobWithContext(context.Background(), args); err != nil {
 		t.Fatalf("expected nil err, got %v", err)
 	}
-}
-
-func TestRunServiceCommand_DryRun(t *testing.T) {
-	_ = runServiceCommand([]string{"install", "--dry-run"})
-	_ = runServiceCommand([]string{"dev-install", "--dry-run"})
-	_ = runServiceCommand([]string{"pause", "--dry-run"})
-	_ = runServiceCommand([]string{"resume", "--dry-run"})
-	_ = runServiceCommand([]string{"revive", "--dry-run"})
-	_ = runServiceCommand([]string{"uninstall", "--dry-run"})
-	_ = runServiceCommand([]string{"unknown-action"})
 }
 
 func TestResolveLiveStoryID_Patterns(t *testing.T) {

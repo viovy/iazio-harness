@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -453,15 +454,16 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Verify iazio-harness service dry-run renders ~/.local/bin/iazio-harness and never ~/.iazio/bin
+		// Verify iazio-harness rejects service and daemon commands (it is a short-lived child CLI, not a service)
 		cmdDry := exec.Command(harnessBin, "service", "install", "--dry-run")
 		cmdDry.Env = append(os.Environ(), "HOME="+homeDir)
-		outDry, err := cmdDry.CombinedOutput()
-		if err != nil {
-			t.Fatalf("iazio-harness service install --dry-run failed: %v (%s)", err, string(outDry))
+		if outDry, err := cmdDry.CombinedOutput(); err == nil {
+			t.Fatalf("expected iazio-harness service install to be rejected, got success: %s", string(outDry))
 		}
-		if strings.Contains(string(outDry), ".iazio/bin") {
-			t.Fatalf("expected service dry-run to reference ~/.local/bin, got: %s", string(outDry))
+		cmdDaemon := exec.Command(harnessBin, "daemon")
+		cmdDaemon.Env = append(os.Environ(), "HOME="+homeDir)
+		if outDaemon, err := cmdDaemon.CombinedOutput(); err == nil {
+			t.Fatalf("expected iazio-harness daemon to be rejected, got success: %s", string(outDaemon))
 		}
 
 		// If sibling iazio-agent and iazio-harvester repos are present in the workspace,
@@ -486,6 +488,11 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 			legacyPlist := fmt.Sprintf(`<plist><dict><key>ProgramArguments</key><array><string>%s</string></array></dict></plist>`, legacyAgent)
 			_ = os.WriteFile(plistPath, []byte(legacyPlist), 0o644)
 
+			systemdUserDir := filepath.Join(homeDir, ".config", "systemd", "user")
+			_ = os.MkdirAll(systemdUserDir, 0o755)
+			legacyHarnessUnit := filepath.Join(systemdUserDir, "iazio-harness.service")
+			_ = os.WriteFile(legacyHarnessUnit, []byte("[Unit]\nDescription=legacy harness\n"), 0o644)
+
 			cmdVer := exec.Command(agentBin, "version")
 			cmdVer.Env = append(os.Environ(), "HOME="+homeDir, "XPC_SERVICE_NAME=io.iazio.iazio-agent")
 			if out, err := cmdVer.CombinedOutput(); err != nil {
@@ -497,9 +504,19 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 			if _, err := os.Stat(stagedHarvesterNext); !os.IsNotExist(err) {
 				t.Fatalf("expected stale staged binary %s to be removed after single-home reconciliation", stagedHarvesterNext)
 			}
-			plistBytes, _ := os.ReadFile(plistPath)
-			if strings.Contains(string(plistBytes), ".iazio/bin/iazio-agent") {
-				t.Fatalf("expected LaunchAgent plist to be rewritten to ~/.local/bin/iazio-agent before shadow binary removal, got:\n%s", string(plistBytes))
+			if runtime.GOOS == "darwin" {
+				plistBytes, _ := os.ReadFile(plistPath)
+				if strings.Contains(string(plistBytes), ".iazio/bin/iazio-agent") {
+					t.Fatalf("expected LaunchAgent plist to be rewritten to ~/.local/bin/iazio-agent before shadow binary removal, got:\n%s", string(plistBytes))
+				}
+			} else if runtime.GOOS == "linux" {
+				unitBytes, _ := os.ReadFile(filepath.Join(systemdUserDir, "iazio-agent.service"))
+				if !strings.Contains(string(unitBytes), agentBin) {
+					t.Fatalf("expected systemd unit to reference %s, got:\n%s", agentBin, string(unitBytes))
+				}
+				if _, err := os.Stat(legacyHarnessUnit); !os.IsNotExist(err) {
+					t.Fatalf("expected legacy iazio-harness.service %s to be purged on reconcile", legacyHarnessUnit)
+				}
 			}
 		}
 		if _, err := os.Stat(harvesterMainDir); err == nil {

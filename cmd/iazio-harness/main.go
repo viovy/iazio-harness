@@ -12,15 +12,12 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/ase/gate"
@@ -33,7 +30,6 @@ import (
 	"github.com/viovy/iazio-harness/internal/prompt"
 	"github.com/viovy/iazio-harness/internal/proof"
 	"github.com/viovy/iazio-harness/internal/repolock"
-	"github.com/viovy/iazio-harness/internal/service"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 	"github.com/viovy/iazio-harness/internal/spool"
 	"github.com/viovy/iazio-harness/internal/story"
@@ -64,7 +60,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: iazio-harness version|auth|run|story|prompt|codebase|status|heal-ase|discard|service|daemon")
+		return fmt.Errorf("usage: iazio-harness version|auth|run|story|prompt|codebase|status|heal-ase|discard")
 	}
 	var spanOpts = []telemetry.SpanOption{
 		telemetry.WithKind("INTERNAL"),
@@ -112,10 +108,6 @@ func run(args []string) error {
 		return runHealASECommand(args[1:])
 	case "discard", "clean-git", "git-clean", "reset-workspace":
 		return runDiscardCommand(args[1:])
-	case "service":
-		return runServiceCommand(args[1:])
-	case "daemon":
-		return runDaemonCommand(args[1:])
 	case "verify-release", "verify-live-release":
 		return runVerifyReleaseCommand(args[1:])
 	default:
@@ -2613,161 +2605,6 @@ func runHealASECommand(args []string) error {
 	}
 	fmt.Printf("Successfully healed ASE state and reaped orphaned processes for %s\n", repoPath)
 	return nil
-}
-
-func runServiceCommand(args []string) error {
-	action := "status"
-	force := false
-	dry := false
-	var extraArgs []string
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--dry-run":
-			dry = true
-		case "--force", "-f":
-			force = true
-		default:
-			if !strings.HasPrefix(args[i], "-") && action == "status" {
-				action = args[i]
-			} else {
-				extraArgs = append(extraArgs, args[i])
-			}
-		}
-	}
-
-	bin, err := os.Executable()
-	if err != nil {
-		bin = "iazio-harness"
-	} else if resolved, err := filepath.EvalSymlinks(bin); err == nil {
-		bin = resolved
-	}
-
-	home, _ := os.UserHomeDir()
-	goos := runtime.GOOS
-
-	switch action {
-	case "install":
-		if dry {
-			fmt.Println(service.ActionText(goos, action, bin, force))
-			return nil
-		}
-		_ = service.ReconcileServiceConfiguration(home, bin, nil)
-		fmt.Println("ADR-002 policy: iazio-harness is an ephemeral job runner and must never be installed as a user or system service (purged any legacy service units).")
-		return nil
-	case "dev-install":
-		src := bin
-		if len(extraArgs) > 0 {
-			src = extraArgs[0]
-		}
-		if dry {
-			fmt.Printf("hot-swap %s and restart supervisor\n", src)
-			return nil
-		}
-		if err := service.DevInstall(src, home, nil); err != nil {
-			return err
-		}
-		fmt.Println("iazio-harness dev binary installed to canonical bin directory (no service installed per ADR-002)")
-		return nil
-	case "pause":
-		if dry {
-			fmt.Println("pause supervisor and place maintenance lock")
-			return nil
-		}
-		if err := service.PauseService(home, nil); err != nil {
-			return err
-		}
-		fmt.Println("iazio-harness service paused (maintenance mode active)")
-		return nil
-	case "resume":
-		if dry {
-			fmt.Println("resume supervisor and remove maintenance lock")
-			return nil
-		}
-		if err := service.ResumeService(home, nil); err != nil {
-			return err
-		}
-		fmt.Println("iazio-harness service resumed (maintenance mode cleared)")
-		return nil
-	case "revive-check":
-		if dry {
-			fmt.Println("check supervisor health and auto-revive if inactive")
-			return nil
-		}
-		return service.ReviveCheck(home, nil)
-	case "reconcile":
-		if dry {
-			fmt.Println("reconcile user service configuration and watchdog units")
-			return nil
-		}
-		if err := service.ReconcileServiceConfiguration(home, bin, nil); err != nil {
-			return err
-		}
-		fmt.Println("iazio-harness user service configuration reconciled")
-		return nil
-	case "start", "stop", "restart", "uninstall":
-		if dry {
-			fmt.Println(service.ActionText(goos, action, bin, force))
-			return nil
-		}
-		if goos == "linux" && !service.IsSystemdAvailable() {
-			switch action {
-			case "start":
-				return service.StartUserDaemonAt(home, bin, nil)
-			case "stop":
-				return service.StopUserDaemonAt(home)
-			case "restart":
-				_ = service.StopUserDaemonAt(home)
-				return service.StartUserDaemonAt(home, bin, nil)
-			case "uninstall":
-				return service.UninstallUserDaemonAt(home)
-			}
-		}
-		_, err := service.Apply(goos, action, bin, false, force, nil)
-		return err
-	case "status":
-		if goos == "linux" && !service.IsSystemdAvailable() {
-			running, pid := service.StatusUserDaemonAt(home)
-			if running {
-				fmt.Printf("running (pid: %d)\n", pid)
-				return nil
-			}
-			fmt.Println("installed but not running")
-			return nil
-		}
-		txt := service.ActionText(goos, action, bin, force)
-		fmt.Println(txt)
-		return nil
-	default:
-		return fmt.Errorf("unknown service action %s", action)
-	}
-}
-
-func runDaemonCommand(args []string) error {
-	interval := watchdog.DefaultInterval
-	for i := 0; i < len(args); i++ {
-		if (args[i] == "--interval" || args[i] == "-i") && i+1 < len(args) {
-			i++
-			if d, err := time.ParseDuration(args[i]); err == nil {
-				interval = d
-			}
-		}
-	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	log.Printf("[iazio-harness] Starting execution supervisor daemon (pid: %d, interval: %v)...", os.Getpid(), interval)
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		binPath := filepath.Join(home, ".local", "bin", "iazio-harness")
-		if runtime.GOOS == "windows" {
-			binPath += ".exe"
-		}
-		go func() {
-			_ = service.ReconcileServiceConfiguration(home, binPath, nil)
-		}()
-	}
-	wd := watchdog.New(watchdog.Options{})
-	return wd.Run(ctx, interval)
 }
 
 func runVerifyReleaseCommand(args []string) error {

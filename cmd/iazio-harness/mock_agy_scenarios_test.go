@@ -15,7 +15,6 @@ import (
 
 	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/engines"
-	"github.com/viovy/iazio-harness/internal/service"
 )
 
 // buildMockAgy compiles cmd/mock-agy into a temporary directory and sets PATH.
@@ -1237,31 +1236,21 @@ func TestMockAgy_Scenario14_NonZeroExitCodes_InPlaceAutoResume(t *testing.T) {
 	}
 }
 
-// Scenario 15: Canonical ~/.local/bin/iazio-harness path resolution
+// Scenario 15: Canonical ~/.local/bin/iazio-harness path resolution and rejection of daemon/service mode
 func TestMockAgy_Scenario15_CanonicalLocalBinPathResolution(t *testing.T) {
-	mockAgyBin := buildMockAgy(t)
+	_ = buildMockAgy(t)
 	tmpHome := os.Getenv("HOME")
 	localBinDir := filepath.Join(tmpHome, ".local", "bin")
 	if err := os.MkdirAll(localBinDir, 0o755); err != nil {
 		t.Fatalf("failed to create ~/.local/bin: %v", err)
 	}
 
-	cleanup := service.SetExecCommandForTest(func(name string, args ...string) error {
-		return nil
-	})
-	defer cleanup()
-
-	// 1. Verify DevInstall installs into canonical ~/.local/bin/iazio-harness
-	if err := service.DevInstall(mockAgyBin, tmpHome, nil); err != nil {
-		t.Fatalf("DevInstall failed: %v", err)
+	// 1. Verify service and daemon subcommands are rejected (iazio-harness is a short-lived CLI runner)
+	if err := run([]string{"service", "install"}); err == nil {
+		t.Fatalf("expected service install to be rejected on iazio-harness")
 	}
-	canonicalBin := filepath.Join(localBinDir, "iazio-harness")
-	if _, err := os.Stat(canonicalBin); err != nil {
-		t.Fatalf("expected canonical binary at %s: %v", canonicalBin, err)
-	}
-	legacyBin := filepath.Join(tmpHome, ".iazio", "bin", "iazio-harness")
-	if _, err := os.Stat(legacyBin); !os.IsNotExist(err) {
-		t.Fatalf("expected legacy ~/.iazio/bin/iazio-harness not to be created, got err=%v", err)
+	if err := run([]string{"daemon"}); err == nil {
+		t.Fatalf("expected daemon subcommand to be rejected on iazio-harness")
 	}
 
 	// 2. Verify ChildEnv injects ~/.local/bin and not ~/.iazio/bin
