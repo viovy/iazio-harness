@@ -322,4 +322,3 @@ func TestSessionExists(t *testing.T) {
 		t.Errorf("expected true after creating brainDir/convID")
 	}
 }
-

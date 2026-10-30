@@ -4,6 +4,8 @@ package autopilot
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -11,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,12 +21,46 @@ import (
 	"github.com/viovy/iazio-harness/internal/redact"
 )
 
-var storyIDRegex = regexp.MustCompile(`\b(STORY-[A-Za-z0-9_-]+)\b`)
+var (
+	storyIDRegex = regexp.MustCompile(`\b(STORY-[A-Za-z0-9_-]+)\b`)
+	hex16Regex   = regexp.MustCompile(`^[0-9a-f]{16}$`)
+	hex32Regex   = regexp.MustCompile(`^[0-9a-f]{32}$`)
+)
 
 const (
-	defaultPromptTimeout = 900 * time.Second
+	// DefaultPromptTimeout is the default execution window for long-running agentic prompts (7 days).
+	DefaultPromptTimeout = 7 * 24 * time.Hour
+	defaultPromptTimeout = DefaultPromptTimeout
 	defaultGracePeriod   = 5 * time.Second
 )
+
+// ResolveDefaultPromptTimeout returns the default prompt timeout, honoring IAZIO_PROMPT_TIMEOUT_SECONDS when set to a positive integer.
+func ResolveDefaultPromptTimeout() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("IAZIO_PROMPT_TIMEOUT_SECONDS")); raw != "" {
+		if sec, err := strconv.Atoi(raw); err == nil && sec > 0 {
+			return time.Duration(sec) * time.Second
+		}
+	}
+	return DefaultPromptTimeout
+}
+
+func formatW3CTraceParent(rawTraceID, rawSpanID string) (string, string) {
+	traceLower := strings.ToLower(strings.TrimSpace(rawTraceID))
+	if !hex32Regex.MatchString(traceLower) || traceLower == "00000000000000000000000000000000" {
+		sum := sha256.Sum256([]byte(rawTraceID))
+		traceLower = hex.EncodeToString(sum[:16])
+	}
+	spanLower := strings.ToLower(strings.TrimSpace(rawSpanID))
+	if !hex16Regex.MatchString(spanLower) || spanLower == "0000000000000000" {
+		seed := rawSpanID
+		if strings.TrimSpace(seed) == "" {
+			seed = fmt.Sprintf("span-%d", time.Now().UnixNano())
+		}
+		sum := sha256.Sum256([]byte(seed))
+		spanLower = hex.EncodeToString(sum[:8])
+	}
+	return traceLower, fmt.Sprintf("00-%s-%s-01", traceLower, spanLower)
+}
 
 // RunPromptOptions specifies parameters for executing a prompt via autopilot.
 type RunPromptOptions struct {
@@ -70,6 +107,7 @@ type CLIPromptRunner struct {
 	AutopilotBinary string
 	GitBinary       string
 	GracePeriod     time.Duration
+	PreFlightHook   func(ctx context.Context, workingDir, storyID string) error
 }
 
 // NewPromptRunner creates a CLIPromptRunner.
@@ -104,7 +142,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 
 	timeout := opts.Timeout
 	if timeout <= 0 {
-		timeout = defaultPromptTimeout
+		timeout = ResolveDefaultPromptTimeout()
 	}
 
 	gracePeriod := opts.GracePeriod
@@ -148,8 +186,15 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		}
 	}
 
-	if storyID != "" && engines.PreFlightHook != nil {
-		if pfErr := engines.PreFlightHook(ctx, opts.WorkingDir, storyID); pfErr != nil {
+	pfHook := r.PreFlightHook
+	if pfHook == nil {
+		pfHook = engines.PreFlightHook
+	}
+	if storyID != "" && pfHook != nil {
+		if pfErr := pfHook(ctx, opts.WorkingDir, storyID); pfErr != nil {
+			if errors.Is(pfErr, engines.ErrStoryNotFound) || strings.Contains(strings.ToLower(pfErr.Error()), "story not found") {
+				return nil, fmt.Errorf("pre-flight story materialization failed for %s: %w", storyID, pfErr)
+			}
 			log.Printf("[prompt_runner] warning: PreFlightHook materialization error for story %s: %v", storyID, pfErr)
 		}
 	}
@@ -195,10 +240,11 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		traceID = os.Getenv("ZIPKIN_TRACE_ID")
 	}
 	if traceID != "" {
+		_, traceparent := formatW3CTraceParent(traceID, opts.PromptID)
 		cmd.Env = append(cmd.Env,
 			"ZIPKIN_TRACE_ID="+traceID,
 			"TRACE_ID="+traceID,
-			fmt.Sprintf("TRACEPARENT=00-%s-%s-01", traceID, opts.PromptID),
+			"TRACEPARENT="+traceparent,
 		)
 	} else if tp := os.Getenv("TRACEPARENT"); tp != "" {
 		cmd.Env = append(cmd.Env, "TRACEPARENT="+tp)

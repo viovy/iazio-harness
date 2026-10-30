@@ -209,18 +209,23 @@ func MaterializeStoryFile(repoRoot, storyID, filename, content string) error {
 }
 
 // ErrStoryNotFound is returned when a requested story does not exist in the backlog or control plane.
-var ErrStoryNotFound = errors.New("story not found in backlog or control plane")
+var ErrStoryNotFound = engines.ErrStoryNotFound
 
 const storyFileExt = ".story.md"
 
 type remoteStoryDetail struct {
-	ID         string   `json:"id"`
-	Title      string   `json:"title"`
-	Status     string   `json:"status"`
-	Priority   string   `json:"priority"`
-	Path       string   `json:"path"`
-	Content    string   `json:"content"`
-	Submodules []string `json:"submodules,omitempty"`
+	ID                   string   `json:"id"`
+	Title                string   `json:"title"`
+	Status               string   `json:"status"`
+	Priority             string   `json:"priority"`
+	Path                 string   `json:"path"`
+	Content              string   `json:"content"`
+	Submodules           []string `json:"submodules,omitempty"`
+	Problem              string   `json:"problem,omitempty"`
+	AcceptanceCriteria   []string `json:"acceptance_criteria,omitempty"`
+	TargetFiles          []string `json:"target_files,omitempty"`
+	DependsOn            []string `json:"depends_on,omitempty"`
+	VerificationCommands []string `json:"verification_commands,omitempty"`
 }
 
 // StoryExistsOnDisk reports whether the specified story file exists in the repoRoot or fleetRoot backlog.
@@ -268,10 +273,91 @@ func checkIndexForStory(indexPath, storyID, baseDir string) bool {
 					return true
 				}
 			}
-			return true
+			return false
 		}
 	}
-	return currentMatch
+	return false
+}
+
+func resolveStoryFile(repoRoot, storyID string) (string, error) {
+	cleanID := strings.TrimSpace(storyID)
+	if cleanID == "" {
+		return "", errors.New("storyID cannot be empty")
+	}
+	if repoRoot == "" {
+		repoRoot = ResolveFleetRoot()
+	}
+	storiesDir := filepath.Join(repoRoot, "docs", "stories")
+	candidates := []string{
+		filepath.Join(storiesDir, cleanID+storyFileExt),
+		filepath.Join(storiesDir, cleanID+".md"),
+		filepath.Join(storiesDir, strings.ToLower(cleanID)+storyFileExt),
+		filepath.Join(storiesDir, strings.ToLower(cleanID)+".md"),
+	}
+	fleetRoot := ResolveFleetRoot()
+	if fleetRoot != "" && fleetRoot != repoRoot {
+		fleetStories := filepath.Join(fleetRoot, "docs", "stories")
+		candidates = append(candidates,
+			filepath.Join(fleetStories, cleanID+storyFileExt),
+			filepath.Join(fleetStories, cleanID+".md"),
+			filepath.Join(fleetStories, strings.ToLower(cleanID)+storyFileExt),
+			filepath.Join(fleetStories, strings.ToLower(cleanID)+".md"),
+		)
+	}
+	for _, c := range candidates {
+		if fi, err := os.Stat(c); err == nil && !fi.IsDir() && fi.Size() > 0 {
+			return c, nil
+		}
+	}
+	scanMatch := func(dir string) string {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return ""
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if (strings.HasSuffix(name, storyFileExt) || strings.HasSuffix(name, ".md")) && storyMatchesID(name, cleanID) {
+				full := filepath.Join(dir, name)
+				if fi, err := os.Stat(full); err == nil && !fi.IsDir() && fi.Size() > 0 {
+					return full
+				}
+			}
+		}
+		return ""
+	}
+	if p := scanMatch(storiesDir); p != "" {
+		return p, nil
+	}
+	if fleetRoot != "" && fleetRoot != repoRoot {
+		if p := scanMatch(filepath.Join(fleetRoot, "docs", "stories")); p != "" {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("%w: %s", ErrStoryNotFound, cleanID)
+}
+
+// MaterializePendingStories ensures the story markdown file exists on disk for the Scaffolder's repository root.
+func (s *Scaffolder) MaterializePendingStories(ctx context.Context, repoRoot, storyID string) (string, error) {
+	if repoRoot == "" && s != nil {
+		repoRoot = s.fleetRoot
+	}
+	if err := MaterializePendingStories(ctx, repoRoot, storyID); err != nil {
+		return "", err
+	}
+	p, _ := resolveStoryFile(repoRoot, storyID)
+	return p, nil
+}
+
+// ExecuteStory materializes any pending story definition before resolving the story file on disk.
+func (s *Scaffolder) ExecuteStory(ctx context.Context, repoRoot, storyID string) (string, error) {
+	if repoRoot == "" && s != nil {
+		repoRoot = s.fleetRoot
+	}
+	_, _ = s.MaterializePendingStories(ctx, repoRoot, storyID)
+	return resolveStoryFile(repoRoot, storyID)
 }
 
 func scanStoriesDir(storiesDir, storyID string) bool {
@@ -421,9 +507,14 @@ func MaterializePendingStories(ctx context.Context, repoRoot, storyID string) er
 		}
 		scaffolder := NewScaffolder(repoRoot, DefaultMaterializeClient)
 		_, err := scaffolder.MaterializeStoryFile(ctx, StoryPayload{
-			Submodule: targetSub,
-			Title:     detail.Title,
-			Priority:  detail.Priority,
+			Submodule:            targetSub,
+			Title:                detail.Title,
+			Priority:             detail.Priority,
+			Problem:              detail.Problem,
+			AcceptanceCriteria:   detail.AcceptanceCriteria,
+			TargetFiles:          detail.TargetFiles,
+			DependsOn:            detail.DependsOn,
+			VerificationCommands: detail.VerificationCommands,
 		})
 		return err
 	}

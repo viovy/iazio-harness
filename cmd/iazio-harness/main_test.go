@@ -2577,12 +2577,12 @@ func TestExecuteJob_OrdinaryPrompt_CleanExecution_MCPDaemonsNoHang(t *testing.T)
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
 			json.NewEncoder(w).Encode(controlplane.JobDetail{
-				ID:          "job-1506",
-				Prompt:      "update tools",
-				Kind:        "ordinary",
-				Engine:      "agy",
-				Agent:       "agy",
-				Status:      "RUNNING",
+				ID:     "job-1506",
+				Prompt: "update tools",
+				Kind:   "ordinary",
+				Engine: "agy",
+				Agent:  "agy",
+				Status: "RUNNING",
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
 			var body struct {
@@ -2792,8 +2792,3 @@ func TestExecuteJob_MissingStoryValidation_NoGitPollution(t *testing.T) {
 		t.Fatalf("git context polluted with dirty files: %s", string(out))
 	}
 }
-
-
-
-
-

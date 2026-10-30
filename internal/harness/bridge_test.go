@@ -294,4 +294,3 @@ func TestParseSIREnvelope(t *testing.T) {
 		t.Fatalf("expected nil for status!=SIR_BOUNDARY_HALT")
 	}
 }
-

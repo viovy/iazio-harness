@@ -386,3 +386,58 @@ func TestCLIPromptRunner_BranchPropagation(t *testing.T) {
 		t.Fatalf("expected AUTOPILOT_TARGET_BRANCH=feat/forensic-v2 in subprocess env, summary=%s", res.Summary)
 	}
 }
+
+func TestCLIPromptRunner_DefaultTimeoutAndEnvOverride(t *testing.T) {
+	if DefaultPromptTimeout != 7*24*time.Hour {
+		t.Fatalf("expected DefaultPromptTimeout=168h, got %v", DefaultPromptTimeout)
+	}
+	t.Setenv("IAZIO_PROMPT_TIMEOUT_SECONDS", "")
+	if got := ResolveDefaultPromptTimeout(); got != 7*24*time.Hour {
+		t.Fatalf("expected 168h default, got %v", got)
+	}
+	t.Setenv("IAZIO_PROMPT_TIMEOUT_SECONDS", "1800")
+	if got := ResolveDefaultPromptTimeout(); got != 30*time.Minute {
+		t.Fatalf("expected 30m env override, got %v", got)
+	}
+}
+
+func TestCLIPromptRunner_PreFlightHookFailsOnStoryNotFound(t *testing.T) {
+	fakeBin := makeFakeAutopilot(t)
+	repoDir := initTestGitRepo(t)
+
+	runner := NewPromptRunner(fakeBin)
+	runner.PreFlightHook = func(ctx context.Context, workingDir, storyID string) error {
+		return fmt.Errorf("%w: %s", engines.ErrStoryNotFound, storyID)
+	}
+
+	_, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:   "prompt-STORY-MISSING-404",
+		StoryID:    "STORY-MISSING-404",
+		Repo:       "test-submodule",
+		Prompt:     "Execute missing story",
+		WorkingDir: repoDir,
+		Timeout:    5 * time.Second,
+	})
+	if err == nil {
+		t.Fatal("expected error when PreFlightHook returns ErrStoryNotFound, got nil")
+	}
+	if !strings.Contains(err.Error(), "pre-flight story materialization failed for STORY-MISSING-404") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestCLIPromptRunner_TraceParentW3CSanitization(t *testing.T) {
+	w3cRe := strings.ToLower
+	_ = w3cRe
+	traceHex, tp := formatW3CTraceParent("tr-non-hex-trace-id", "prompt-STORY-GOV-3806")
+	if len(traceHex) != 32 {
+		t.Fatalf("expected 32-char hex traceID, got %q", traceHex)
+	}
+	parts := strings.Split(tp, "-")
+	if len(parts) != 4 || parts[0] != "00" || len(parts[1]) != 32 || len(parts[2]) != 16 || parts[3] != "01" {
+		t.Fatalf("expected valid W3C traceparent 00-<32hex>-<16hex>-01, got %q", tp)
+	}
+	if !hex32Regex.MatchString(parts[1]) || !hex16Regex.MatchString(parts[2]) {
+		t.Fatalf("expected lowercase hex traceId and spanId in %q", tp)
+	}
+}

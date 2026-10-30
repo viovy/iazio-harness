@@ -603,3 +603,26 @@ func TestExecutorForwardsBranchToPromptRunner(t *testing.T) {
 	}
 }
 
+func TestExecutor_DefaultSevenDayTimeoutAndEnvOverride(t *testing.T) {
+	fleetRoot, _, _ := setupTestFleet(t)
+	runner := &mockPromptRunner{}
+	exec := NewExecutor(fleetRoot, runner)
+	exec.SetLockDir(t.TempDir())
+
+	t.Setenv("IAZIO_PROMPT_TIMEOUT_SECONDS", "")
+	_, err := exec.Execute(context.Background(), PromptPayload{
+		PromptID:       "timeout-default-7d",
+		Repo:           "iazio-mcp",
+		Prompt:         "Long running prompt",
+		TimeoutSeconds: 0,
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	runner.mu.Lock()
+	gotDefault := runner.lastOpts.Timeout
+	runner.mu.Unlock()
+	if gotDefault != 7*24*time.Hour {
+		t.Fatalf("expected 7d default timeout, got %v", gotDefault)
+	}
+}

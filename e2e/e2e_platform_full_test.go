@@ -39,14 +39,14 @@ type ZipkinSpan struct {
 }
 
 type TroubleshootingInsight struct {
-	TraceID             string       `json:"trace_id"`
-	ZipkinUIURL         string       `json:"zipkin_ui_url"`
-	SpanCount           int          `json:"span_count"`
-	RootCauseCategory   string       `json:"root_cause_category"`
-	Summary             string       `json:"summary"`
-	PinpointedSpan      string       `json:"pinpointed_span"`
-	RemediationAction   string       `json:"remediation_action"`
-	RecordedSpans       []ZipkinSpan `json:"recorded_spans"`
+	TraceID           string       `json:"trace_id"`
+	ZipkinUIURL       string       `json:"zipkin_ui_url"`
+	SpanCount         int          `json:"span_count"`
+	RootCauseCategory string       `json:"root_cause_category"`
+	Summary           string       `json:"summary"`
+	PinpointedSpan    string       `json:"pinpointed_span"`
+	RemediationAction string       `json:"remediation_action"`
+	RecordedSpans     []ZipkinSpan `json:"recorded_spans"`
 }
 
 type ZipkinCollector struct {
@@ -267,18 +267,18 @@ type Job struct {
 }
 
 type Schedule struct {
-	ID              string    `json:"id"`
-	Name            string    `json:"name"`
-	TargetAgent     string    `json:"target_agent"`
-	TargetRepo      string    `json:"target_repo"`
-	Action          string    `json:"action"`
-	Enabled         bool      `json:"enabled"`
-	Status          string    `json:"status"` // "idle", "running", "paused"
-	ActiveJobID     string    `json:"active_job_id,omitempty"`
-	LastTraceID     string    `json:"last_trace_id,omitempty"`
-	CompletedRuns   int       `json:"completed_runs"`
-	MaxDurationSec  int       `json:"max_duration_sec"`
-	LastReconciled  time.Time `json:"last_reconciled"`
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	TargetAgent    string    `json:"target_agent"`
+	TargetRepo     string    `json:"target_repo"`
+	Action         string    `json:"action"`
+	Enabled        bool      `json:"enabled"`
+	Status         string    `json:"status"` // "idle", "running", "paused"
+	ActiveJobID    string    `json:"active_job_id,omitempty"`
+	LastTraceID    string    `json:"last_trace_id,omitempty"`
+	CompletedRuns  int       `json:"completed_runs"`
+	MaxDurationSec int       `json:"max_duration_sec"`
+	LastReconciled time.Time `json:"last_reconciled"`
 }
 
 type HistoryEntry struct {
@@ -368,14 +368,14 @@ func (ac *AgentWorkspaceController) DiscardAll(forceKillActive bool) ([]string, 
 // ============================================================================
 
 type IazioControlPlane struct {
-	mu          sync.Mutex
-	jobs        map[string]*Job
-	jobOrder    []string
-	schedules   map[string]*Schedule
-	history     []HistoryEntry
-	agentCtrl   *AgentWorkspaceController
-	zipkin      *ZipkinCollector
-	leaseTTL    time.Duration
+	mu        sync.Mutex
+	jobs      map[string]*Job
+	jobOrder  []string
+	schedules map[string]*Schedule
+	history   []HistoryEntry
+	agentCtrl *AgentWorkspaceController
+	zipkin    *ZipkinCollector
+	leaseTTL  time.Duration
 }
 
 func NewIazioControlPlane(agentCtrl *AgentWorkspaceController, zipkin *ZipkinCollector, leaseTTL time.Duration) *IazioControlPlane {
@@ -1317,4 +1317,3 @@ func TestE2E_IazioHarness_PureCodeAction_DiscardAndClean(t *testing.T) {
 		t.Fatalf("expected untracked_dir to be deleted")
 	}
 }
-
