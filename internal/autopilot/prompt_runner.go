@@ -44,6 +44,7 @@ type RunPromptOptions struct {
 type PromptResult struct {
 	PromptID      string   `json:"prompt_id"`
 	Repo          string   `json:"repo"`
+	Branch        string   `json:"branch,omitempty"`
 	TargetAgent   string   `json:"target_agent"`
 	StoryID       string   `json:"story_id,omitempty"`
 	StoryTitle    string   `json:"story_title,omitempty"`
@@ -180,8 +181,12 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	cmd := exec.Command(r.AutopilotBinary, args...)
 	cmd.Dir = opts.WorkingDir
 
-	// Propagate Zipkin/W3C trace continuity into autopilot process
+	// Propagate Zipkin/W3C trace continuity and target branch into autopilot process
 	cmd.Env = os.Environ()
+	targetBranch := strings.TrimSpace(opts.Branch)
+	if targetBranch != "" {
+		cmd.Env = append(cmd.Env, "AUTOPILOT_TARGET_BRANCH="+targetBranch)
+	}
 	traceID := opts.TraceID
 	if traceID == "" {
 		traceID = os.Getenv("TRACE_ID")
@@ -322,6 +327,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	result := &PromptResult{
 		PromptID:      opts.PromptID,
 		Repo:          opts.Repo,
+		Branch:        targetBranch,
 		TargetAgent:   targetAgent,
 		StoryID:       detectedStoryID,
 		StoryTitle:    detectedStoryTitle,

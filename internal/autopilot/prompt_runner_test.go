@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -72,7 +73,8 @@ func TestAutopilotHelperProcess(t *testing.T) {
 
 		// Test output with secret token to test redaction
 		pwd, _ := os.Getwd()
-		fmt.Printf("Executed in %s: ghp_SECRET_GITHUB_TOKEN_1234567890abcdef OK story=%s\n", filepath.Base(pwd), storyArg)
+		branchEnv := os.Getenv("AUTOPILOT_TARGET_BRANCH")
+		fmt.Printf("Executed in %s: ghp_SECRET_GITHUB_TOKEN_1234567890abcdef OK story=%s branch=%s\n", filepath.Base(pwd), storyArg, branchEnv)
 		return
 	}
 
@@ -83,6 +85,14 @@ func TestAutopilotHelperProcess(t *testing.T) {
 func makeFakeAutopilot(t *testing.T) string {
 	t.Helper()
 	tmpDir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		fakeBin := filepath.Join(tmpDir, "fake-autopilot.bat")
+		script := fmt.Sprintf("@echo off\r\nset GO_WANT_AUTOPILOT_HELPER=1\r\n\"%s\" -test.run=TestAutopilotHelperProcess -- %%*\r\n", os.Args[0])
+		if err := os.WriteFile(fakeBin, []byte(script), 0755); err != nil {
+			t.Fatalf("failed to write fake autopilot bat: %v", err)
+		}
+		return fakeBin
+	}
 	fakeBin := filepath.Join(tmpDir, "fake-autopilot")
 	script := fmt.Sprintf("#!/bin/sh\nexport GO_WANT_AUTOPILOT_HELPER=1\nexec %s -test.run=TestAutopilotHelperProcess -- \"$@\"\n", os.Args[0])
 	if err := os.WriteFile(fakeBin, []byte(script), 0755); err != nil {
@@ -348,5 +358,31 @@ func TestPromptRunner_RunPrompt_DetectsStoryID(t *testing.T) {
 	}
 	if res.StoryID != "STORY-GOV-3688" {
 		t.Errorf("expected detected StoryID STORY-GOV-3688, got %s", res.StoryID)
+	}
+}
+
+func TestCLIPromptRunner_BranchPropagation(t *testing.T) {
+	fakeBin := makeFakeAutopilot(t)
+	repoDir := initTestGitRepo(t)
+
+	runner := NewPromptRunner(fakeBin)
+	opts := RunPromptOptions{
+		PromptID:   "test-prompt-branch",
+		Repo:       "test-submodule",
+		Branch:     "feat/forensic-v2",
+		Prompt:     "Execute prompt on target branch",
+		WorkingDir: repoDir,
+		Timeout:    5 * time.Second,
+	}
+
+	res, err := runner.RunPrompt(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("unexpected RunPrompt error: %v", err)
+	}
+	if res.Branch != "feat/forensic-v2" {
+		t.Fatalf("expected PromptResult.Branch 'feat/forensic-v2', got %q", res.Branch)
+	}
+	if !strings.Contains(res.Summary, "branch=feat/forensic-v2") {
+		t.Fatalf("expected AUTOPILOT_TARGET_BRANCH=feat/forensic-v2 in subprocess env, summary=%s", res.Summary)
 	}
 }
