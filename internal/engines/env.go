@@ -54,7 +54,6 @@ func ChildEnv(base []string, schedule map[string]string, docsHubPath string) []s
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		dirs := []string{
 			filepath.Join(home, ".local", "bin"),
-			filepath.Join(home, ".iazio", "bin"),
 		}
 		if runtime.GOOS == "darwin" {
 			dirs = append(dirs, "/opt/homebrew/bin")

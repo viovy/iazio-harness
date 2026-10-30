@@ -340,9 +340,12 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "[mock-agy] Resume on existing worktree succeeded. Worktree clean.")
 		return 0
 
-	case "in_place_harness_auto_resume":
-		// Scenario 10: Turn 1 fails transiently; Turn 2 resumes in-place and succeeds.
+	case "in_place_harness_auto_resume", "nonzero_exit_inplace_resume":
+		// Scenario 10 / 14: Turn 1 fails transiently with configurable exit code (1, 2, 10); Turn 2 resumes in-place and succeeds.
 		stateMarker := filepath.Join(os.TempDir(), "mock_agy_inplace_resume.tmp")
+		if customMarker := os.Getenv("MOCK_AGY_STATE_MARKER"); customMarker != "" {
+			stateMarker = customMarker
+		}
 		_, mErr := os.Stat(stateMarker)
 		if mErr != nil {
 			_ = os.WriteFile(stateMarker, []byte("attempt_1_done"), 0644)
@@ -353,8 +356,16 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 				_ = os.MkdirAll(convDir, 0755)
 				_ = os.WriteFile(filepath.Join(convDir, cid+".db"), []byte("mock-db"), 0644)
 			}
-			fmt.Fprintln(stderr, "[mock-agy] Transient network reset on attempt 1. Exiting 1.")
-			return 1
+			failCode := 1
+			if rawCode := strings.TrimSpace(os.Getenv("MOCK_AGY_EXIT_CODE")); rawCode != "" {
+				if rawCode == "2" {
+					failCode = 2
+				} else if rawCode == "10" {
+					failCode = 10
+				}
+			}
+			fmt.Fprintf(stderr, "[mock-agy] Transient network reset on attempt 1. Exiting %d.\n", failCode)
+			return failCode
 		}
 		_ = os.Remove(stateMarker)
 		_ = os.WriteFile("inplace_resumed_file.txt", []byte("inplace recovery content\n"), 0644)

@@ -110,6 +110,24 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 		}
 	}
 
+	promptKind := "ordinary"
+	if strings.TrimSpace(payload.StoryID) != "" {
+		promptKind = "ase"
+	}
+	if prepRes, prepErr := Prepare(Input{
+		Kind:  promptKind,
+		JobID: sanitizeRepoName(payload.PromptID),
+		Body:  payload.Prompt,
+		Values: Values{
+			StoryID:        strings.TrimSpace(payload.StoryID),
+			TargetLeafName: filepath.Base(targetDir),
+			WorktreePath:   targetDir,
+			DocsHubPath:    e.fleetRoot,
+		},
+	}); prepErr == nil && strings.TrimSpace(prepRes.Prompt) != "" {
+		payload.Prompt = prepRes.Prompt
+	}
+
 	opts := autopilot.RunPromptOptions{
 		PromptID:    payload.PromptID,
 		StoryID:     payload.StoryID,

@@ -2485,7 +2485,8 @@ func TestExecuteJob_DeterministicResume_ConversationNotFound_StartsNewConversati
 	newConvID := "220e349f-2962-5147-b5f9-d5744f67bf38"
 
 	_ = os.WriteFile(mockAgy, []byte(fmt.Sprintf(`#!/bin/sh
-run_num=$(wc -l < "%s" 2>/dev/null || echo 0)
+run_num=$( (wc -l < "%s" 2>/dev/null || echo 0) | tr -d ' \t\r\n' )
+if [ -z "$run_num" ]; then run_num=0; fi
 echo "run" >> "%s"
 echo "$*" > "%s/run_${run_num}.txt"
 

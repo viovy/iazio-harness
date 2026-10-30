@@ -93,7 +93,22 @@ func Prepare(in Input) (Result, error) {
 		}
 		values.SourceTranscriptPath = transcriptPath
 	}
-	filled, err := Fill(in.Body, values)
+	body := in.Body
+	matches := placeholderRE.FindAllStringSubmatch(body, -1)
+	for _, m := range matches {
+		name := m[1]
+		if in.Kind == KindStoryRefinement && name == "SourceTranscriptPath" {
+			continue
+		}
+		if val, ok := values.lookup(name); ok && strings.TrimSpace(val) == "" {
+			body = strings.ReplaceAll(body, " "+m[0]+" ", " ")
+			body = strings.ReplaceAll(body, m[0], "")
+		}
+	}
+	if body != in.Body {
+		body = strings.TrimSpace(body)
+	}
+	filled, err := Fill(body, values)
 	if err != nil {
 		return Result{}, err
 	}

@@ -2766,7 +2766,7 @@ func runDaemonCommand(args []string) error {
 
 	log.Printf("[iazio-harness] Starting execution supervisor daemon (pid: %d, interval: %v)...", os.Getpid(), interval)
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		binPath := filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		binPath := filepath.Join(home, ".local", "bin", "iazio-harness")
 		if runtime.GOOS == "windows" {
 			binPath += ".exe"
 		}

@@ -118,7 +118,6 @@ func (c CLI) HealthCheck() error {
 		if home, errH := os.UserHomeDir(); errH == nil && home != "" {
 			candidates := []string{
 				filepath.Join(home, ".local", "bin", c.Name()),
-				filepath.Join(home, ".iazio", "bin", c.Name()),
 				filepath.Join(home, ".gemini", "antigravity-cli", "bin", c.Name()),
 			}
 			for _, cand := range candidates {
@@ -230,7 +229,6 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	} else if home, err := os.UserHomeDir(); err == nil && home != "" {
 		candidates := []string{
 			filepath.Join(home, ".local", "bin", bin),
-			filepath.Join(home, ".iazio", "bin", bin),
 			filepath.Join(home, ".gemini", "antigravity-cli", "bin", bin),
 		}
 		if runtime.GOOS == "windows" {
@@ -875,7 +873,6 @@ func ResolveDynamicTool(engine string, priorityList []string) string {
 		if home, err := os.UserHomeDir(); err == nil && home != "" {
 			candidates := []string{
 				filepath.Join(home, ".local", "bin", tool),
-				filepath.Join(home, ".iazio", "bin", tool),
 				filepath.Join(home, ".gemini", "antigravity-cli", "bin", tool),
 			}
 			for _, cand := range candidates {
