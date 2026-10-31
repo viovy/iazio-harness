@@ -71,6 +71,11 @@ func TestAutopilotHelperProcess(t *testing.T) {
 			os.Exit(1)
 		}
 
+		if strings.Contains(promptContent, "SIMULATE_JETSKI_PERMISSION_DENIED") {
+			fmt.Println(`jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g. command(<target>)). Alternatively, re-run with --dangerously-skip-permissions to auto-approve all tools.`)
+			os.Exit(0)
+		}
+
 		// Test output with secret token to test redaction
 		pwd, _ := os.Getwd()
 		branchEnv := os.Getenv("AUTOPILOT_TARGET_BRANCH")
@@ -439,5 +444,38 @@ func TestCLIPromptRunner_TraceParentW3CSanitization(t *testing.T) {
 	}
 	if !hex32Regex.MatchString(parts[1]) || !hex16Regex.MatchString(parts[2]) {
 		t.Fatalf("expected lowercase hex traceId and spanId in %q", tp)
+	}
+}
+
+func TestCLIPromptRunner_FailsOnJetskiHeadlessPermissionDenial(t *testing.T) {
+	fakeBin := makeFakeAutopilot(t)
+	repoDir := initTestGitRepo(t)
+
+	runner := NewPromptRunner(fakeBin)
+	opts := RunPromptOptions{
+		PromptID:    "job_54dcf0141811092f",
+		Repo:        "iazio-web",
+		Title:       "Sort prompts alphabetically in iazio-web /prompts view",
+		Prompt:      "SIMULATE_JETSKI_PERMISSION_DENIED",
+		TargetAgent: "agy",
+		WorkingDir:  repoDir,
+		Timeout:     5 * time.Second,
+	}
+
+	res, err := runner.RunPrompt(context.Background(), opts)
+	if err == nil {
+		t.Fatal("expected error when agy outputs jetski headless permission denial with exit code 0, got nil")
+	}
+	if res == nil {
+		t.Fatal("expected non-nil PromptResult")
+	}
+	if res.Status != "failed" {
+		t.Fatalf("expected status 'failed', got %q", res.Status)
+	}
+	if res.ExitCode == 0 {
+		t.Fatalf("expected non-zero exit code, got %d", res.ExitCode)
+	}
+	if !strings.Contains(err.Error(), "PERMISSION_DENIED") {
+		t.Fatalf("expected PERMISSION_DENIED error, got: %v", err)
 	}
 }

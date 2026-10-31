@@ -107,6 +107,9 @@ var permissionDeniedRegexes = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)authentication\s+(failed|required)`),
 	regexp.MustCompile(`(?i)invalid\s+token`),
 	regexp.MustCompile(`(?i)fatal:\s+could\s+not\s+read\s+Username`),
+	regexp.MustCompile(`(?i)jetski:\s*no\s+output\s+produced`),
+	regexp.MustCompile(`(?i)headless\s+mode\s+cannot\s+prompt\s+for`),
+	regexp.MustCompile(`(?i)so\s+it\s+was\s+auto-denied`),
 }
 
 var mergeConflictRegexes = []*regexp.Regexp{

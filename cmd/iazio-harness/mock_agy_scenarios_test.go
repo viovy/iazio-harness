@@ -1263,3 +1263,75 @@ func TestMockAgy_Scenario15_CanonicalLocalBinPathResolution(t *testing.T) {
 		t.Fatalf("expected ChildEnv PATH not to include legacy .iazio/bin, got %q", pathVal)
 	}
 }
+
+// Scenario 16: job-1350 (sch-1348, Prompt: "Execute story STORY-ROOT-245", Kind: "ordinary")
+// Turn 1 exits 0 leaving 4 dirty files in worktree. Because isASEJob recognizes "Execute story STORY-ROOT-245",
+// harness triggers Turn 2 in-place auto-continuation, cleans worktree, marks STORY-ROOT-245 DONE, and exits 0.
+func TestMockAgy_Scenario16_Job1350_DirtyWorktreePostExit_InPlaceAutoResume(t *testing.T) {
+	buildMockAgy(t)
+	marker := filepath.Join(t.TempDir(), "mock_agy_job_1350_turn.tmp")
+	t.Setenv("MOCK_AGY_STATE_MARKER", marker)
+	t.Setenv("MOCK_AGY_SCENARIO", "job_1350_dirty_worktree_post_exit")
+
+	var mu sync.Mutex
+	var postedChunks []string
+	var postedExitCode = -1
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/"):
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:     "job-1350",
+				Prompt: "Execute story STORY-ROOT-245",
+				Kind:   "ordinary",
+				Engine: "mock-agy",
+				Agent:  "mock-agy",
+				Status: "RUNNING",
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			var body struct {
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedChunks = append(postedChunks, body.Text)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+			var body struct {
+				ExitCode int `json:"exit_code"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedExitCode = body.ExitCode
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	worktree := initTestGitWorktree(t)
+	_ = os.MkdirAll(filepath.Join(worktree, "docs", "stories"), 0o755)
+	_ = os.WriteFile(filepath.Join(worktree, "docs", "stories", "story-root-245.story.md"), []byte("---\nid: STORY-ROOT-245\ntitle: Fix dirty worktree post exit\nstatus: IN_PROGRESS\n---\n"), 0o644)
+	_ = exec.Command("git", "-C", worktree, "add", ".").Run()
+	_ = exec.Command("git", "-C", worktree, "commit", "-m", "chore: initial story").Run()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err := executeJob(ctx, srv.URL, "job-1350", worktree, "", "ordinary", "", "")
+	if err != nil {
+		t.Fatalf("expected executeJob for job-1350 to auto-resume in-place and succeed, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if postedExitCode != 0 {
+		t.Fatalf("expected final exit code 0 after in-place dirty worktree continuation, got %d", postedExitCode)
+	}
+	allOutput := strings.Join(postedChunks, "\n")
+	if !strings.Contains(allOutput, "Turn 2 cleaned dirty worktree and completed STORY-ROOT-245") {
+		t.Fatalf("expected Turn 2 continuation output in chunks, got:\n%s", allOutput)
+	}
+}

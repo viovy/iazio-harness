@@ -287,3 +287,24 @@ func TestIsProcessAlive_AndScanPSDescendants(t *testing.T) {
 		}
 	}
 }
+
+func TestSweepDeadProcesses_PrefersHarnessPIDOverDeadToolPID(t *testing.T) {
+	tempDir := t.TempDir()
+	w := New(Options{
+		StateFile:  filepath.Join(tempDir, "active-jobs.json"),
+		StatusFile: filepath.Join(tempDir, "daemon.status"),
+		IsAlive: func(pid int) bool {
+			return pid == 1000 // HarnessPID 1000 is alive; ToolPID 2000 is dead
+		},
+	})
+	w.Track(TrackedJob{
+		JobID:      "job-1350",
+		PID:        2000,
+		HarnessPID: 1000,
+		ToolPID:    2000,
+	})
+	reaped := w.SweepDeadProcesses()
+	if len(reaped) != 0 {
+		t.Fatalf("expected 0 reaped jobs while HarnessPID is alive, got %v", reaped)
+	}
+}
