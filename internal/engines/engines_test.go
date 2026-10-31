@@ -1166,8 +1166,8 @@ func TestRawWriter_FiltersRootAgentIdleMessage(t *testing.T) {
 func TestProcessGroupHelpers(t *testing.T) {
 	cmd := exec.Command("sleep", "5")
 	SetProcGroup(cmd)
-	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
-		t.Errorf("expected Setpgid to be true")
+	if !checkProcGroupAttrs(cmd) {
+		t.Errorf("expected process group attributes to be properly configured")
 	}
 	PostStartProcessGroup(cmd)
 	setProcGroup(cmd)

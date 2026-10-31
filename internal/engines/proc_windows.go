@@ -62,8 +62,14 @@ var (
 	harnessJobs  = make(map[int]uintptr)
 )
 
-// SetProcGroup configures cmd to run in its own job object on Windows.
-func SetProcGroup(cmd *exec.Cmd) {}
+// SetProcGroup configures cmd to run in its own job object on Windows with CREATE_NO_WINDOW.
+func SetProcGroup(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP | 0x08000000 // CREATE_NO_WINDOW
+	cmd.SysProcAttr.HideWindow = true
+}
 
 // PostStartProcessGroup assigns the started process to a Windows Job Object with KILL_ON_JOB_CLOSE.
 func PostStartProcessGroup(cmd *exec.Cmd) {
@@ -129,3 +135,7 @@ func setProcGroup(cmd *exec.Cmd)          { SetProcGroup(cmd) }
 func postStartProcessGroup(cmd *exec.Cmd) { PostStartProcessGroup(cmd) }
 func stopProcessGroup(cmd *exec.Cmd)      { StopProcessGroup(cmd) }
 func killProcessGroup(cmd *exec.Cmd)      { KillProcessGroup(cmd) }
+
+func checkProcGroupAttrs(cmd *exec.Cmd) bool {
+	return cmd != nil && cmd.SysProcAttr != nil && cmd.SysProcAttr.CreationFlags&0x08000000 != 0 && cmd.SysProcAttr.HideWindow
+}

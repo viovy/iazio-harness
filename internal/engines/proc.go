@@ -47,3 +47,7 @@ func setProcGroup(cmd *exec.Cmd)          { SetProcGroup(cmd) }
 func postStartProcessGroup(cmd *exec.Cmd) { PostStartProcessGroup(cmd) }
 func stopProcessGroup(cmd *exec.Cmd)      { StopProcessGroup(cmd) }
 func killProcessGroup(cmd *exec.Cmd)      { KillProcessGroup(cmd) }
+
+func checkProcGroupAttrs(cmd *exec.Cmd) bool {
+	return cmd != nil && cmd.SysProcAttr != nil && cmd.SysProcAttr.Setpgid
+}
