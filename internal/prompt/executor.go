@@ -18,18 +18,22 @@ import (
 
 // PromptPayload represents the structured JSON input received from iazio-agent.
 type PromptPayload struct {
-	PromptID       string `json:"prompt_id"`
-	JobID          string `json:"job_id,omitempty"`
-	APIURL         string `json:"api_url,omitempty"`
-	Token          string `json:"token,omitempty"`
-	StoryID        string `json:"story_id,omitempty"`
-	Repo           string `json:"repo"`
-	Branch         string `json:"branch,omitempty"`
-	Title          string `json:"title,omitempty"`
-	Prompt         string `json:"prompt"`
-	TargetAgent    string `json:"target_agent,omitempty"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
-	TraceID        string `json:"trace_id,omitempty"`
+	PromptID         string `json:"prompt_id"`
+	JobID            string `json:"job_id,omitempty"`
+	APIURL           string `json:"api_url,omitempty"`
+	Token            string `json:"token,omitempty"`
+	FencingToken     int64  `json:"fencing_token,omitempty"`
+	StoryID          string `json:"story_id,omitempty"`
+	Repo             string `json:"repo"`
+	WorktreePath     string `json:"worktree_path,omitempty"`
+	Submodule        string `json:"submodule,omitempty"`
+	Branch           string `json:"branch,omitempty"`
+	Title            string `json:"title,omitempty"`
+	Prompt           string `json:"prompt"`
+	NormalizedPrompt string `json:"normalized_prompt,omitempty"`
+	TargetAgent      string `json:"target_agent,omitempty"`
+	TimeoutSeconds   int    `json:"timeout_seconds,omitempty"`
+	TraceID          string `json:"trace_id,omitempty"`
 }
 
 // Executor coordinates submodule resolution, workspace file locking, and execution delegation.
@@ -68,14 +72,38 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 			payload.PromptID = fmt.Sprintf("prompt-%d", time.Now().UnixNano())
 		}
 	}
+	if strings.TrimSpace(payload.Prompt) == "" && strings.TrimSpace(payload.NormalizedPrompt) != "" {
+		payload.Prompt = payload.NormalizedPrompt
+	}
+	if strings.TrimSpace(payload.Repo) == "" && strings.TrimSpace(payload.WorktreePath) != "" {
+		payload.Repo = payload.WorktreePath
+	}
 
 	if err := validatePayload(payload); err != nil {
 		return nil, fmt.Errorf("invalid prompt payload: %w", err)
 	}
 
-	targetDir, err := e.ResolveSubmodulePath(payload.Repo)
-	if err != nil {
-		return nil, fmt.Errorf("resolve submodule path: %w", err)
+	effectiveFleetRoot := e.fleetRoot
+	if wt := strings.TrimSpace(payload.WorktreePath); wt != "" && !strings.Contains(wt, "..") {
+		if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
+			if _, gmErr := os.Stat(filepath.Join(wt, ".gitmodules")); gmErr == nil {
+				effectiveFleetRoot = wt
+			}
+		}
+	}
+
+	var targetDir string
+	var err error
+	if sub := strings.TrimSpace(payload.Submodule); sub != "" && !codebase.IsSuperprojectRoot(sub) && (codebase.IsSuperprojectRoot(payload.Repo) || filepath.IsAbs(payload.Repo)) {
+		if subDir, subErr := codebase.ResolveSubmodulePath(effectiveFleetRoot, sub); subErr == nil {
+			targetDir = subDir
+		}
+	}
+	if targetDir == "" {
+		targetDir, err = codebase.ResolveSubmodulePath(effectiveFleetRoot, payload.Repo)
+		if err != nil {
+			return nil, fmt.Errorf("resolve submodule path: %w", err)
+		}
 	}
 
 	// 1. Resolve lock file path
@@ -102,13 +130,13 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 	workingDir := targetDir
 	if payload.TargetAgent == "autopilot" || strings.TrimSpace(payload.StoryID) != "" {
 		// Intelligent story hub resolution: if target submodule lacks its own docs/stories
-		// and fleetRoot has docs/stories, target fleetRoot so autopilot can find the centralized
+		// and effectiveFleetRoot has docs/stories, target effectiveFleetRoot so autopilot can find the centralized
 		// backlog story and root Makefile (execute-story-flow, validate-local-fleet).
 		subStories := filepath.Join(targetDir, "docs", "stories")
 		if fi, err := os.Stat(subStories); err != nil || !fi.IsDir() {
-			fleetStories := filepath.Join(e.fleetRoot, "docs", "stories")
+			fleetStories := filepath.Join(effectiveFleetRoot, "docs", "stories")
 			if fFi, fErr := os.Stat(fleetStories); fErr == nil && fFi.IsDir() {
-				workingDir = e.fleetRoot
+				workingDir = effectiveFleetRoot
 			}
 		}
 	}
@@ -125,18 +153,19 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 			StoryID:        strings.TrimSpace(payload.StoryID),
 			TargetLeafName: filepath.Base(targetDir),
 			WorktreePath:   targetDir,
-			DocsHubPath:    e.fleetRoot,
+			DocsHubPath:    effectiveFleetRoot,
 		},
 	}); prepErr == nil && strings.TrimSpace(prepRes.Prompt) != "" {
 		payload.Prompt = prepRes.Prompt
 	}
 
 	opts := autopilot.RunPromptOptions{
-		PromptID:    payload.PromptID,
-		JobID:       strings.TrimSpace(payload.JobID),
-		APIURL:      strings.TrimSpace(payload.APIURL),
-		Token:       strings.TrimSpace(payload.Token),
-		StoryID:     payload.StoryID,
+		PromptID:     payload.PromptID,
+		JobID:        strings.TrimSpace(payload.JobID),
+		APIURL:       strings.TrimSpace(payload.APIURL),
+		Token:        strings.TrimSpace(payload.Token),
+		FencingToken: payload.FencingToken,
+		StoryID:      payload.StoryID,
 		Repo:        payload.Repo,
 		Branch:      strings.TrimSpace(payload.Branch),
 		Title:       payload.Title,
@@ -148,6 +177,9 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 	}
 
 	result, err := e.runner.RunPrompt(ctx, opts)
+	if result != nil && result.WorktreePath == "" {
+		result.WorktreePath = workingDir
+	}
 	if err != nil {
 		return result, err
 	}

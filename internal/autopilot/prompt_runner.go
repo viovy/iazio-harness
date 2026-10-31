@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -15,15 +16,18 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/redact"
+	"github.com/viovy/iazio-harness/internal/sessionstore"
 )
 
 var (
 	storyIDRegex = regexp.MustCompile(`\b(STORY-[A-Za-z0-9_-]+)\b`)
+	convIDRegex  = regexp.MustCompile(`(?i)(?:created|resumed|resuming|loaded|active|using|streaming)\s+conversation\s+([A-Za-z0-9_-]{12,64})`)
 	hex16Regex   = regexp.MustCompile(`^[0-9a-f]{16}$`)
 	hex32Regex   = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
@@ -33,6 +37,8 @@ const (
 	DefaultPromptTimeout = 7 * 24 * time.Hour
 	defaultPromptTimeout = DefaultPromptTimeout
 	defaultGracePeriod   = 5 * time.Second
+	geminiDirName        = ".gemini"
+	agyCliDirName        = "antigravity-cli"
 )
 
 // ResolveDefaultPromptTimeout returns the default prompt timeout, honoring IAZIO_PROMPT_TIMEOUT_SECONDS when set to a positive integer.
@@ -65,11 +71,12 @@ func formatW3CTraceParent(rawTraceID, rawSpanID string) (string, string) {
 
 // RunPromptOptions specifies parameters for executing a prompt via autopilot.
 type RunPromptOptions struct {
-	PromptID    string        `json:"prompt_id"`
-	JobID       string        `json:"job_id,omitempty"`
-	APIURL      string        `json:"api_url,omitempty"`
-	Token       string        `json:"token,omitempty"`
-	StoryID     string        `json:"story_id,omitempty"`
+	PromptID     string        `json:"prompt_id"`
+	JobID        string        `json:"job_id,omitempty"`
+	APIURL       string        `json:"api_url,omitempty"`
+	Token        string        `json:"token,omitempty"`
+	FencingToken int64         `json:"fencing_token,omitempty"`
+	StoryID      string        `json:"story_id,omitempty"`
 	Repo        string        `json:"repo"`
 	Branch      string        `json:"branch,omitempty"`
 	Title       string        `json:"title,omitempty"`
@@ -90,22 +97,208 @@ func hasHeadlessPermissionDenial(text string) bool {
 
 // PromptResult represents the structured telemetry returned after prompt execution.
 type PromptResult struct {
-	PromptID      string   `json:"prompt_id"`
-	Repo          string   `json:"repo"`
-	Branch        string   `json:"branch,omitempty"`
-	TargetAgent   string   `json:"target_agent"`
-	StoryID       string   `json:"story_id,omitempty"`
-	StoryTitle    string   `json:"story_title,omitempty"`
-	StoryPath     string   `json:"story_path,omitempty"`
-	Status        string   `json:"status"`
-	ExitCode      int      `json:"exit_code"`
-	PreGitHeadSHA string   `json:"pre_git_head_sha,omitempty"`
-	PreGitTreeSHA string   `json:"pre_git_tree_sha,omitempty"`
-	GitHeadSHA    string   `json:"git_head_sha"`
-	GitTreeSHA    string   `json:"git_tree_sha"`
-	ModifiedFiles []string `json:"modified_files"`
-	Summary       string   `json:"summary"`
-	DurationMs    int64    `json:"duration_ms"`
+	PromptID             string   `json:"prompt_id"`
+	Repo                 string   `json:"repo"`
+	WorktreePath         string   `json:"worktree_path,omitempty"`
+	Branch               string   `json:"branch,omitempty"`
+	TargetAgent          string   `json:"target_agent"`
+	StoryID              string   `json:"story_id,omitempty"`
+	StoryTitle           string   `json:"story_title,omitempty"`
+	StoryPath            string   `json:"story_path,omitempty"`
+	ConversationID       string   `json:"conversation_id,omitempty"`
+	ActiveConversationID string   `json:"active_conversation_id,omitempty"`
+	ConversationIDs      []string `json:"conversation_ids,omitempty"`
+	Status               string   `json:"status"`
+	ExitCode             int      `json:"exit_code"`
+	PreGitHeadSHA        string   `json:"pre_git_head_sha,omitempty"`
+	PreGitTreeSHA        string   `json:"pre_git_tree_sha,omitempty"`
+	GitHeadSHA           string   `json:"git_head_sha"`
+	GitTreeSHA           string   `json:"git_tree_sha"`
+	ModifiedFiles        []string `json:"modified_files"`
+	Summary              string   `json:"summary"`
+	DurationMs           int64    `json:"duration_ms"`
+}
+
+type chunkStreamingWriter struct {
+	mu           *sync.Mutex
+	buf          *bytes.Buffer
+	lastOutAt    *time.Time
+	streamedAny  *bool
+	convDetected *string
+	ctx          context.Context
+	apiURL       string
+	token        string
+	jobID        string
+	stream       string
+}
+
+func (w *chunkStreamingWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	w.mu.Lock()
+	_, _ = w.buf.Write(p)
+	*w.lastOutAt = time.Now()
+	text := redact.Egress(string(p))
+	var newConv string
+	if *w.convDetected == "" {
+		if m := convIDRegex.FindStringSubmatch(text); len(m) > 1 && sessionstore.IsValidConversationID(m[1]) {
+			*w.convDetected = m[1]
+			newConv = m[1]
+		}
+	}
+	canPost := w.jobID != "" && w.apiURL != "" && strings.TrimSpace(text) != ""
+	if canPost {
+		*w.streamedAny = true
+	}
+	w.mu.Unlock()
+
+	if newConv != "" && w.jobID != "" && w.apiURL != "" {
+		_ = controlplane.PostConversation(w.ctx, w.apiURL, w.token, w.jobID, newConv)
+	}
+	if canPost {
+		_ = controlplane.PostChunk(w.ctx, w.apiURL, w.token, w.jobID, w.stream, text)
+	}
+	return len(p), nil
+}
+
+func discoverLogFileConversation(logPath string) string {
+	if strings.TrimSpace(logPath) == "" {
+		return ""
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil || len(b) == 0 {
+		return ""
+	}
+	if m := convIDRegex.FindStringSubmatch(string(b)); len(m) > 1 && sessionstore.IsValidConversationID(m[1]) {
+		return m[1]
+	}
+	return ""
+}
+
+func discoverStoryFromASEState(workingDir string, after time.Time) (storyID, storyTitle, storyPath string) {
+	if strings.TrimSpace(workingDir) == "" {
+		return "", "", ""
+	}
+	checkSessionFile := func(p string) string {
+		fi, err := os.Stat(p)
+		if err != nil || fi.IsDir() || fi.ModTime().Before(after) {
+			return ""
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return ""
+		}
+		if m := storyIDRegex.FindStringSubmatch(string(b)); len(m) > 1 {
+			return m[1]
+		}
+		return ""
+	}
+
+	candidates := []string{
+		filepath.Join(workingDir, ".session_story_id"),
+		filepath.Join(workingDir, ".autopilot", "state.json"),
+		filepath.Join(workingDir, ".autopilot", "ase-state.json"),
+	}
+	if subMatches, err := filepath.Glob(filepath.Join(workingDir, "*", ".session_story_id")); err == nil {
+		candidates = append(candidates, subMatches...)
+	}
+	for _, p := range candidates {
+		if sid := checkSessionFile(p); sid != "" {
+			storyID = sid
+			break
+		}
+	}
+
+	storyGlobs := []string{
+		filepath.Join(workingDir, "docs", "stories", "*.story.md"),
+		filepath.Join(workingDir, "*", "docs", "stories", "*.story.md"),
+	}
+	for _, pattern := range storyGlobs {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, mPath := range matches {
+			fi, errS := os.Stat(mPath)
+			if errS != nil || fi.IsDir() || fi.ModTime().Before(after) {
+				continue
+			}
+			b, errR := os.ReadFile(mPath)
+			if errR != nil {
+				continue
+			}
+			content := string(b)
+			var fileSID, fileTitle string
+			for _, line := range strings.Split(content, "\n") {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "id:") && fileSID == "" {
+					if m := storyIDRegex.FindStringSubmatch(trimmed); len(m) > 1 {
+						fileSID = m[1]
+					}
+				} else if strings.HasPrefix(trimmed, "title:") && fileTitle == "" {
+					fileTitle = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "title:")), `"'`)
+				}
+			}
+			if fileSID == "" {
+				if m := storyIDRegex.FindStringSubmatch(filepath.Base(mPath)); len(m) > 1 {
+					fileSID = m[1]
+				}
+			}
+			if storyID == "" || fileSID == storyID {
+				if storyID == "" {
+					storyID = fileSID
+				}
+				if fileTitle != "" {
+					storyTitle = fileTitle
+				}
+				if rel, errRel := filepath.Rel(workingDir, mPath); errRel == nil {
+					storyPath = filepath.ToSlash(rel)
+				} else {
+					storyPath = filepath.ToSlash(mPath)
+				}
+				break
+			}
+		}
+	}
+	return storyID, storyTitle, storyPath
+}
+
+func discoverNewBrainConversation(after time.Time, preExisting map[string]bool) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	brainDir := filepath.Join(home, geminiDirName, agyCliDirName, "brain")
+	if entries, err := os.ReadDir(brainDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() || preExisting[e.Name()] {
+				continue
+			}
+			if !sessionstore.IsValidConversationID(e.Name()) {
+				continue
+			}
+			if info, errI := e.Info(); errI == nil && info.ModTime().After(after) {
+				return e.Name()
+			}
+		}
+	}
+	convDir := filepath.Join(home, geminiDirName, agyCliDirName, "conversations")
+	if entries, err := os.ReadDir(convDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".db") {
+				continue
+			}
+			cid := strings.TrimSuffix(e.Name(), ".db")
+			if preExisting[cid] || !sessionstore.IsValidConversationID(cid) {
+				continue
+			}
+			if info, errI := e.Info(); errI == nil && info.ModTime().After(after) {
+				return cid
+			}
+		}
+	}
+	return ""
 }
 
 // PromptRunner defines the interface for executing prompts in a submodule directory.
@@ -223,9 +416,18 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	isMockAgy := strings.HasPrefix(baseEffectiveAgent, "mock-agy")
 	isDirectAgy := r.AutopilotBinary == "autopilot" && (baseEffectiveAgent == "agy" || baseEffectiveAgent == "agy.exe")
 
+	var tmpLogPath string
 	if isMockAgy || isDirectAgy {
+		if logFile, errL := os.CreateTemp("", fmt.Sprintf("iazio-agy-log-%s-*.log", opts.PromptID)); errL == nil {
+			tmpLogPath = logFile.Name()
+			_ = logFile.Close()
+			defer os.Remove(tmpLogPath)
+		}
 		cmdBin = effectiveAgent
 		args = []string{"--print", opts.Prompt, "--dangerously-skip-permissions"}
+		if tmpLogPath != "" {
+			args = append(args, "--log-file", tmpLogPath)
+		}
 	} else if storyID != "" && targetAgent == "autopilot" && strings.TrimSpace(opts.Prompt) == "" {
 		args = []string{"story", "run", "--story", storyID}
 	} else {
@@ -272,9 +474,53 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	// Dual delivery: also pipe prompt bytes to Stdin for mock or stdin-reading executors
 	cmd.Stdin = bytes.NewReader([]byte(opts.Prompt))
 
+	jobID := strings.TrimSpace(opts.JobID)
+	if jobID == "" {
+		jobID = strings.TrimSpace(os.Getenv("IAZIO_JOB_ID"))
+	}
+	apiURL := strings.TrimSpace(opts.APIURL)
+	if apiURL == "" {
+		apiURL = strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_URL"))
+	}
+	token := strings.TrimSpace(opts.Token)
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("IAZIO_HARNESS_TOKEN"))
+	}
+
+	preExistingConvs := map[string]bool{}
+	if home, errH := os.UserHomeDir(); errH == nil && home != "" {
+		if entries, errD := os.ReadDir(filepath.Join(home, geminiDirName, agyCliDirName, "brain")); errD == nil {
+			for _, e := range entries {
+				preExistingConvs[e.Name()] = true
+			}
+		}
+		if entries, errD := os.ReadDir(filepath.Join(home, geminiDirName, agyCliDirName, "conversations")); errD == nil {
+			for _, e := range entries {
+				preExistingConvs[strings.TrimSuffix(e.Name(), ".db")] = true
+			}
+		}
+	}
+
+	var streamMu sync.Mutex
 	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+	lastOutAt := startTime
+	streamedAny := false
+	detectedConvID := ""
+
+	var stdoutW io.Writer = &stdoutBuf
+	var stderrW io.Writer = &stderrBuf
+	if jobID != "" && apiURL != "" {
+		stdoutW = &chunkStreamingWriter{
+			mu: &streamMu, buf: &stdoutBuf, lastOutAt: &lastOutAt, streamedAny: &streamedAny,
+			convDetected: &detectedConvID, ctx: ctx, apiURL: apiURL, token: token, jobID: jobID, stream: "stdout",
+		}
+		stderrW = &chunkStreamingWriter{
+			mu: &streamMu, buf: &stderrBuf, lastOutAt: &lastOutAt, streamedAny: &streamedAny,
+			convDetected: &detectedConvID, ctx: ctx, apiURL: apiURL, token: token, jobID: jobID, stream: "stderr",
+		}
+	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 
 	// Capture pre-execution Git state
 	preHeadSHA, preTreeSHA, _ := captureGitSnapshot(opts.WorkingDir, gitBin)
@@ -288,6 +534,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		return &PromptResult{
 			PromptID:      opts.PromptID,
 			Repo:          opts.Repo,
+			WorktreePath:  opts.WorkingDir,
 			TargetAgent:   targetAgent,
 			Status:        "failed",
 			ExitCode:      1,
@@ -302,6 +549,63 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 
 	engines.PostStartProcessGroup(cmd)
+
+	toolPID := 0
+	if cmd.Process != nil {
+		toolPID = cmd.Process.Pid
+	}
+	boundStoryID := storyID
+	tickDone := make(chan struct{})
+	if jobID != "" && apiURL != "" {
+		_ = controlplane.PostTick(ctx, apiURL, token, jobID, 0, os.Getpid(), toolPID, 0)
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-tickDone:
+					return
+				case <-execCtx.Done():
+					return
+				case <-ticker.C:
+					streamMu.Lock()
+					silentMs := time.Since(lastOutAt).Milliseconds()
+					curConv := detectedConvID
+					curBoundStory := boundStoryID
+					streamMu.Unlock()
+					elapsedSec := int(time.Since(startTime).Seconds())
+					_ = controlplane.PostTick(ctx, apiURL, token, jobID, silentMs, os.Getpid(), toolPID, elapsedSec)
+					if curConv == "" {
+						cid := discoverLogFileConversation(tmpLogPath)
+						if cid == "" {
+							cid = discoverNewBrainConversation(startTime.Add(-2*time.Second), preExistingConvs)
+						}
+						if cid != "" {
+							streamMu.Lock()
+							if detectedConvID == "" {
+								detectedConvID = cid
+							}
+							streamMu.Unlock()
+							_ = controlplane.PostConversation(ctx, apiURL, token, jobID, cid)
+						}
+					}
+					if curBoundStory == "" {
+						if sid, stitle, spath := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second)); sid != "" {
+							streamMu.Lock()
+							if boundStoryID == "" {
+								boundStoryID = sid
+							}
+							streamMu.Unlock()
+							if stitle == "" {
+								stitle = opts.Title
+							}
+							_ = controlplane.PostStoryBinding(ctx, apiURL, token, jobID, sid, stitle, spath, opts.FencingToken)
+						}
+					}
+				}
+			}
+		}()
+	}
 
 	// 4. Wait for execution or cancellation / timeout
 	waitDone := make(chan error, 1)
@@ -347,6 +651,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 		}
 	}
+	close(tickDone)
 
 	durationMs := time.Since(startTime).Milliseconds()
 
@@ -354,16 +659,36 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	headSHA, treeSHA, modified := captureGitSnapshot(opts.WorkingDir, gitBin)
 
 	// 6. Output Summary & Redaction
-	combinedOutput := stdoutBuf.String() + "\n" + stderrBuf.String()
-	summary := stdoutBuf.String()
+	streamMu.Lock()
+	rawOut := stdoutBuf.String()
+	rawErr := stderrBuf.String()
+	alreadyStreamed := streamedAny
+	curConv := detectedConvID
+	streamMu.Unlock()
+
+	combinedOutput := rawOut + "\n" + rawErr
+	summary := rawOut
 	if strings.TrimSpace(summary) == "" {
-		if stderrBuf.Len() > 0 {
-			summary = stderrBuf.String()
+		if len(rawErr) > 0 {
+			summary = rawErr
 		} else if waitErr != nil {
 			summary = waitErr.Error()
 		}
 	}
 	summary = redact.Egress(strings.TrimSpace(summary))
+
+	if curConv == "" {
+		if cid := discoverLogFileConversation(tmpLogPath); cid != "" {
+			curConv = cid
+		} else if m := convIDRegex.FindStringSubmatch(combinedOutput); len(m) > 1 && sessionstore.IsValidConversationID(m[1]) {
+			curConv = m[1]
+		} else if cid := discoverNewBrainConversation(startTime.Add(-2*time.Second), preExistingConvs); cid != "" {
+			curConv = cid
+		}
+		if curConv != "" && jobID != "" && apiURL != "" {
+			_ = controlplane.PostConversation(ctx, apiURL, token, jobID, curConv)
+		}
+	}
 
 	if hasHeadlessPermissionDenial(combinedOutput) {
 		execStatus = "failed"
@@ -373,19 +698,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		waitErr = fmt.Errorf("PERMISSION_DENIED: headless agent tool permission was auto-denied: %s", summary)
 	}
 
-	jobID := strings.TrimSpace(opts.JobID)
-	if jobID == "" {
-		jobID = strings.TrimSpace(os.Getenv("IAZIO_JOB_ID"))
-	}
-	apiURL := strings.TrimSpace(opts.APIURL)
-	if apiURL == "" {
-		apiURL = strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_URL"))
-	}
-	token := strings.TrimSpace(opts.Token)
-	if token == "" {
-		token = strings.TrimSpace(os.Getenv("IAZIO_HARNESS_TOKEN"))
-	}
-	if jobID != "" && apiURL != "" && summary != "" {
+	if jobID != "" && apiURL != "" && summary != "" && !alreadyStreamed {
 		_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", summary+"\n")
 	}
 
@@ -393,9 +706,23 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	var detectedStoryPath string
 	var detectedStoryTitle string
 
+	if aseSID, aseTitle, asePath := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second)); aseSID != "" {
+		if detectedStoryID == "" {
+			detectedStoryID = aseSID
+		}
+		if aseTitle != "" {
+			detectedStoryTitle = aseTitle
+		}
+		if asePath != "" {
+			detectedStoryPath = asePath
+		}
+	}
+
 	for _, f := range modified {
-		if strings.HasPrefix(f, "docs/stories/") && strings.HasSuffix(f, ".story.md") {
-			detectedStoryPath = f
+		if (strings.HasPrefix(f, "docs/stories/") || strings.Contains(f, "/docs/stories/")) && strings.HasSuffix(f, ".story.md") {
+			if detectedStoryPath == "" {
+				detectedStoryPath = f
+			}
 			if detectedStoryID == "" {
 				if m := storyIDRegex.FindStringSubmatch(f); len(m) > 1 {
 					detectedStoryID = m[1]
@@ -410,27 +737,41 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			detectedStoryID = m[1]
 		}
 	}
-	if opts.Title != "" {
+	if detectedStoryTitle == "" && opts.Title != "" {
 		detectedStoryTitle = opts.Title
 	}
+	streamMu.Lock()
+	alreadyBoundStory := boundStoryID
+	streamMu.Unlock()
+	if detectedStoryID != "" && detectedStoryID != alreadyBoundStory && jobID != "" && apiURL != "" {
+		_ = controlplane.PostStoryBinding(ctx, apiURL, token, jobID, detectedStoryID, detectedStoryTitle, detectedStoryPath, opts.FencingToken)
+	}
 
+	var convIDs []string
+	if curConv != "" {
+		convIDs = []string{curConv}
+	}
 	result := &PromptResult{
-		PromptID:      opts.PromptID,
-		Repo:          opts.Repo,
-		Branch:        targetBranch,
-		TargetAgent:   targetAgent,
-		StoryID:       detectedStoryID,
-		StoryTitle:    detectedStoryTitle,
-		StoryPath:     detectedStoryPath,
-		Status:        execStatus,
-		ExitCode:      exitCode,
-		PreGitHeadSHA: preHeadSHA,
-		PreGitTreeSHA: preTreeSHA,
-		GitHeadSHA:    headSHA,
-		GitTreeSHA:    treeSHA,
-		ModifiedFiles: modified,
-		Summary:       summary,
-		DurationMs:    durationMs,
+		PromptID:             opts.PromptID,
+		Repo:                 opts.Repo,
+		WorktreePath:         opts.WorkingDir,
+		Branch:               targetBranch,
+		TargetAgent:          targetAgent,
+		StoryID:              detectedStoryID,
+		StoryTitle:           detectedStoryTitle,
+		StoryPath:            detectedStoryPath,
+		ConversationID:       curConv,
+		ActiveConversationID: curConv,
+		ConversationIDs:      convIDs,
+		Status:               execStatus,
+		ExitCode:             exitCode,
+		PreGitHeadSHA:        preHeadSHA,
+		PreGitTreeSHA:        preTreeSHA,
+		GitHeadSHA:           headSHA,
+		GitTreeSHA:           treeSHA,
+		ModifiedFiles:        modified,
+		Summary:              summary,
+		DurationMs:           durationMs,
 	}
 
 	if waitErr != nil && execStatus != "completed" {

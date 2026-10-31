@@ -1,14 +1,18 @@
 package autopilot
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -477,5 +481,105 @@ func TestCLIPromptRunner_FailsOnJetskiHeadlessPermissionDenial(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "PERMISSION_DENIED") {
 		t.Fatalf("expected PERMISSION_DENIED error, got: %v", err)
+	}
+}
+
+func TestDiscoverLogFileConversation_And_DiscoverStoryFromASEState(t *testing.T) {
+	if got := discoverLogFileConversation(""); got != "" {
+		t.Fatalf("expected empty conv ID for blank log path, got %q", got)
+	}
+	if got := discoverLogFileConversation("/nonexistent/path/agy.log"); got != "" {
+		t.Fatalf("expected empty conv ID for missing log path, got %q", got)
+	}
+
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "agy-run.log")
+	if err := os.WriteFile(logPath, []byte("2026-10-31 INFO Created conversation conv-logfile-998877665544\n"), 0o600); err != nil {
+		t.Fatalf("write log file: %v", err)
+	}
+	if got := discoverLogFileConversation(logPath); got != "conv-logfile-998877665544" {
+		t.Fatalf("expected conv-logfile-998877665544, got %q", got)
+	}
+
+	if sid, stitle, spath := discoverStoryFromASEState("", time.Now()); sid != "" || stitle != "" || spath != "" {
+		t.Fatalf("expected empty story result for blank workingDir, got %q %q %q", sid, stitle, spath)
+	}
+
+	after := time.Now().Add(-5 * time.Second)
+	wsDir := filepath.Join(tmpDir, "ws")
+	if err := os.MkdirAll(filepath.Join(wsDir, ".autopilot"), 0o755); err != nil {
+		t.Fatalf("mkdir .autopilot: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(wsDir, "docs", "stories"), 0o755); err != nil {
+		t.Fatalf("mkdir docs/stories: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wsDir, ".session_story_id"), []byte("STORY-GOV-3839\n"), 0o600); err != nil {
+		t.Fatalf("write .session_story_id: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wsDir, ".autopilot", "ase-state.json"), []byte(`{"story_id":"STORY-GOV-3839"}`), 0o600); err != nil {
+		t.Fatalf("write ase-state.json: %v", err)
+	}
+	storyFile := filepath.Join(wsDir, "docs", "stories", "2026-10-31-gov-3839.story.md")
+	storyBody := "---\nid: STORY-GOV-3839\ntitle: \"ASE State Discovery Test\"\nstatus: IN_PROGRESS\n---\n"
+	if err := os.WriteFile(storyFile, []byte(storyBody), 0o600); err != nil {
+		t.Fatalf("write story file: %v", err)
+	}
+
+	sid, stitle, spath := discoverStoryFromASEState(wsDir, after)
+	if sid != "STORY-GOV-3839" {
+		t.Fatalf("expected STORY-GOV-3839, got %q", sid)
+	}
+	if stitle != "ASE State Discovery Test" {
+		t.Fatalf("expected ASE State Discovery Test, got %q", stitle)
+	}
+	if spath != "docs/stories/2026-10-31-gov-3839.story.md" {
+		t.Fatalf("expected docs/stories/2026-10-31-gov-3839.story.md, got %q", spath)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var mu sync.Mutex
+	var buf bytes.Buffer
+	lastOut := time.Now()
+	streamed := false
+	conv := ""
+	csw := &chunkStreamingWriter{
+		mu: &mu, buf: &buf, lastOutAt: &lastOut, streamedAny: &streamed,
+		convDetected: &conv, ctx: context.Background(), apiURL: srv.URL, token: "tok", jobID: "job_1", stream: "stdout",
+	}
+	if n, err := csw.Write(nil); err != nil || n != 0 {
+		t.Fatalf("expected 0, nil for empty write, got %d %v", n, err)
+	}
+	msg := []byte("Created conversation conv-stream-112233445566\n")
+	if n, err := csw.Write(msg); err != nil || n != len(msg) {
+		t.Fatalf("write failed: %d %v", n, err)
+	}
+	if conv != "conv-stream-112233445566" || !streamed {
+		t.Fatalf("expected conv-stream-112233445566 and streamed=true, got %q %v", conv, streamed)
+	}
+
+	wrapper := makeFakeAutopilot(t)
+	runner := NewPromptRunner(wrapper)
+	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:     "prompt_stream_cov",
+		JobID:        "job_stream_cov",
+		APIURL:       srv.URL,
+		Token:        "tok",
+		FencingToken: 7,
+		Repo:         "iazio-web",
+		Title:        "ASE State Discovery Test",
+		Prompt:       "normal execution prompt",
+		TargetAgent:  "autopilot",
+		WorkingDir:   wsDir,
+		Timeout:      10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunPrompt with streaming failed: %v", err)
+	}
+	if res.StoryID != "STORY-GOV-3839" {
+		t.Fatalf("expected StoryID STORY-GOV-3839 from ASE state, got %q", res.StoryID)
 	}
 }
