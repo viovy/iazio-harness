@@ -184,10 +184,14 @@ func TestTaskSupervisor_ExecuteReapExplicit(t *testing.T) {
 	defer sup.Stop()
 
 	tasks := []BackgroundTaskInfo{
-		{PID: -1, Command: "mock-task-1"},
+		{PID: 99999999, Command: "mock-task-1"},
 	}
 	sup.executeReap(tasks, 100*time.Millisecond, 200*time.Millisecond, false)
 	sup.executeReap(tasks, 100*time.Millisecond, 200*time.Millisecond, true)
+}
+
+func TestKillProcessPlatform_NonExistent(t *testing.T) {
+	_ = killProcessPlatform(99999999)
 }
 
 func TestFindChildProcesses_NegativeOrZeroPID(t *testing.T) {
