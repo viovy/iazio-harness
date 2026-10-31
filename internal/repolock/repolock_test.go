@@ -3,6 +3,7 @@ package repolock
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -230,3 +231,35 @@ func TestAcquire_ConcurrentFlockContention(t *testing.T) {
 		t.Fatalf("expected ErrRepoBusy under OS flock conflict, got: %v", err)
 	}
 }
+
+func TestRepolock_EdgeCases(t *testing.T) {
+	// Empty worktree path
+	if _, err := Acquire("", LockInfo{}, nil); err == nil {
+		t.Errorf("expected error for empty worktree path")
+	}
+
+	// ForceRelease
+	if err := ForceRelease(""); err != nil {
+		t.Errorf("expected nil for empty ForceRelease, got: %v", err)
+	}
+	wt := t.TempDir()
+	if err := ForceRelease(wt); err != nil {
+		t.Errorf("expected nil for ForceRelease on empty dir, got: %v", err)
+	}
+
+	// Read missing
+	if _, err := Read(filepath.Join(wt, "missing")); err == nil {
+		t.Errorf("expected error reading missing lock")
+	}
+
+	// Update after release
+	h, err := Acquire(wt, LockInfo{JobID: "j1", PID: 123}, nil)
+	if err != nil {
+		t.Fatalf("acquire failed: %v", err)
+	}
+	_ = h.Release()
+	if err := h.Update(LockInfo{JobID: "j2"}); err == nil {
+		t.Errorf("expected error updating released handle")
+	}
+}
+
