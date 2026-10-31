@@ -1436,3 +1436,175 @@ func TestMockAgy_Scenario17_Job3ffa5d0be1649f0e_BufferedStdoutBrainTranscriptStr
 		t.Fatalf("expected STORY-GOV-3850 bound via story-binding, got %q", boundStoryID)
 	}
 }
+
+// Scenario 16 (job_3ffa5d0be1649f0e / STORY-GOV-3852):
+// Verifies that:
+//  1. While agent tool PID (tool_pid) is alive and conversation ba042127-c63f-4b1e-a42e-95b307e61bbc
+//     is resolved and chatty / has executing child tasks, CLIPromptRunner defers timeout instead of killing the run.
+//  2. When agy enters "WaitForConversationFullyIdle: root agent idle; waiting up to 1h0m0s for 1 background task(s)",
+//     CLIPromptRunner reaps the stalled background drain after the grace period and auto-resumes
+//     --conversation=ba042127-c63f-4b1e-a42e-95b307e61bbc in-place to complete STORY-GOV-3850.
+//  3. When auto-resume is disabled (MaxAutoResumeAttempts = 0), a background drain interruption returns
+//     Status="timed_out" and FailureCategory="BACKGROUND_DRAIN_TIMEOUT" (never a false "completed").
+func TestMockAgy_Scenario16_Job3ffa5d0be1649f0e_BackgroundDrainPIDLivenessAndAutoResume(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "background_drain_pid_liveness_and_auto_resume")
+	t.Setenv("MOCK_AGY_FAST", "1")
+	t.Setenv("IAZIO_BG_DRAIN_GRACE_MS", "150")
+
+	var mu sync.Mutex
+	var postedChunks []string
+	var postedConvIDs []string
+	var boundStoryID string
+	var maxToolPIDSeen int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			var body struct {
+				Type    string `json:"type"`
+				Text    string `json:"text"`
+				ToolPID int    `json:"tool_pid"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.Text != "" {
+				postedChunks = append(postedChunks, body.Text)
+			}
+			if body.ToolPID > maxToolPIDSeen {
+				maxToolPIDSeen = body.ToolPID
+			}
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/conversations"):
+			var body struct {
+				ConversationID string `json:"conversation_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.ConversationID != "" {
+				postedConvIDs = append(postedConvIDs, body.ConversationID)
+			}
+			w.WriteHeader(http.StatusOK)
+		case (r.Method == http.MethodPatch || r.Method == http.MethodPost) && strings.HasSuffix(r.URL.Path, "/story-binding"):
+			var body struct {
+				StoryID string `json:"story_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			boundStoryID = body.StoryID
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ticks"):
+			var body struct {
+				ToolPID int `json:"tool_pid"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.ToolPID > maxToolPIDSeen {
+				maxToolPIDSeen = body.ToolPID
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	worktree := initTestGitWorktree(t)
+	_ = os.WriteFile(filepath.Join(worktree, ".gitignore"), []byte(".session_story_id\n"), 0o644)
+	_ = exec.Command("git", "-C", worktree, "add", ".gitignore").Run()
+	_ = exec.Command("git", "-C", worktree, "commit", "-m", "chore: initial").Run()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	runner := autopilot.NewPromptRunner("")
+	runner.BackgroundDrainGracePeriod = 150 * time.Millisecond
+
+	// Set a short 300ms nominal timeout so Turn 1's 480ms active/chatty phase triggers PID liveness timeout deferral!
+	res, err := runner.RunPrompt(ctx, autopilot.RunPromptOptions{
+		PromptID:    "prompt_3ffa5d0be1649f0e",
+		JobID:       "job_3ffa5d0be1649f0e",
+		APIURL:      srv.URL,
+		Repo:        "/home/romeo/work/meta-repo-02",
+		WorkingDir:  worktree,
+		Prompt:      "/autonomous-story-execution STORY-GOV-3850",
+		TargetAgent: "agy",
+		Timeout:     300 * time.Millisecond,
+	})
+	if err != nil {
+		mu.Lock()
+		chunksDebug := strings.Join(postedChunks, "")
+		mu.Unlock()
+		t.Fatalf("expected RunPrompt to auto-resume and succeed, got error: %v (res=%+v)\nchunks:\n%s", err, res, chunksDebug)
+	}
+	if res == nil || res.Status != "completed" || res.ExitCode != 0 {
+		t.Fatalf("expected completed exit 0, got %+v", res)
+	}
+	if res.ActiveConversationID != "ba042127-c63f-4b1e-a42e-95b307e61bbc" {
+		t.Fatalf("expected active conversation ba042127-c63f-4b1e-a42e-95b307e61bbc, got %q", res.ActiveConversationID)
+	}
+	if res.StoryID != "STORY-GOV-3850" {
+		t.Fatalf("expected StoryID STORY-GOV-3850, got %q", res.StoryID)
+	}
+	if res.ToolPID <= 0 {
+		t.Fatalf("expected non-zero ToolPID in PromptResult, got %d", res.ToolPID)
+	}
+	if res.ResumeAttempts < 1 {
+		t.Fatalf("expected at least 1 auto-resume attempt, got %d", res.ResumeAttempts)
+	}
+	if res.FailureCategory != "" {
+		t.Fatalf("expected empty FailureCategory on completed job, got %q", res.FailureCategory)
+	}
+
+	mu.Lock()
+	allChunks := strings.Join(postedChunks, "")
+	seenToolPID := maxToolPIDSeen
+	mu.Unlock()
+
+	if seenToolPID <= 0 {
+		t.Fatalf("expected non-zero tool_pid posted in ticks, got %d", seenToolPID)
+	}
+	for _, expected := range []string{
+		"[ASE-SUPERVISOR] Attached Antigravity conversation: ba042127-c63f-4b1e-a42e-95b307e61bbc",
+		"[pid_liveness.timeout_deferred]",
+		"[background_task.auto_reaped]",
+		"[auto_resume.triggered] Auto-resuming conversation ba042127-c63f-4b1e-a42e-95b307e61bbc",
+		"Auto-resumed conversation ba042127-c63f-4b1e-a42e-95b307e61bbc and completed STORY-GOV-3850",
+	} {
+		if !strings.Contains(allChunks, expected) {
+			t.Fatalf("expected streamed chunks to contain %q, got:\n%s", expected, allChunks)
+		}
+	}
+	if boundStoryID != "STORY-GOV-3850" {
+		t.Fatalf("expected STORY-GOV-3850 bound via story-binding, got %q", boundStoryID)
+	}
+
+	// Sub-case B: When auto-resume is disabled (MaxAutoResumeAttempts = 0), background drain timeout MUST NOT return COMPLETED
+	worktree2 := initTestGitWorktree(t)
+	_ = os.WriteFile(filepath.Join(worktree2, ".gitignore"), []byte(".session_story_id\n"), 0o644)
+	_ = exec.Command("git", "-C", worktree2, "add", ".gitignore").Run()
+	_ = exec.Command("git", "-C", worktree2, "commit", "-m", "chore: initial").Run()
+
+	zeroResumes := 0
+	resFail, errFail := runner.RunPrompt(ctx, autopilot.RunPromptOptions{
+		PromptID:              "prompt_3ffa5d0be1649f0e_no_resume",
+		JobID:                 "job_3ffa5d0be1649f0e",
+		APIURL:                srv.URL,
+		Repo:                  "/home/romeo/work/meta-repo-02",
+		WorkingDir:            worktree2,
+		Prompt:                "/autonomous-story-execution STORY-GOV-3850",
+		TargetAgent:           "agy",
+		Timeout:               2 * time.Second,
+		MaxAutoResumeAttempts: &zeroResumes,
+	})
+	if errFail == nil {
+		t.Fatalf("expected error when background drain times out without auto-resume, got nil")
+	}
+	if resFail == nil || resFail.Status == "completed" {
+		t.Fatalf("expected non-completed status on background drain timeout, got %+v", resFail)
+	}
+	if resFail.FailureCategory != "BACKGROUND_DRAIN_TIMEOUT" || resFail.FailureStage != "BACKGROUND_DRAIN" {
+		t.Fatalf("expected FailureCategory=BACKGROUND_DRAIN_TIMEOUT and FailureStage=BACKGROUND_DRAIN, got %+v", resFail)
+	}
+	if resFail.ActiveConversationID != "ba042127-c63f-4b1e-a42e-95b307e61bbc" {
+		t.Fatalf("expected ActiveConversationID preserved on background drain timeout, got %q", resFail.ActiveConversationID)
+	}
+}
