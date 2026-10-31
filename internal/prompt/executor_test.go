@@ -626,3 +626,35 @@ func TestExecutor_DefaultSevenDayTimeoutAndEnvOverride(t *testing.T) {
 		t.Fatalf("expected 7d default timeout, got %v", gotDefault)
 	}
 }
+
+func TestGov3839_ExecutorResolvesAbsoluteWorktreePathAndNormalizedPrompt(t *testing.T) {
+	fleetRoot, _, _ := setupTestFleet(t)
+	runner := &mockPromptRunner{}
+	exec := NewExecutor(fleetRoot, runner)
+	exec.SetLockDir(t.TempDir())
+
+	res, err := exec.Execute(context.Background(), PromptPayload{
+		PromptID:         "job_697e5159287042b2",
+		JobID:            "job_697e5159287042b2",
+		Repo:             fleetRoot,
+		WorktreePath:     fleetRoot,
+		Submodule:        "iazio-mcp",
+		NormalizedPrompt: "Execute story on resolved worktree",
+		TargetAgent:      "agy",
+	})
+	if err != nil {
+		t.Fatalf("Execute with absolute WorktreePath failed: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected non-nil PromptResult")
+	}
+	runner.mu.Lock()
+	opts := runner.lastOpts
+	runner.mu.Unlock()
+	if !strings.Contains(opts.Prompt, "Execute story on resolved worktree") {
+		t.Fatalf("expected NormalizedPrompt fallback to populate RunPromptOptions.Prompt, got %q", opts.Prompt)
+	}
+	if filepath.Base(opts.WorkingDir) != "iazio-mcp" {
+		t.Fatalf("expected Submodule 'iazio-mcp' within WorktreePath to resolve WorkingDir to iazio-mcp, got %q", opts.WorkingDir)
+	}
+}

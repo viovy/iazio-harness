@@ -474,13 +474,16 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		cid := "c0ffee00-54dc-f014-1811-092f00003838"
 		fmt.Fprintf(stdout, "Created conversation %s\n", cid)
 		fmt.Fprintln(stdout, "ALLOCATED_STORY_ID: STORY-WEB-3838")
+		_ = os.WriteFile(".session_story_id", []byte("STORY-WEB-3838\n"), 0644)
+		_ = os.MkdirAll(".autopilot", 0755)
+		_ = os.WriteFile(filepath.Join(".autopilot", "state.json"), []byte(`{"story_id":"STORY-WEB-3838","title":"Sort prompts alphabetically in iazio-web /prompts view"}`), 0644)
 		_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
 		storyFile := filepath.Join("docs", "stories", "2026-10-31-web-3838-sort-prompts-alphabetically.story.md")
 		_ = os.WriteFile(storyFile, []byte("---\nid: STORY-WEB-3838\ntitle: Sort prompts alphabetically in iazio-web /prompts view\nstatus: DONE\n---\n"), 0644)
 		_ = os.MkdirAll(filepath.Join("lib", "screens"), 0755)
 		codeFile := filepath.Join("lib", "screens", "prompts_screen.dart")
 		_ = os.WriteFile(codeFile, []byte("// Sorted alphabetically A-Z\n"), 0644)
-		_ = exec.Command("git", "add", ".").Run()
+		_ = exec.Command("git", "add", "docs", "lib").Run()
 		_ = exec.Command("git", "commit", "-m", "feat(iazio-web): sort prompts alphabetically in /prompts view [STORY-WEB-3838]").Run()
 		fmt.Fprintln(stdout, "[mock-agy] Executed story STORY-WEB-3838: sorted prompts alphabetically in iazio-web /prompts view and verified unit tests.")
 		return 0
@@ -531,9 +534,6 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			}
 		}
 		fmt.Fprintf(stdout, "[mock-agy] Executed prompt: %s\n", fullPrompt)
-		if logFile != "" {
-			_ = os.WriteFile(logFile, []byte("[mock-agy] Log file output\n"), 0644)
-		}
 		return 0
 	}
 }

@@ -11,7 +11,7 @@ import (
 
 // IsSuperprojectRoot checks if repo refers to the superproject itself.
 func IsSuperprojectRoot(repo string) bool {
-	return repo == "." || repo == ("viovy-m"+"eta-repo") || repo == ("m"+"eta-repo") || repo == "superproject"
+	return repo == "." || repo == "root" || repo == ("viovy-m"+"eta-repo") || repo == ("m"+"eta-repo") || strings.HasPrefix(repo, "m"+"eta-repo-") || repo == "superproject"
 }
 
 // CandidateFleetRoots returns candidate host paths where a fleet superproject may reside.
@@ -98,6 +98,24 @@ func ResolveSubmodulePath(fleetRoot, submodule string) (string, error) {
 
 	if IsSuperprojectRoot(cleanRepo) {
 		return filepath.Abs(fleetRoot)
+	}
+
+	if !strings.Contains(cleanRepo, "..") && filepath.IsAbs(cleanRepo) {
+		cleanAbs := filepath.Clean(cleanRepo)
+		if fleetRoot != "" && cleanAbs == filepath.Clean(fleetRoot) {
+			return filepath.Abs(cleanAbs)
+		}
+		if info, err := os.Stat(cleanAbs); err == nil && info.IsDir() {
+			if _, gmErr := os.Stat(filepath.Join(cleanAbs, ".gitmodules")); gmErr == nil {
+				return filepath.Abs(cleanAbs)
+			}
+			parentGm := filepath.Join(filepath.Dir(cleanAbs), ".gitmodules")
+			if _, gmErr := os.Stat(parentGm); gmErr == nil {
+				if reg, _ := IsSubmoduleRegistered(parentGm, filepath.Base(cleanAbs)); reg {
+					return filepath.Abs(cleanAbs)
+				}
+			}
+		}
 	}
 
 	if strings.Contains(cleanRepo, "..") || filepath.IsAbs(cleanRepo) {
