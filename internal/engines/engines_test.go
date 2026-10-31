@@ -1166,8 +1166,8 @@ func TestRawWriter_FiltersRootAgentIdleMessage(t *testing.T) {
 func TestProcessGroupHelpers(t *testing.T) {
 	cmd := exec.Command("sleep", "5")
 	SetProcGroup(cmd)
-	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
-		t.Errorf("expected Setpgid to be true")
+	if !checkProcGroupAttrs(cmd) {
+		t.Errorf("expected process group attributes to be properly configured")
 	}
 	PostStartProcessGroup(cmd)
 	setProcGroup(cmd)
@@ -1186,6 +1186,35 @@ func TestProcessGroupHelpers(t *testing.T) {
 		StopProcessGroup(cmd)
 		KillProcessGroup(cmd)
 		_ = cmd.Wait()
+	}
+}
+
+func TestWatchCancel_Paths(t *testing.T) {
+	// Case 1: done received
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	close(done)
+	watchCancel(ctx, nil, done)
+
+	// Case 2: ctx canceled before done, done finishes immediately
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	done2 := make(chan struct{})
+	close(done2)
+	cmd2 := exec.Command("sleep", "1")
+	watchCancel(ctx2, cmd2, done2)
+}
+
+func TestProcGroup_EdgeCases(t *testing.T) {
+	SetProcGroup(nil)
+	PostStartProcessGroup(nil)
+	if checkProcGroupAttrs(nil) {
+		t.Errorf("expected false for nil cmd")
+	}
+	emptyCmd := &exec.Cmd{}
+	if checkProcGroupAttrs(emptyCmd) {
+		t.Errorf("expected false for empty SysProcAttr")
 	}
 }
 

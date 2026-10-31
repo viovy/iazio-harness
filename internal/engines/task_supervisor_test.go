@@ -177,3 +177,28 @@ func TestTaskSupervisor_TypeB_IdleDaemonReap(t *testing.T) {
 		t.Errorf("expected drained_on_root_idle stream event, got: %v", stream.chunks)
 	}
 }
+
+func TestTaskSupervisor_ExecuteReapExplicit(t *testing.T) {
+	stream := &mockStream{}
+	sup := NewTaskSupervisor(os.Getpid(), stream, 1*time.Second)
+	defer sup.Stop()
+
+	tasks := []BackgroundTaskInfo{
+		{PID: 99999999, Command: "mock-task-1"},
+	}
+	sup.executeReap(tasks, 100*time.Millisecond, 200*time.Millisecond, false)
+	sup.executeReap(tasks, 100*time.Millisecond, 200*time.Millisecond, true)
+}
+
+func TestKillProcessPlatform_NonExistent(t *testing.T) {
+	_ = killProcessPlatform(99999999)
+}
+
+func TestFindChildProcesses_NegativeOrZeroPID(t *testing.T) {
+	if len(FindChildProcesses(0)) != 0 {
+		t.Errorf("expected 0 for pid 0")
+	}
+	if len(FindChildProcesses(-5)) != 0 {
+		t.Errorf("expected 0 for negative pid")
+	}
+}

@@ -473,3 +473,72 @@ func TestAuthHelpers_Comprehensive(t *testing.T) {
 		t.Errorf("expected refreshPresent=true, got %v, %v", pres, err)
 	}
 }
+
+func TestDeviceLogin_ErrorCases(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/device-500":
+			w.WriteHeader(http.StatusInternalServerError)
+		case "/device-bad-json":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("not-json"))
+		case "/device-empty-code":
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"device_code": ""})
+		case "/token-error":
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "access_denied"})
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// 1. DeviceAuthURL returns 500
+	err := deviceLogin(ctx, Endpoints{DeviceAuthURL: ts.URL + "/device-500", TokenURL: ts.URL + "/token-error"})
+	if err == nil {
+		t.Errorf("expected error on device 500")
+	}
+
+	// 2. DeviceAuthURL returns invalid json
+	err = deviceLogin(ctx, Endpoints{DeviceAuthURL: ts.URL + "/device-bad-json", TokenURL: ts.URL + "/token-error"})
+	if err == nil {
+		t.Errorf("expected error on device bad json")
+	}
+
+	// 3. DeviceAuthURL returns empty device code
+	err = deviceLogin(ctx, Endpoints{DeviceAuthURL: ts.URL + "/device-empty-code", TokenURL: ts.URL + "/token-error"})
+	if err == nil {
+		t.Errorf("expected error on empty device code")
+	}
+
+	// 4. Invalid device auth URL
+	canceledCtx, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	err = deviceLogin(canceledCtx, Endpoints{DeviceAuthURL: "http://[::1]:namedport", TokenURL: ts.URL + "/token-error"})
+	if err == nil {
+		t.Errorf("expected error on invalid device auth url request")
+	}
+}
+
+func TestInteractiveLogin_ErrorPaths(t *testing.T) {
+	ctx := context.Background()
+
+	// ep with missing token url
+	t.Setenv("IAZIO_TOKEN_URL", "")
+	t.Setenv("IAZIO_AUTH_URL", "")
+	t.Setenv("IAZIO_DEVICE_AUTH_URL", "")
+	err := interactiveLogin(ctx)
+	if err == nil || !strings.Contains(err.Error(), "token") {
+		t.Errorf("expected token endpoint required error, got %v", err)
+	}
+
+	// ep with token url but missing both auth and device url
+	t.Setenv("IAZIO_TOKEN_URL", "https://token.example.com")
+	err = interactiveLogin(ctx)
+	if err == nil || !strings.Contains(err.Error(), "auth") {
+		t.Errorf("expected auth endpoint required error, got %v", err)
+	}
+}
+

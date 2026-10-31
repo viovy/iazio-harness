@@ -154,3 +154,27 @@ func TestChunker_EmptyFile(t *testing.T) {
 		t.Errorf("expected 0 chunks for empty file, got %d", len(chunks))
 	}
 }
+
+func TestChunker_MultiLanguageSymbols(t *testing.T) {
+	// Python
+	pyCode := "class MyService:\n    async def process(self):\n        pass\n"
+	pyChunks := ChunkFile("repo", "service.py", "tree", "", []byte(pyCode))
+	if len(pyChunks) != 1 || pyChunks[0].Symbol != "MyService" {
+		t.Errorf("expected MyService symbol, got %+v", pyChunks)
+	}
+
+	// JS / TS
+	jsCode := "export class WorkerClient {}\nexport const runTask = async () => {};\nfunction helper() {}\n"
+	jsChunks := ChunkFile("repo", "worker.ts", "tree", "", []byte(jsCode))
+	if len(jsChunks) != 1 || jsChunks[0].Symbol != "WorkerClient" {
+		t.Errorf("expected WorkerClient symbol, got %+v", jsChunks)
+	}
+
+	// Rust
+	rsCode := "pub struct EngineConfig {}\npub async fn start_engine() {}\n"
+	rsChunks := ChunkFile("repo", "engine.rs", "tree", "", []byte(rsCode))
+	if len(rsChunks) != 1 || rsChunks[0].Symbol != "EngineConfig" {
+		t.Errorf("expected EngineConfig symbol, got %+v", rsChunks)
+	}
+}
+
