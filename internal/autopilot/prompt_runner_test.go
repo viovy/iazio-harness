@@ -1,14 +1,18 @@
 package autopilot
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -530,5 +534,52 @@ func TestDiscoverLogFileConversation_And_DiscoverStoryFromASEState(t *testing.T)
 	}
 	if spath != "docs/stories/2026-10-31-gov-3839.story.md" {
 		t.Fatalf("expected docs/stories/2026-10-31-gov-3839.story.md, got %q", spath)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var mu sync.Mutex
+	var buf bytes.Buffer
+	lastOut := time.Now()
+	streamed := false
+	conv := ""
+	csw := &chunkStreamingWriter{
+		mu: &mu, buf: &buf, lastOutAt: &lastOut, streamedAny: &streamed,
+		convDetected: &conv, ctx: context.Background(), apiURL: srv.URL, token: "tok", jobID: "job_1", stream: "stdout",
+	}
+	if n, err := csw.Write(nil); err != nil || n != 0 {
+		t.Fatalf("expected 0, nil for empty write, got %d %v", n, err)
+	}
+	msg := []byte("Created conversation conv-stream-112233445566\n")
+	if n, err := csw.Write(msg); err != nil || n != len(msg) {
+		t.Fatalf("write failed: %d %v", n, err)
+	}
+	if conv != "conv-stream-112233445566" || !streamed {
+		t.Fatalf("expected conv-stream-112233445566 and streamed=true, got %q %v", conv, streamed)
+	}
+
+	wrapper := makeFakeAutopilot(t)
+	runner := NewPromptRunner(wrapper)
+	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:     "prompt_stream_cov",
+		JobID:        "job_stream_cov",
+		APIURL:       srv.URL,
+		Token:        "tok",
+		FencingToken: 7,
+		Repo:         "iazio-web",
+		Title:        "ASE State Discovery Test",
+		Prompt:       "normal execution prompt",
+		TargetAgent:  "autopilot",
+		WorkingDir:   wsDir,
+		Timeout:      10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunPrompt with streaming failed: %v", err)
+	}
+	if res.StoryID != "STORY-GOV-3839" {
+		t.Fatalf("expected StoryID STORY-GOV-3839 from ASE state, got %q", res.StoryID)
 	}
 }
