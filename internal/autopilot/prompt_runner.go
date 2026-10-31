@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/redact"
 )
@@ -65,6 +66,9 @@ func formatW3CTraceParent(rawTraceID, rawSpanID string) (string, string) {
 // RunPromptOptions specifies parameters for executing a prompt via autopilot.
 type RunPromptOptions struct {
 	PromptID    string        `json:"prompt_id"`
+	JobID       string        `json:"job_id,omitempty"`
+	APIURL      string        `json:"api_url,omitempty"`
+	Token       string        `json:"token,omitempty"`
 	StoryID     string        `json:"story_id,omitempty"`
 	Repo        string        `json:"repo"`
 	Branch      string        `json:"branch,omitempty"`
@@ -75,6 +79,13 @@ type RunPromptOptions struct {
 	TraceID     string        `json:"trace_id,omitempty"`
 	Timeout     time.Duration `json:"timeout,omitempty"`
 	GracePeriod time.Duration `json:"grace_period,omitempty"`
+}
+
+func hasHeadlessPermissionDenial(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "jetski: no output produced") ||
+		strings.Contains(lower, "headless mode cannot prompt for") ||
+		strings.Contains(lower, "so it was auto-denied")
 }
 
 // PromptResult represents the structured telemetry returned after prompt execution.
@@ -199,18 +210,26 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		}
 	}
 
-	// 2. Prepare autopilot command invocation:
+	// 2. Prepare autopilot or direct headless agent command invocation:
 	// If the prompt targets story execution via autopilot, route directly to the standard
 	// built-in `autopilot story run --story <ID>`, eliminating exit 99 across older host runtimes.
+	cmdBin := r.AutopilotBinary
 	var args []string
-	if storyID != "" && targetAgent == "autopilot" && strings.TrimSpace(opts.Prompt) == "" {
+	effectiveAgent := targetAgent
+	if effectiveAgent == "" || effectiveAgent == "auto" || (storyID == "" && effectiveAgent == "autopilot") {
+		effectiveAgent = "agy"
+	}
+	baseEffectiveAgent := strings.ToLower(filepath.Base(effectiveAgent))
+	isMockAgy := strings.HasPrefix(baseEffectiveAgent, "mock-agy")
+	isDirectAgy := r.AutopilotBinary == "autopilot" && (baseEffectiveAgent == "agy" || baseEffectiveAgent == "agy.exe")
+
+	if isMockAgy || isDirectAgy {
+		cmdBin = effectiveAgent
+		args = []string{"--print", opts.Prompt, "--dangerously-skip-permissions"}
+	} else if storyID != "" && targetAgent == "autopilot" && strings.TrimSpace(opts.Prompt) == "" {
 		args = []string{"story", "run", "--story", storyID}
 	} else {
 		args = []string{"prompt", "run", "--file", tmpPath}
-		effectiveAgent := targetAgent
-		if effectiveAgent == "" || effectiveAgent == "auto" || (storyID == "" && effectiveAgent == "autopilot") {
-			effectiveAgent = "agy"
-		}
 		args = append(args, "--target-agent", effectiveAgent)
 		if opts.Title != "" {
 			args = append(args, "--title", opts.Title)
@@ -223,7 +242,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.Command(r.AutopilotBinary, args...)
+	cmd := exec.Command(cmdBin, args...)
 	cmd.Dir = opts.WorkingDir
 
 	// Propagate Zipkin/W3C trace continuity and target branch into autopilot process
@@ -335,6 +354,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	headSHA, treeSHA, modified := captureGitSnapshot(opts.WorkingDir, gitBin)
 
 	// 6. Output Summary & Redaction
+	combinedOutput := stdoutBuf.String() + "\n" + stderrBuf.String()
 	summary := stdoutBuf.String()
 	if strings.TrimSpace(summary) == "" {
 		if stderrBuf.Len() > 0 {
@@ -344,6 +364,30 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		}
 	}
 	summary = redact.Egress(strings.TrimSpace(summary))
+
+	if hasHeadlessPermissionDenial(combinedOutput) {
+		execStatus = "failed"
+		if exitCode == 0 {
+			exitCode = 1
+		}
+		waitErr = fmt.Errorf("PERMISSION_DENIED: headless agent tool permission was auto-denied: %s", summary)
+	}
+
+	jobID := strings.TrimSpace(opts.JobID)
+	if jobID == "" {
+		jobID = strings.TrimSpace(os.Getenv("IAZIO_JOB_ID"))
+	}
+	apiURL := strings.TrimSpace(opts.APIURL)
+	if apiURL == "" {
+		apiURL = strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_URL"))
+	}
+	token := strings.TrimSpace(opts.Token)
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("IAZIO_HARNESS_TOKEN"))
+	}
+	if jobID != "" && apiURL != "" && summary != "" {
+		_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", summary+"\n")
+	}
 
 	detectedStoryID := storyID
 	var detectedStoryPath string

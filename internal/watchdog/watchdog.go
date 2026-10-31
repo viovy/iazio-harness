@@ -242,10 +242,14 @@ func (w *Watchdog) SweepDeadProcesses() []string {
 		if job.Status != StatusRunning {
 			continue
 		}
-		if job.PID <= 0 || !w.isAlive(job.PID) {
+		checkPID := job.HarnessPID
+		if checkPID <= 0 {
+			checkPID = job.PID
+		}
+		if checkPID <= 0 || !w.isAlive(checkPID) {
 			job.Status = StatusTerminatedUnexpectedly
 			job.UpdatedAt = now
-			job.LastError = fmt.Sprintf("process PID %d terminated unexpectedly without clean exit", job.PID)
+			job.LastError = fmt.Sprintf("process PID %d terminated unexpectedly without clean exit", checkPID)
 			reaped = append(reaped, jobID)
 
 			// Clean up stale repo lock if worktree path is present

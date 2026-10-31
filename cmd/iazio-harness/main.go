@@ -505,9 +505,6 @@ func cleanStaleGitLocks(workspacePath string) []string {
 }
 
 func isASEJob(job controlplane.JobDetail) bool {
-	if job.Kind == "ordinary" {
-		return false
-	}
 	if job.Kind == "ase" || job.Kind == "story_execution" || job.Kind == "story_refinement" {
 		return true
 	}
@@ -517,6 +514,12 @@ func isASEJob(job controlplane.JobDetail) bool {
 	}
 	if job.StoryID != "" && job.StoryID != fallbackResumeStoryID && job.StoryID != "pending_harness_creation" {
 		return true
+	}
+	if extracted := sessionstore.ExtractStoryID(job.Prompt); extracted != "" && (strings.Contains(promptLower, "execute story") || strings.EqualFold(job.Engine, "autopilot")) {
+		return true
+	}
+	if job.Kind == "ordinary" {
+		return false
 	}
 	return false
 }
@@ -1061,6 +1064,11 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	defer lock.Release()
 
 	storyID := job.StoryID
+	if strings.TrimSpace(storyID) == "" {
+		if extracted := sessionstore.ExtractStoryID(job.Prompt); extracted != "" {
+			storyID = extracted
+		}
+	}
 	isASE := isASEJob(job)
 	if isASE {
 		if strings.TrimSpace(storyID) == "" || strings.EqualFold(storyID, fallbackResumeStoryID) || strings.EqualFold(storyID, "resume complete current ase flow") {

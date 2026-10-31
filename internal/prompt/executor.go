@@ -19,6 +19,9 @@ import (
 // PromptPayload represents the structured JSON input received from iazio-agent.
 type PromptPayload struct {
 	PromptID       string `json:"prompt_id"`
+	JobID          string `json:"job_id,omitempty"`
+	APIURL         string `json:"api_url,omitempty"`
+	Token          string `json:"token,omitempty"`
 	StoryID        string `json:"story_id,omitempty"`
 	Repo           string `json:"repo"`
 	Branch         string `json:"branch,omitempty"`
@@ -130,6 +133,9 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 
 	opts := autopilot.RunPromptOptions{
 		PromptID:    payload.PromptID,
+		JobID:       strings.TrimSpace(payload.JobID),
+		APIURL:      strings.TrimSpace(payload.APIURL),
+		Token:       strings.TrimSpace(payload.Token),
 		StoryID:     payload.StoryID,
 		Repo:        payload.Repo,
 		Branch:      strings.TrimSpace(payload.Branch),

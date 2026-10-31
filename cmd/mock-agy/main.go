@@ -103,7 +103,7 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		case strings.HasPrefix(arg, "--prompt="):
 			printPrompt = strings.TrimPrefix(arg, "--prompt=")
 		case arg == "--print" || arg == "-p" || arg == "--prompt":
-			if i+1 < len(args) {
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
 				printPrompt = args[i+1]
 				i++
 			}
@@ -462,6 +462,58 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "[mock-agy] Progress checkpoint %d: verified test gates passing...\n", i)
 		}
 		fmt.Fprintln(stdout, "[mock-agy] Story STORY-GOV-3715 executed successfully with cryptographic proof of mutation.")
+		return 0
+
+	case "gemini_web_mcp_sort_prompts_flow":
+		// Scenario: Gemini Web -> iazio-mcp -> iazio-harness-api -> iazio-agent -> iazio-harness -> mock-agy (job_54dcf0141811092f)
+		// If --dangerously-skip-permissions was NOT passed, reproduce the exact silent exit-0 permission denial from job_54dcf0141811092f.
+		if !skipPermissions {
+			fmt.Fprintln(stdout, `jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g. command(<target>)). Alternatively, re-run with --dangerously-skip-permissions to auto-approve all tools.`)
+			return 0
+		}
+		cid := "c0ffee00-54dc-f014-1811-092f00003838"
+		fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+		fmt.Fprintln(stdout, "ALLOCATED_STORY_ID: STORY-WEB-3838")
+		_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
+		storyFile := filepath.Join("docs", "stories", "2026-10-31-web-3838-sort-prompts-alphabetically.story.md")
+		_ = os.WriteFile(storyFile, []byte("---\nid: STORY-WEB-3838\ntitle: Sort prompts alphabetically in iazio-web /prompts view\nstatus: DONE\n---\n"), 0644)
+		_ = os.MkdirAll(filepath.Join("lib", "screens"), 0755)
+		codeFile := filepath.Join("lib", "screens", "prompts_screen.dart")
+		_ = os.WriteFile(codeFile, []byte("// Sorted alphabetically A-Z\n"), 0644)
+		_ = exec.Command("git", "add", ".").Run()
+		_ = exec.Command("git", "commit", "-m", "feat(iazio-web): sort prompts alphabetically in /prompts view [STORY-WEB-3838]").Run()
+		fmt.Fprintln(stdout, "[mock-agy] Executed story STORY-WEB-3838: sorted prompts alphabetically in iazio-web /prompts view and verified unit tests.")
+		return 0
+
+	case "job_1350_dirty_worktree_post_exit":
+		// Scenario: job-1350 (sch-1348, Prompt: "Execute story STORY-ROOT-245", Kind: "ordinary", Engine: "autopilot" / "mock-agy")
+		// Turn 1 exits 0 leaving 4 modified/untracked files without completing story.
+		// Turn 2 (in-place continuation) cleans dirty files, marks STORY-ROOT-245 DONE, and commits cleanly.
+		stateMarker := filepath.Join(os.TempDir(), "mock_agy_job_1350_turn.tmp")
+		if customMarker := os.Getenv("MOCK_AGY_STATE_MARKER"); customMarker != "" {
+			stateMarker = customMarker
+		}
+		_, mErr := os.Stat(stateMarker)
+		isTurn2 := (mErr == nil) || strings.Contains(strings.ToLower(fullPrompt), "resume")
+		if !isTurn2 {
+			_ = os.WriteFile(stateMarker, []byte("turn1"), 0644)
+			for i := 1; i <= 4; i++ {
+				_ = os.WriteFile(fmt.Sprintf("dirty_1350_%d.txt", i), []byte("uncommitted work\n"), 0644)
+			}
+			fmt.Fprintln(stdout, "Created conversation c0ffee00-1350-1348-9abc-000000001350")
+			fmt.Fprintln(stdout, "[mock-agy] Turn 1 exiting 0 with 4 dirty files in worktree...")
+			return 0
+		}
+		_ = os.Remove(stateMarker)
+		for i := 1; i <= 4; i++ {
+			_ = os.Remove(fmt.Sprintf("dirty_1350_%d.txt", i))
+		}
+		_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
+		storyFile := filepath.Join("docs", "stories", "story-root-245.story.md")
+		_ = os.WriteFile(storyFile, []byte("---\nid: STORY-ROOT-245\ntitle: Fix dirty worktree post exit\nstatus: DONE\n---\n"), 0644)
+		_ = exec.Command("git", "add", ".").Run()
+		_ = exec.Command("git", "commit", "-m", "feat: complete STORY-ROOT-245 cleanly").Run()
+		fmt.Fprintln(stdout, "[mock-agy] Turn 2 cleaned dirty worktree and completed STORY-ROOT-245.")
 		return 0
 
 	default:

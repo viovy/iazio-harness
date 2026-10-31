@@ -725,3 +725,24 @@ func TestCheckASECompletion_StoryDone_Complete(t *testing.T) {
 		t.Fatalf("expected complete=true when story is DONE on disk, got false")
 	}
 }
+
+func TestDiagnose_JetskiHeadlessPermissionDenial(t *testing.T) {
+	rep := Diagnose(DiagnosticInput{
+		JobID:      "job_54dcf0141811092f",
+		ExitCode:   0,
+		OutputText: `jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g. command(<target>)). Alternatively, re-run with --dangerously-skip-permissions to auto-approve all tools.`,
+	})
+	if rep.Healthy {
+		t.Fatal("expected Healthy=false when jetski permission denial is present")
+	}
+	found := false
+	for _, f := range rep.Findings {
+		if f.Code == CodePermissionDenied {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected CodePermissionDenied finding, got: %+v", rep.Findings)
+	}
+}
