@@ -357,4 +357,39 @@ func TestMockAgy_ScenariosUnit(t *testing.T) {
 			t.Fatalf("unexpected stdout: %s", stdout.String())
 		}
 	})
+
+	t.Run("Scenario16_Job3ffa5d0be1649f0e_BgDrainPIDLiveness", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		origWd, _ := os.Getwd()
+		_ = os.Chdir(tmpDir)
+		defer func() { _ = os.Chdir(origWd) }()
+
+		t.Setenv("HOME", tmpDir)
+		t.Setenv("MOCK_AGY_UNIT", "1")
+
+		_ = exec.Command("git", "init").Run()
+		_ = exec.Command("git", "config", "user.email", "test@test.local").Run()
+		_ = exec.Command("git", "config", "user.name", "Tester").Run()
+
+		logFile1 := filepath.Join(tmpDir, "turn1.log")
+		var stdout1, stderr1 bytes.Buffer
+		code1 := run([]string{"--log-file=" + logFile1, "--print=/autonomous-story-execution STORY-GOV-3850"}, "background_drain_pid_liveness_and_auto_resume", &stdout1, &stderr1)
+		if code1 != 0 {
+			t.Fatalf("expected turn 1 exit 0, got %d: %s", code1, stderr1.String())
+		}
+		logBytes1, _ := os.ReadFile(logFile1)
+		if !strings.Contains(stdout1.String()+string(logBytes1), "ba042127-c63f-4b1e-a42e-95b307e61bbc") {
+			t.Fatalf("expected conversation ID in turn 1 output/log: %s", stdout1.String()+string(logBytes1))
+		}
+
+		logFile2 := filepath.Join(tmpDir, "turn2.log")
+		var stdout2, stderr2 bytes.Buffer
+		code2 := run([]string{"--log-file=" + logFile2, "--conversation=ba042127-c63f-4b1e-a42e-95b307e61bbc", "Resume and complete STORY-GOV-3850"}, "background_drain_pid_liveness_and_auto_resume", &stdout2, &stderr2)
+		if code2 != 0 {
+			t.Fatalf("expected turn 2 exit 0, got %d: %s", code2, stderr2.String())
+		}
+		if !strings.Contains(stdout2.String(), "Resumed conversation ba042127-c63f-4b1e-a42e-95b307e61bbc") {
+			t.Fatalf("expected resumed message in turn 2 stdout: %s", stdout2.String())
+		}
+	})
 }

@@ -670,3 +670,199 @@ func TestTailBrainTranscriptSteps_And_StartupBanner(t *testing.T) {
 		t.Fatalf("expected startup banner chunk in postedChunks, got:\n%s", joinedChunks)
 	}
 }
+
+func TestBackgroundDrainPIDLivenessAndAutoResume_Unit(t *testing.T) {
+	// 1. Unit test helper functions directly
+	logFile := filepath.Join(t.TempDir(), "agy.log")
+	_ = os.WriteFile(logFile, []byte("2026/10/31 16:04:01 WaitForConversationFullyIdle: root agent idle; waiting up to 1h0m0s for 2 background task(s)\n"), 0o600)
+
+	if ok, cnt := hasBackgroundDrainLog("", "some line\nWaitForConversationFullyIdle: root agent idle; waiting up to 1h0m0s for 3 background task(s)\n", ""); !ok || cnt != 3 {
+		t.Fatalf("expected drain=true cnt=3 from stdout, got %v %d", ok, cnt)
+	}
+	if ok, cnt := hasBackgroundDrainLog("", "", "WaitForConversationFullyIdle: custom format\n"); !ok || cnt != 1 {
+		t.Fatalf("expected drain=true cnt=1 from stderr fallback, got %v %d", ok, cnt)
+	}
+	if ok, cnt := hasBackgroundDrainLog("", "WaitForConversationFullyIdle: root agent idle; waiting up to 1h0m0s for 1 background task(s)\n[agy step #5] output: resumed active work\n", ""); ok || cnt != 0 {
+		t.Fatalf("expected drain=false when newer non-drain line follows, got %v %d", ok, cnt)
+	}
+	if ok, cnt := hasBackgroundDrainLog(logFile, "", ""); !ok || cnt != 2 {
+		t.Fatalf("expected drain=true cnt=2 from logPath, got %v %d", ok, cnt)
+	}
+
+	ptLogFile := filepath.Join(t.TempDir(), "pt.log")
+	_ = os.WriteFile(ptLogFile, []byte("print timeout after 15m0s with turn in progress\n"), 0o600)
+	if !hasPrintTimeoutLog("", "Error: print timeout after 15m0s with turn in progress", "") {
+		t.Fatalf("expected printTimeout=true from stdout")
+	}
+	if !hasPrintTimeoutLog(ptLogFile, "", "") {
+		t.Fatalf("expected printTimeout=true from logPath")
+	}
+	if hasPrintTimeoutLog("", "normal output", "") {
+		t.Fatalf("expected printTimeout=false on normal output")
+	}
+
+	wsDir := t.TempDir()
+	storiesDir := filepath.Join(wsDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0o755)
+	storyPath := filepath.Join(storiesDir, "2026-10-31-gov-3850-test.story.md")
+	_ = os.WriteFile(storyPath, []byte("---\nid: STORY-GOV-3850\nstatus: IN_PROGRESS\n---\n# Story\n"), 0o600)
+	if !isStoryIncompleteInWorktree(wsDir, "STORY-GOV-3850") {
+		t.Fatalf("expected story IN_PROGRESS to be incomplete")
+	}
+	if isStoryIncompleteInWorktree("", "STORY-GOV-3850") || isStoryIncompleteInWorktree(wsDir, "") {
+		t.Fatalf("expected empty args to return false")
+	}
+	_ = os.WriteFile(storyPath, []byte("---\nid: STORY-GOV-3850\nstatus: DONE\n---\n# Story\n"), 0o600)
+	if isStoryIncompleteInWorktree(wsDir, "STORY-GOV-3850") {
+		t.Fatalf("expected story DONE to not be incomplete")
+	}
+
+	brainDir := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainDir)
+	convID := "ba042127-c63f-4b1e-a42e-95b307e61bbc"
+	tpDir := filepath.Join(brainDir, convID, ".system_generated", "logs")
+	_ = os.MkdirAll(tpDir, 0o755)
+	_ = os.WriteFile(filepath.Join(tpDir, "transcript.jsonl"), []byte(`{"step_index":1}`+"\n"), 0o600)
+
+	if chatty, _ := hasActiveConversationActivity(convID, os.Getpid(), time.Now(), 0); !chatty {
+		t.Fatalf("expected chatty=true with recent lastTranscriptOrOutputAt")
+	}
+	if chatty, _ := hasActiveConversationActivity(convID, 0, time.Time{}, 10*time.Second); !chatty {
+		t.Fatalf("expected chatty=true from fresh transcript.jsonl modtime")
+	}
+
+	r := NewPromptRunner("autopilot")
+	if d := r.resolveBackgroundDrainGracePeriod(RunPromptOptions{BackgroundDrainGracePeriod: 250 * time.Millisecond}); d != 250*time.Millisecond {
+		t.Fatalf("unexpected opts grace: %v", d)
+	}
+	r.BackgroundDrainGracePeriod = 350 * time.Millisecond
+	if d := r.resolveBackgroundDrainGracePeriod(RunPromptOptions{}); d != 350*time.Millisecond {
+		t.Fatalf("unexpected runner grace: %v", d)
+	}
+	r.BackgroundDrainGracePeriod = 0
+	t.Setenv("IAZIO_BG_DRAIN_GRACE_MS", "120")
+	if d := r.resolveBackgroundDrainGracePeriod(RunPromptOptions{}); d != 120*time.Millisecond {
+		t.Fatalf("unexpected env ms grace: %v", d)
+	}
+	t.Setenv("IAZIO_BG_DRAIN_GRACE_MS", "")
+	t.Setenv("IAZIO_BG_DRAIN_GRACE_SECONDS", "2")
+	if d := r.resolveBackgroundDrainGracePeriod(RunPromptOptions{}); d != 2*time.Second {
+		t.Fatalf("unexpected env sec grace: %v", d)
+	}
+	t.Setenv("IAZIO_BG_DRAIN_GRACE_SECONDS", "")
+	t.Setenv("MOCK_AGY_FAST", "1")
+	if d := r.resolveBackgroundDrainGracePeriod(RunPromptOptions{}); d != 150*time.Millisecond {
+		t.Fatalf("unexpected MOCK_AGY_FAST grace: %v", d)
+	}
+
+	maxOpt := 4
+	if m := r.resolveMaxAutoResumeAttempts(RunPromptOptions{MaxAutoResumeAttempts: &maxOpt}); m != 4 {
+		t.Fatalf("unexpected opts maxAutoResume: %d", m)
+	}
+	maxRunner := 3
+	r.MaxAutoResumeAttempts = &maxRunner
+	if m := r.resolveMaxAutoResumeAttempts(RunPromptOptions{}); m != 3 {
+		t.Fatalf("unexpected runner maxAutoResume: %d", m)
+	}
+	r.MaxAutoResumeAttempts = nil
+	t.Setenv("IAZIO_MAX_AUTO_RESUME_ATTEMPTS", "5")
+	if m := r.resolveMaxAutoResumeAttempts(RunPromptOptions{}); m != 5 {
+		t.Fatalf("unexpected env maxAutoResume: %d", m)
+	}
+	t.Setenv("IAZIO_MAX_AUTO_RESUME_ATTEMPTS", "")
+
+	// 2. Test RunPrompt end-to-end with a mock-agy script that triggers timeout deferral, background drain reap, and auto-resume
+	binDir := t.TempDir()
+	mockAgyBin := filepath.Join(binDir, "mock-agy")
+	script := `#!/bin/sh
+LOG_FILE=""
+CONV_ARG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --log-file=*) LOG_FILE="${1#*=}" ;;
+    --log-file) shift; LOG_FILE="$1" ;;
+    --conversation=*) CONV_ARG="${1#*=}" ;;
+    --conversation) shift; CONV_ARG="$1" ;;
+  esac
+  shift
+done
+
+if [ -z "$CONV_ARG" ]; then
+  mkdir -p .autopilot docs/stories
+  echo '{"story_id":"STORY-GOV-3850"}' > .autopilot/ase-state.json
+  printf -- "---\nid: STORY-GOV-3850\nstatus: IN_PROGRESS\n---\n# Story\n" > docs/stories/2026-10-31-gov-3850.story.md
+  echo "Created conversation ba042127-c63f-4b1e-a42e-95b307e61bbc"
+  if [ -n "$LOG_FILE" ]; then
+    echo "Created conversation ba042127-c63f-4b1e-a42e-95b307e61bbc" >> "$LOG_FILE"
+  fi
+  sleep 0.12
+  echo "Still active on turn 1"
+  sleep 0.12
+  echo "WaitForConversationFullyIdle: root agent idle; waiting up to 1h0m0s for 1 background task(s)"
+  if [ -n "$LOG_FILE" ]; then
+    echo "WaitForConversationFullyIdle: root agent idle; waiting up to 1h0m0s for 1 background task(s)" >> "$LOG_FILE"
+  fi
+  sleep 5
+  exit 0
+else
+  printf -- "---\nid: STORY-GOV-3850\nstatus: DONE\n---\n# Story\n" > docs/stories/2026-10-31-gov-3850.story.md
+  git add docs/stories/2026-10-31-gov-3850.story.md >/dev/null 2>&1 || true
+  git commit -m "feat: complete STORY-GOV-3850" >/dev/null 2>&1 || true
+  echo "Resumed conversation $CONV_ARG and completed STORY-GOV-3850"
+  exit 0
+fi
+`
+	if err := os.WriteFile(mockAgyBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock-agy script: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	repoDir := initTestGitRepo(t)
+	runner := NewPromptRunner("autopilot")
+	runner.GracePeriod = 50 * time.Millisecond
+	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:                   "prompt_bg_drain_unit",
+		JobID:                      "job_3ffa5d0be1649f0e",
+		APIURL:                     srv.URL,
+		Token:                      "tok",
+		Repo:                       "meta-repo-02",
+		Prompt:                     "/autonomous-story-execution STORY-GOV-3850",
+		TargetAgent:                mockAgyBin,
+		WorkingDir:                 repoDir,
+		Timeout:                    180 * time.Millisecond,
+		BackgroundDrainGracePeriod: 120 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("expected auto-resumed RunPrompt to succeed, got err=%v", err)
+	}
+	if res.Status != "completed" || res.ResumeAttempts < 1 || res.ActiveConversationID != convID {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+
+	// 3. Test fail-closed BACKGROUND_DRAIN_TIMEOUT when MaxAutoResumeAttempts = 0
+	repoDir2 := initTestGitRepo(t)
+	zeroResumes := 0
+	res2, err2 := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:                   "prompt_bg_drain_failclosed",
+		JobID:                      "job_3ffa5d0be1649f0e_fc",
+		APIURL:                     srv.URL,
+		Token:                      "tok",
+		Repo:                       "meta-repo-02",
+		Prompt:                     "/autonomous-story-execution STORY-GOV-3850",
+		TargetAgent:                mockAgyBin,
+		WorkingDir:                 repoDir2,
+		Timeout:                    180 * time.Millisecond,
+		BackgroundDrainGracePeriod: 120 * time.Millisecond,
+		MaxAutoResumeAttempts:      &zeroResumes,
+	})
+	if err2 == nil {
+		t.Fatalf("expected error when auto-resume is disabled on background drain")
+	}
+	if res2 == nil || res2.Status != "timed_out" || res2.FailureCategory != "BACKGROUND_DRAIN_TIMEOUT" || res2.FailureStage != "BACKGROUND_DRAIN" {
+		t.Fatalf("expected fail-closed BACKGROUND_DRAIN_TIMEOUT, got %+v", res2)
+	}
+}

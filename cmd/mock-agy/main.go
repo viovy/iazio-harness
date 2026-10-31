@@ -564,6 +564,94 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		_ = exec.Command("git", "commit", "-m", "feat(gov-3850): verify live transcript streaming [STORY-GOV-3850]").Run()
 		return 0
 
+	case "background_drain_pid_liveness_and_auto_resume":
+		// Scenario (job_3ffa5d0be1649f0e / STORY-GOV-3852):
+		// Reproduces job_3ffa5d0be1649f0e on host=debian repo=/home/romeo/work/meta-repo-02
+		// Bound Story: STORY-GOV-3850, Active Conversation: ba042127-c63f-4b1e-a42e-95b307e61bbc.
+		// Turn 1:
+		//  - Resolves conversation ba042127-c63f-4b1e-a42e-95b307e61bbc and binds STORY-GOV-3850 (status: IN_PROGRESS)
+		//  - Emits active chatty transcript steps while tool_pid is alive across the initial timeout window (verifying timeout deferral)
+		//  - Then logs "WaitForConversationFullyIdle: root agent idle; waiting up to 1h0m0s for 1 background task(s)" and blocks on a background child
+		// Turn 2 (auto-resumed with --conversation=ba042127-c63f-4b1e-a42e-95b307e61bbc):
+		//  - Completes STORY-GOV-3850 (status: DONE), commits cleanly, and exits 0.
+		cid := "ba042127-c63f-4b1e-a42e-95b307e61bbc"
+		storyFile := filepath.Join("docs", "stories", "2026-10-31-gov-3850-sort-prompts-alphabetically-iazio-web.story.md")
+		if conversationID == cid || strings.Contains(strings.ToLower(fullPrompt), "resume and complete") {
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				logsDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain", cid, ".system_generated", "logs")
+				_ = os.MkdirAll(logsDir, 0755)
+				transcriptPath := filepath.Join(logsDir, "transcript.jsonl")
+				step4 := `{"step_index":4,"type":"PLANNER_RESPONSE","content":"Auto-resumed conversation ba042127-c63f-4b1e-a42e-95b307e61bbc and completed STORY-GOV-3850."}` + "\n"
+				if tf, err := os.OpenFile(transcriptPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+					_, _ = tf.WriteString(step4)
+					_ = tf.Close()
+				}
+			}
+			_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
+			_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3850\ntitle: Sort Prompts Alphabetically in iazio-web (/prompts) and Underlying API\nstatus: DONE\n---\n"), 0644)
+			_ = exec.Command("git", "add", "docs").Run()
+			_ = exec.Command("git", "commit", "-m", "feat(gov-3850): complete STORY-GOV-3850 after auto-resume [STORY-GOV-3850]").Run()
+			fmt.Fprintf(stdout, "Resumed conversation %s\n", cid)
+			fmt.Fprintln(stdout, "[mock-agy] Auto-resumed conversation ba042127-c63f-4b1e-a42e-95b307e61bbc and completed STORY-GOV-3850.")
+			return 0
+		}
+
+		// Turn 1:
+		if logFileWriter != nil {
+			fmt.Fprintf(logFileWriter, "Created conversation %s\n", cid)
+		} else {
+			fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+		}
+		_ = os.WriteFile(".session_story_id", []byte("STORY-GOV-3850\n"), 0644)
+		_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
+		_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3850\ntitle: Sort Prompts Alphabetically in iazio-web (/prompts) and Underlying API\nstatus: IN_PROGRESS\n---\n"), 0644)
+
+		var transcriptPath string
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+			_ = os.MkdirAll(convDir, 0755)
+			_ = os.WriteFile(filepath.Join(convDir, cid+".db"), []byte("mock-db"), 0644)
+
+			logsDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain", cid, ".system_generated", "logs")
+			_ = os.MkdirAll(logsDir, 0755)
+			transcriptPath = filepath.Join(logsDir, "transcript.jsonl")
+			step1 := `{"step_index":1,"type":"USER_INPUT","content":"/autonomous-story-execution STORY-GOV-3850"}` + "\n"
+			step2 := `{"step_index":2,"type":"PLANNER_RESPONSE","thinking":"Implementing STORY-GOV-3850 on debian meta-repo-02","tool_calls":[{"name":"run_command","arguments":{"CommandLine":"go test ./...","toolSummary":"Run unit tests"}}]}` + "\n"
+			_ = os.WriteFile(transcriptPath, []byte(step1+step2), 0644)
+		}
+
+		// Spawn an active child process and emit chatty transcript steps across 480ms so tool_pid liveness defers a 300ms timeout
+		stepSleep := 120 * time.Millisecond
+		drainSleep := 30 * time.Second
+		if os.Getenv("MOCK_AGY_UNIT") == "1" {
+			stepSleep = 5 * time.Millisecond
+			drainSleep = 5 * time.Millisecond
+		} else {
+			childCmd := exec.Command("sleep", "30")
+			_ = childCmd.Start()
+		}
+		for i := 0; i < 4; i++ {
+			time.Sleep(stepSleep)
+			if transcriptPath != "" {
+				step := fmt.Sprintf(`{"step_index":%d,"type":"PLANNER_RESPONSE","content":"Executing active task step %d while tool_pid is live"}`+"\n", 10+i, i+1)
+				if tf, err := os.OpenFile(transcriptPath, os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+					_, _ = tf.WriteString(step)
+					_ = tf.Close()
+				}
+			}
+		}
+
+		// Now enter WaitForConversationFullyIdle background drain
+		drainLine := "2026/10/31 17:48:00 WaitForConversationFullyIdle: root agent idle; waiting up to 1h0m0s for 1 background task(s)\n"
+		if logFileWriter != nil {
+			_, _ = io.WriteString(logFileWriter, drainLine)
+		} else {
+			_, _ = io.WriteString(stdout, drainLine)
+		}
+		// Block until supervisor reaps background drain
+		time.Sleep(drainSleep)
+		return 0
+
 	default:
 		// Default simple execution
 		if conversationID != "" {

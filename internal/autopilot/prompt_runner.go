@@ -25,22 +25,27 @@ import (
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/redact"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
+	"github.com/viovy/iazio-harness/internal/watchdog"
 )
 
 var (
-	storyIDRegex = regexp.MustCompile(`\b(STORY-[A-Za-z0-9_-]+)\b`)
-	convIDRegex  = regexp.MustCompile(`(?i)(?:created|resumed|resuming|loaded|active|using|streaming)\s+conversation\s+([A-Za-z0-9_-]{12,64})`)
-	hex16Regex   = regexp.MustCompile(`^[0-9a-f]{16}$`)
-	hex32Regex   = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	storyIDRegex      = regexp.MustCompile(`\b(STORY-[A-Za-z0-9_-]+)\b`)
+	convIDRegex       = regexp.MustCompile(`(?i)(?:created|resumed|resuming|loaded|active|using|streaming)\s+conversation\s+([A-Za-z0-9_-]{12,64})`)
+	bgDrainIdleRegex  = regexp.MustCompile(`(?i)root agent idle;\s*waiting up to\s*[0-9hms.]+\s*for\s*(\d+)\s*background task`)
+	printTimeoutRegex = regexp.MustCompile(`(?i)print timeout after\s*[0-9hms.]+\s*with turn in progress`)
+	hex16Regex        = regexp.MustCompile(`^[0-9a-f]{16}$`)
+	hex32Regex        = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
 
 const (
 	// DefaultPromptTimeout is the default execution window for long-running agentic prompts (7 days).
-	DefaultPromptTimeout = 7 * 24 * time.Hour
-	defaultPromptTimeout = DefaultPromptTimeout
-	defaultGracePeriod   = 5 * time.Second
-	geminiDirName        = ".gemini"
-	agyCliDirName        = "antigravity-cli"
+	DefaultPromptTimeout         = 7 * 24 * time.Hour
+	defaultPromptTimeout         = DefaultPromptTimeout
+	defaultGracePeriod           = 5 * time.Second
+	defaultBackgroundDrainGrace  = 60 * time.Second
+	defaultMaxAutoResumeAttempts = 3
+	geminiDirName                = ".gemini"
+	agyCliDirName                = "antigravity-cli"
 )
 
 // ResolveDefaultPromptTimeout returns the default prompt timeout, honoring IAZIO_PROMPT_TIMEOUT_SECONDS when set to a positive integer.
@@ -73,21 +78,23 @@ func formatW3CTraceParent(rawTraceID, rawSpanID string) (string, string) {
 
 // RunPromptOptions specifies parameters for executing a prompt via autopilot.
 type RunPromptOptions struct {
-	PromptID     string        `json:"prompt_id"`
-	JobID        string        `json:"job_id,omitempty"`
-	APIURL       string        `json:"api_url,omitempty"`
-	Token        string        `json:"token,omitempty"`
-	FencingToken int64         `json:"fencing_token,omitempty"`
-	StoryID      string        `json:"story_id,omitempty"`
-	Repo        string        `json:"repo"`
-	Branch      string        `json:"branch,omitempty"`
-	Title       string        `json:"title,omitempty"`
-	Prompt      string        `json:"prompt"`
-	TargetAgent string        `json:"target_agent,omitempty"`
-	WorkingDir  string        `json:"working_dir"`
-	TraceID     string        `json:"trace_id,omitempty"`
-	Timeout     time.Duration `json:"timeout,omitempty"`
-	GracePeriod time.Duration `json:"grace_period,omitempty"`
+	PromptID                   string        `json:"prompt_id"`
+	JobID                      string        `json:"job_id,omitempty"`
+	APIURL                     string        `json:"api_url,omitempty"`
+	Token                      string        `json:"token,omitempty"`
+	FencingToken               int64         `json:"fencing_token,omitempty"`
+	StoryID                    string        `json:"story_id,omitempty"`
+	Repo                       string        `json:"repo"`
+	Branch                     string        `json:"branch,omitempty"`
+	Title                      string        `json:"title,omitempty"`
+	Prompt                     string        `json:"prompt"`
+	TargetAgent                string        `json:"target_agent,omitempty"`
+	WorkingDir                 string        `json:"working_dir"`
+	TraceID                    string        `json:"trace_id,omitempty"`
+	Timeout                    time.Duration `json:"timeout,omitempty"`
+	GracePeriod                time.Duration `json:"grace_period,omitempty"`
+	BackgroundDrainGracePeriod time.Duration `json:"background_drain_grace_period,omitempty"`
+	MaxAutoResumeAttempts      *int          `json:"max_auto_resume_attempts,omitempty"`
 }
 
 func hasHeadlessPermissionDenial(text string) bool {
@@ -110,6 +117,12 @@ type PromptResult struct {
 	ConversationID       string   `json:"conversation_id,omitempty"`
 	ActiveConversationID string   `json:"active_conversation_id,omitempty"`
 	ConversationIDs      []string `json:"conversation_ids,omitempty"`
+	HarnessPID           int      `json:"harness_pid,omitempty"`
+	ToolPID              int      `json:"tool_pid,omitempty"`
+	ElapsedSeconds       int      `json:"elapsed_seconds,omitempty"`
+	FailureCategory      string   `json:"failure_category,omitempty"`
+	FailureStage         string   `json:"failure_stage,omitempty"`
+	ResumeAttempts       int      `json:"resume_attempts,omitempty"`
 	Status               string   `json:"status"`
 	ExitCode             int      `json:"exit_code"`
 	PreGitHeadSHA        string   `json:"pre_git_head_sha,omitempty"`
@@ -436,6 +449,140 @@ func tailBrainTranscriptSteps(convID string, seenSteps map[int]bool) string {
 	return sb.String()
 }
 
+func hasBackgroundDrainLog(logPath, stdoutText, stderrText string) (bool, int) {
+	check := func(s string) (bool, int) {
+		trimmed := strings.TrimSpace(s)
+		if trimmed == "" {
+			return false, 0
+		}
+		lines := strings.Split(trimmed, "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			line := strings.TrimSpace(lines[i])
+			if line == "" {
+				continue
+			}
+			if m := bgDrainIdleRegex.FindStringSubmatch(line); len(m) > 0 {
+				cnt := 1
+				if len(m) > 1 {
+					if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+						cnt = n
+					}
+				}
+				return true, cnt
+			}
+			if strings.Contains(line, "WaitForConversationFullyIdle") {
+				return true, 1
+			}
+			// A newer non-drain log line appeared after any earlier drain message.
+			return false, 0
+		}
+		return false, 0
+	}
+	if ok, cnt := check(stdoutText); ok {
+		return true, cnt
+	}
+	if ok, cnt := check(stderrText); ok {
+		return true, cnt
+	}
+	if strings.TrimSpace(logPath) != "" {
+		if b, err := os.ReadFile(logPath); err == nil && len(b) > 0 {
+			if ok, cnt := check(string(b)); ok {
+				return true, cnt
+			}
+		}
+	}
+	return false, 0
+}
+
+func hasPrintTimeoutLog(logPath, stdoutText, stderrText string) bool {
+	if printTimeoutRegex.MatchString(stdoutText) || printTimeoutRegex.MatchString(stderrText) {
+		return true
+	}
+	if strings.TrimSpace(logPath) != "" {
+		if b, err := os.ReadFile(logPath); err == nil && len(b) > 0 {
+			if printTimeoutRegex.MatchString(string(b)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isStoryIncompleteInWorktree(workingDir, storyID string) bool {
+	targetSID := strings.TrimSpace(storyID)
+	if strings.TrimSpace(workingDir) == "" || targetSID == "" {
+		return false
+	}
+	storyGlobs := []string{
+		filepath.Join(workingDir, "docs", "stories", "*.story.md"),
+		filepath.Join(workingDir, "*", "docs", "stories", "*.story.md"),
+	}
+	for _, pattern := range storyGlobs {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, mPath := range matches {
+			b, errR := os.ReadFile(mPath)
+			if errR != nil {
+				continue
+			}
+			content := string(b)
+			lines := strings.Split(content, "\n")
+			inFrontmatter := false
+			var fmID, fmStatus string
+			for idx, rawLine := range lines {
+				trimmed := strings.TrimSpace(rawLine)
+				if idx == 0 && trimmed == "---" {
+					inFrontmatter = true
+					continue
+				}
+				if inFrontmatter && trimmed == "---" {
+					break
+				}
+				if inFrontmatter || idx < 25 {
+					if strings.HasPrefix(trimmed, "id:") && fmID == "" {
+						fmID = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "id:")), `"'`)
+					} else if strings.HasPrefix(trimmed, "status:") && fmStatus == "" {
+						fmStatus = strings.ToUpper(strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "status:")), `"'`))
+					}
+				}
+			}
+			idMatched := strings.EqualFold(fmID, targetSID) ||
+				(fmID == "" && strings.Contains(strings.ToUpper(filepath.Base(mPath)), strings.ToUpper(targetSID)))
+			if !idMatched {
+				continue
+			}
+			if fmStatus == "IN_PROGRESS" || fmStatus == "READY" || fmStatus == "TODO" || fmStatus == "BLOCKED" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasActiveConversationActivity(convID string, toolPID int, lastTranscriptOrOutputAt time.Time, activeWindow time.Duration) (chatty bool, activeChildren int) {
+	if activeWindow <= 0 {
+		activeWindow = 30 * time.Second
+	}
+	if !lastTranscriptOrOutputAt.IsZero() && time.Since(lastTranscriptOrOutputAt) < activeWindow {
+		chatty = true
+	}
+	if !chatty && strings.TrimSpace(convID) != "" && sessionstore.IsValidConversationID(convID) {
+		if brainDir := resolveBrainDir(); brainDir != "" {
+			tp := filepath.Join(brainDir, convID, ".system_generated", "logs", "transcript.jsonl")
+			if fi, err := os.Stat(tp); err == nil && time.Since(fi.ModTime()) < activeWindow {
+				chatty = true
+			}
+		}
+	}
+	if toolPID > 0 {
+		children := engines.FindChildProcesses(toolPID)
+		activeChildren = len(children)
+	}
+	return chatty, activeChildren
+}
+
 // PromptRunner defines the interface for executing prompts in a submodule directory.
 type PromptRunner interface {
 	RunPrompt(ctx context.Context, opts RunPromptOptions) (*PromptResult, error)
@@ -443,10 +590,12 @@ type PromptRunner interface {
 
 // CLIPromptRunner delegates prompt execution to the autopilot binary on the host.
 type CLIPromptRunner struct {
-	AutopilotBinary string
-	GitBinary       string
-	GracePeriod     time.Duration
-	PreFlightHook   func(ctx context.Context, workingDir, storyID string) error
+	AutopilotBinary            string
+	GitBinary                  string
+	GracePeriod                time.Duration
+	BackgroundDrainGracePeriod time.Duration
+	MaxAutoResumeAttempts      *int
+	PreFlightHook              func(ctx context.Context, workingDir, storyID string) error
 }
 
 // NewPromptRunner creates a CLIPromptRunner.
@@ -463,6 +612,44 @@ func NewPromptRunner(autopilotBin string) *CLIPromptRunner {
 		GitBinary:       "git",
 		GracePeriod:     defaultGracePeriod,
 	}
+}
+
+func (r *CLIPromptRunner) resolveBackgroundDrainGracePeriod(opts RunPromptOptions) time.Duration {
+	if opts.BackgroundDrainGracePeriod > 0 {
+		return opts.BackgroundDrainGracePeriod
+	}
+	if r.BackgroundDrainGracePeriod > 0 {
+		return r.BackgroundDrainGracePeriod
+	}
+	if rawMs := strings.TrimSpace(os.Getenv("IAZIO_BG_DRAIN_GRACE_MS")); rawMs != "" {
+		if ms, err := strconv.Atoi(rawMs); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	if rawSec := strings.TrimSpace(os.Getenv("IAZIO_BG_DRAIN_GRACE_SECONDS")); rawSec != "" {
+		if sec, err := strconv.Atoi(rawSec); err == nil && sec > 0 {
+			return time.Duration(sec) * time.Second
+		}
+	}
+	if os.Getenv("MOCK_AGY_FAST") == "1" {
+		return 150 * time.Millisecond
+	}
+	return defaultBackgroundDrainGrace
+}
+
+func (r *CLIPromptRunner) resolveMaxAutoResumeAttempts(opts RunPromptOptions) int {
+	if opts.MaxAutoResumeAttempts != nil {
+		return *opts.MaxAutoResumeAttempts
+	}
+	if r.MaxAutoResumeAttempts != nil {
+		return *r.MaxAutoResumeAttempts
+	}
+	if raw := strings.TrimSpace(os.Getenv("IAZIO_MAX_AUTO_RESUME_ATTEMPTS")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return defaultMaxAutoResumeAttempts
 }
 
 // RunPrompt executes the prompt inside opts.WorkingDir using autopilot.
@@ -491,6 +678,9 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	if gracePeriod <= 0 {
 		gracePeriod = defaultGracePeriod
 	}
+
+	bgDrainGrace := r.resolveBackgroundDrainGracePeriod(opts)
+	maxAutoResumes := r.resolveMaxAutoResumeAttempts(opts)
 
 	gitBin := r.GitBinary
 	if gitBin == "" {
@@ -539,10 +729,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 
 	// 2. Prepare autopilot or direct headless agent command invocation:
-	// If the prompt targets story execution via autopilot, route directly to the standard
-	// built-in `autopilot story run --story <ID>`, eliminating exit 99 across older host runtimes.
 	cmdBin := r.AutopilotBinary
-	var args []string
 	effectiveAgent := targetAgent
 	if effectiveAgent == "" || effectiveAgent == "auto" || (storyID == "" && effectiveAgent == "autopilot") {
 		effectiveAgent = "agy"
@@ -550,64 +737,6 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	baseEffectiveAgent := strings.ToLower(filepath.Base(effectiveAgent))
 	isMockAgy := strings.HasPrefix(baseEffectiveAgent, "mock-agy")
 	isDirectAgy := r.AutopilotBinary == "autopilot" && (baseEffectiveAgent == "agy" || baseEffectiveAgent == "agy.exe")
-
-	var tmpLogPath string
-	if isMockAgy || isDirectAgy {
-		if logFile, errL := os.CreateTemp("", fmt.Sprintf("iazio-agy-log-%s-*.log", opts.PromptID)); errL == nil {
-			tmpLogPath = logFile.Name()
-			_ = logFile.Close()
-			defer os.Remove(tmpLogPath)
-		}
-		cmdBin = effectiveAgent
-		args = []string{"--print", opts.Prompt, "--dangerously-skip-permissions"}
-		if tmpLogPath != "" {
-			args = append(args, "--log-file", tmpLogPath)
-		}
-	} else if storyID != "" && targetAgent == "autopilot" && strings.TrimSpace(opts.Prompt) == "" {
-		args = []string{"story", "run", "--story", storyID}
-	} else {
-		args = []string{"prompt", "run", "--file", tmpPath}
-		args = append(args, "--target-agent", effectiveAgent)
-		if opts.Title != "" {
-			args = append(args, "--title", opts.Title)
-		}
-		if storyID != "" {
-			args = append(args, "--story", storyID)
-		}
-	}
-
-	execCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	cmd := exec.Command(cmdBin, args...)
-	cmd.Dir = opts.WorkingDir
-
-	// Propagate Zipkin/W3C trace continuity and target branch into autopilot process
-	cmd.Env = os.Environ()
-	targetBranch := strings.TrimSpace(opts.Branch)
-	if targetBranch != "" {
-		cmd.Env = append(cmd.Env, "AUTOPILOT_TARGET_BRANCH="+targetBranch)
-	}
-	traceID := opts.TraceID
-	if traceID == "" {
-		traceID = os.Getenv("TRACE_ID")
-	}
-	if traceID == "" {
-		traceID = os.Getenv("ZIPKIN_TRACE_ID")
-	}
-	if traceID != "" {
-		_, traceparent := formatW3CTraceParent(traceID, opts.PromptID)
-		cmd.Env = append(cmd.Env,
-			"ZIPKIN_TRACE_ID="+traceID,
-			"TRACE_ID="+traceID,
-			"TRACEPARENT="+traceparent,
-		)
-	} else if tp := os.Getenv("TRACEPARENT"); tp != "" {
-		cmd.Env = append(cmd.Env, "TRACEPARENT="+tp)
-	}
-
-	// Dual delivery: also pipe prompt bytes to Stdin for mock or stdin-reading executors
-	cmd.Stdin = bytes.NewReader([]byte(opts.Prompt))
 
 	jobID := strings.TrimSpace(opts.JobID)
 	if jobID == "" {
@@ -620,6 +749,14 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	token := strings.TrimSpace(opts.Token)
 	if token == "" {
 		token = strings.TrimSpace(os.Getenv("IAZIO_HARNESS_TOKEN"))
+	}
+	targetBranch := strings.TrimSpace(opts.Branch)
+	traceID := opts.TraceID
+	if traceID == "" {
+		traceID = os.Getenv("TRACE_ID")
+	}
+	if traceID == "" {
+		traceID = os.Getenv("ZIPKIN_TRACE_ID")
 	}
 
 	preExistingConvs := map[string]bool{}
@@ -643,6 +780,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	lastOutAt := startTime
 	streamedAny := false
 	detectedConvID := ""
+	boundStoryID := storyID
+	postedStoryID := ""
 	seenTranscriptSteps := make(map[int]bool)
 
 	var stdoutW io.Writer = &stdoutBuf
@@ -657,127 +796,315 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			convDetected: &detectedConvID, ctx: ctx, apiURL: apiURL, token: token, jobID: jobID, stream: "stderr",
 		}
 	}
-	cmd.Stdout = stdoutW
-	cmd.Stderr = stderrW
+
+	emitSupervisorNote := func(msg string) {
+		streamMu.Lock()
+		_, _ = stdoutBuf.WriteString(msg)
+		lastOutAt = time.Now()
+		if jobID != "" && apiURL != "" {
+			streamedAny = true
+		}
+		streamMu.Unlock()
+		if jobID != "" && apiURL != "" {
+			_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", msg)
+		}
+	}
 
 	// Capture pre-execution Git state
 	preHeadSHA, preTreeSHA, _ := captureGitSnapshot(opts.WorkingDir, gitBin)
 
-	// 3. Configure dedicated process group
-	engines.SetProcGroup(cmd)
+	var lastToolPID int
+	var resumeAttempts int
+	var failureCategory string
+	var failureStage string
 
-	if err := cmd.Start(); err != nil {
-		durationMs := time.Since(startTime).Milliseconds()
-		headSHA, treeSHA, modified := captureGitSnapshot(opts.WorkingDir, gitBin)
-		return &PromptResult{
-			PromptID:      opts.PromptID,
-			Repo:          opts.Repo,
-			WorktreePath:  opts.WorkingDir,
-			TargetAgent:   targetAgent,
-			Status:        "failed",
-			ExitCode:      1,
-			PreGitHeadSHA: preHeadSHA,
-			PreGitTreeSHA: preTreeSHA,
-			GitHeadSHA:    headSHA,
-			GitTreeSHA:    treeSHA,
-			ModifiedFiles: modified,
-			Summary:       redact.Egress(fmt.Sprintf("Failed to spawn autopilot: %v", err)),
-			DurationMs:    durationMs,
-		}, fmt.Errorf("spawn autopilot: %w", err)
-	}
+	runSingleTurn := func(turnPrompt string, resumeConvID string, isResumeTurn bool) (turnStatus string, turnExit int, turnErr error, turnBgDrainReaped bool, turnPrintTimeout bool) {
+		streamMu.Lock()
+		turnStartOutLen := stdoutBuf.Len()
+		turnStartErrLen := stderrBuf.Len()
+		streamMu.Unlock()
 
-	engines.PostStartProcessGroup(cmd)
-
-	toolPID := 0
-	if cmd.Process != nil {
-		toolPID = cmd.Process.Pid
-	}
-	boundStoryID := storyID
-	tickDone := make(chan struct{})
-	if jobID != "" && apiURL != "" {
-		tsStr := time.Now().UTC().Format(time.RFC3339)
-		promptPreview := strings.TrimSpace(strings.ReplaceAll(opts.Prompt, "\n", " "))
-		if len(promptPreview) > 160 {
-			promptPreview = promptPreview[:157] + "..."
+		var tmpLogPath string
+		var args []string
+		if isMockAgy || isDirectAgy {
+			if logFile, errL := os.CreateTemp("", fmt.Sprintf("iazio-agy-log-%s-*.log", opts.PromptID)); errL == nil {
+				tmpLogPath = logFile.Name()
+				_ = logFile.Close()
+				defer os.Remove(tmpLogPath)
+			}
+			cmdBin = effectiveAgent
+			args = []string{"--print", turnPrompt, "--dangerously-skip-permissions"}
+			if resumeConvID != "" {
+				args = append(args, "--conversation="+resumeConvID)
+			}
+			if tmpLogPath != "" {
+				args = append(args, "--log-file", tmpLogPath)
+			}
+		} else if storyID != "" && targetAgent == "autopilot" && strings.TrimSpace(turnPrompt) == "" {
+			args = []string{"story", "run", "--story", storyID}
+		} else {
+			args = []string{"prompt", "run", "--file", tmpPath}
+			args = append(args, "--target-agent", effectiveAgent)
+			if opts.Title != "" {
+				args = append(args, "--title", opts.Title)
+			}
+			if storyID != "" {
+				args = append(args, "--story", storyID)
+			}
 		}
-		storyLabel := boundStoryID
-		if storyLabel == "" {
-			storyLabel = "pending-allocation"
+
+		cmd := exec.Command(cmdBin, args...)
+		cmd.Dir = opts.WorkingDir
+		cmd.Env = os.Environ()
+		if targetBranch != "" {
+			cmd.Env = append(cmd.Env, "AUTOPILOT_TARGET_BRANCH="+targetBranch)
 		}
-		banner := fmt.Sprintf(
-			"[%s] [ASE-SUPERVISOR] Starting prompt execution for Job %s (HarnessPID=%d, ToolPID=%d, Agent=%s, Story=%s, Worktree=%s)\n[%s] [ASE-SUPERVISOR] Prompt: %s\n",
-			tsStr, jobID, os.Getpid(), toolPID, effectiveAgent, storyLabel, opts.WorkingDir, tsStr, redact.Egress(promptPreview),
-		)
-		_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", banner)
-		_ = controlplane.PostTick(ctx, apiURL, token, jobID, 0, os.Getpid(), toolPID, 0)
+		if traceID != "" {
+			_, traceparent := formatW3CTraceParent(traceID, opts.PromptID)
+			cmd.Env = append(cmd.Env,
+				"ZIPKIN_TRACE_ID="+traceID,
+				"TRACE_ID="+traceID,
+				"TRACEPARENT="+traceparent,
+			)
+		} else if tp := os.Getenv("TRACEPARENT"); tp != "" {
+			cmd.Env = append(cmd.Env, "TRACEPARENT="+tp)
+		}
+		cmd.Stdin = bytes.NewReader([]byte(turnPrompt))
+		cmd.Stdout = stdoutW
+		cmd.Stderr = stderrW
+
+		engines.SetProcGroup(cmd)
+		if err := cmd.Start(); err != nil {
+			return "failed", 1, fmt.Errorf("spawn autopilot: %w", err), false, false
+		}
+		engines.PostStartProcessGroup(cmd)
+
+		toolPID := 0
+		if cmd.Process != nil {
+			toolPID = cmd.Process.Pid
+			lastToolPID = toolPID
+		}
+
+		if !isResumeTurn && jobID != "" && apiURL != "" {
+			tsStr := time.Now().UTC().Format(time.RFC3339)
+			promptPreview := strings.TrimSpace(strings.ReplaceAll(turnPrompt, "\n", " "))
+			if len(promptPreview) > 160 {
+				promptPreview = promptPreview[:157] + "..."
+			}
+			streamMu.Lock()
+			storyLabel := boundStoryID
+			streamMu.Unlock()
+			if storyLabel == "" {
+				storyLabel = "pending-allocation"
+			}
+			banner := fmt.Sprintf(
+				"[%s] [ASE-SUPERVISOR] Starting prompt execution for Job %s (HarnessPID=%d, ToolPID=%d, Agent=%s, Story=%s, Worktree=%s)\n[%s] [ASE-SUPERVISOR] Prompt: %s\n",
+				tsStr, jobID, os.Getpid(), toolPID, effectiveAgent, storyLabel, opts.WorkingDir, tsStr, redact.Egress(promptPreview),
+			)
+			_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", banner)
+			_ = controlplane.PostTick(ctx, apiURL, token, jobID, 0, os.Getpid(), toolPID, int(time.Since(startTime).Seconds()))
+		} else if isResumeTurn && jobID != "" && apiURL != "" {
+			_ = controlplane.PostTick(ctx, apiURL, token, jobID, 0, os.Getpid(), toolPID, int(time.Since(startTime).Seconds()))
+		}
+
+		waitDone := make(chan error, 1)
 		go func() {
-			ticker := time.NewTicker(2 * time.Second)
-			defer ticker.Stop()
-			lastHeartbeatChunkAt := startTime
-			for {
-				select {
-				case <-tickDone:
-					return
-				case <-execCtx.Done():
-					return
-				case <-ticker.C:
+			waitDone <- cmd.Wait()
+		}()
+
+		pollInterval := 2 * time.Second
+		if os.Getenv("MOCK_AGY_FAST") == "1" || timeout < 5*time.Second || bgDrainGrace < 2*time.Second {
+			pollInterval = 50 * time.Millisecond
+		}
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+
+		turnTimeout := timeout
+		if isResumeTurn && turnTimeout < 5*time.Second {
+			turnTimeout = 5 * time.Second
+		}
+		deadline := time.Now().Add(turnTimeout)
+		lastHeartbeatChunkAt := time.Now()
+		var bgDrainSince time.Time
+		var timedOut bool
+		var canceled bool
+
+		syncTurnTelemetry := func() (curConv, curBoundStory string) {
+			streamMu.Lock()
+			curConv = detectedConvID
+			curBoundStory = boundStoryID
+			streamMu.Unlock()
+
+			if curConv == "" {
+				cid := discoverLogFileConversation(tmpLogPath)
+				if cid == "" {
+					cid = discoverNewBrainConversation(startTime.Add(-2*time.Second), preExistingConvs)
+				}
+				if cid != "" {
 					streamMu.Lock()
-					curConv := detectedConvID
-					curBoundStory := boundStoryID
+					if detectedConvID == "" {
+						detectedConvID = cid
+					}
+					curConv = detectedConvID
+					lastOutAt = time.Now()
 					streamMu.Unlock()
+					if jobID != "" && apiURL != "" {
+						_ = controlplane.PostConversation(ctx, apiURL, token, jobID, cid)
+						convMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Attached Antigravity conversation: %s\n", time.Now().UTC().Format(time.RFC3339), cid)
+						_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", convMsg)
+						lastHeartbeatChunkAt = time.Now()
+					}
+				}
+			}
 
-					if curConv == "" {
-						cid := discoverLogFileConversation(tmpLogPath)
-						if cid == "" {
-							cid = discoverNewBrainConversation(startTime.Add(-2*time.Second), preExistingConvs)
+			streamMu.Lock()
+			alreadyPostedStory := postedStoryID
+			streamMu.Unlock()
+			if curBoundStory == "" || alreadyPostedStory == "" {
+				sid, stitle, spath := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second))
+				if sid == "" {
+					sid = curBoundStory
+				}
+				if sid != "" {
+					streamMu.Lock()
+					if boundStoryID == "" {
+						boundStoryID = sid
+					}
+					curBoundStory = boundStoryID
+					shouldPost := postedStoryID == ""
+					if shouldPost {
+						postedStoryID = sid
+					}
+					lastOutAt = time.Now()
+					streamMu.Unlock()
+					if stitle == "" {
+						stitle = opts.Title
+					}
+					if shouldPost && jobID != "" && apiURL != "" {
+						_ = controlplane.PostStoryBinding(ctx, apiURL, token, jobID, sid, stitle, spath, opts.FencingToken)
+						storyMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Bound governing story: %s (%s)\n", time.Now().UTC().Format(time.RFC3339), sid, stitle)
+						_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", storyMsg)
+						lastHeartbeatChunkAt = time.Now()
+					}
+				}
+			}
+
+			if curConv != "" {
+				streamMu.Lock()
+				stepChunk := tailBrainTranscriptSteps(curConv, seenTranscriptSteps)
+				if stepChunk != "" {
+					lastOutAt = time.Now()
+					bgDrainSince = time.Time{}
+				}
+				streamMu.Unlock()
+				if stepChunk != "" && jobID != "" && apiURL != "" {
+					_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", stepChunk)
+					lastHeartbeatChunkAt = time.Now()
+				}
+			}
+			return curConv, curBoundStory
+		}
+
+		const maxTimeoutDeferrals = 12
+		timeoutDeferrals := 0
+
+	turnLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				canceled = true
+				engines.StopProcessGroup(cmd)
+				select {
+				case <-waitDone:
+				case <-time.After(gracePeriod):
+					engines.KillProcessGroup(cmd)
+					<-waitDone
+				}
+				turnErr = ctx.Err()
+				break turnLoop
+
+			case wErr := <-waitDone:
+				turnErr = wErr
+				break turnLoop
+
+			case <-ticker.C:
+				curConv, curBoundStory := syncTurnTelemetry()
+
+				streamMu.Lock()
+				fullOut := stdoutBuf.String()
+				fullErr := stderrBuf.String()
+				outSnapshot := fullOut
+				if turnStartOutLen <= len(fullOut) {
+					outSnapshot = fullOut[turnStartOutLen:]
+				}
+				errSnapshot := fullErr
+				if turnStartErrLen <= len(fullErr) {
+					errSnapshot = fullErr[turnStartErrLen:]
+				}
+				lastActivity := lastOutAt
+				streamMu.Unlock()
+
+				inBgDrain, bgTasks := hasBackgroundDrainLog(tmpLogPath, outSnapshot, errSnapshot)
+				if inBgDrain {
+					if bgDrainSince.IsZero() {
+						bgDrainSince = time.Now()
+					} else if time.Since(bgDrainSince) >= bgDrainGrace {
+						turnBgDrainReaped = true
+						reapNote := fmt.Sprintf(
+							"[%s] [ASE-SUPERVISOR] [background_task.auto_reaped] Root agent idle in background drain (ToolPID=%d, Conv=%s, Tasks=%d); reaping idle background task(s) after %s to unblock auto-resume.\n",
+							time.Now().UTC().Format(time.RFC3339), toolPID, curConv, bgTasks, bgDrainGrace,
+						)
+						emitSupervisorNote(reapNote)
+						engines.StopProcessGroup(cmd)
+						select {
+						case wErr := <-waitDone:
+							turnErr = wErr
+						case <-time.After(gracePeriod):
+							engines.KillProcessGroup(cmd)
+							turnErr = <-waitDone
 						}
-						if cid != "" {
-							streamMu.Lock()
-							if detectedConvID == "" {
-								detectedConvID = cid
-							}
-							curConv = detectedConvID
-							lastOutAt = time.Now()
-							streamMu.Unlock()
-							_ = controlplane.PostConversation(ctx, apiURL, token, jobID, cid)
-							convMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Attached Antigravity conversation: %s\n", time.Now().UTC().Format(time.RFC3339), cid)
-							_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", convMsg)
-							lastHeartbeatChunkAt = time.Now()
+						break turnLoop
+					}
+					if jobID != "" && apiURL != "" {
+						elapsedSec := int(time.Since(startTime).Seconds())
+						_ = controlplane.PostTick(ctx, apiURL, token, jobID, time.Since(lastActivity).Milliseconds(), os.Getpid(), toolPID, elapsedSec)
+					}
+					continue
+				} else {
+					bgDrainSince = time.Time{}
+				}
+
+				if time.Now().After(deadline) {
+					toolAlive := toolPID > 0 && watchdog.IsProcessAlive(toolPID)
+					if toolAlive && curConv != "" && !inBgDrain && timeoutDeferrals < maxTimeoutDeferrals {
+						chatty, activeChildren := hasActiveConversationActivity(curConv, toolPID, lastActivity, turnTimeout)
+						if chatty || activeChildren > 0 {
+							timeoutDeferrals++
+							deadline = time.Now().Add(turnTimeout)
+							deferNote := fmt.Sprintf(
+								"[%s] [ASE-SUPERVISOR] [pid_liveness.timeout_deferred] Agent tool PID=%d is still alive on conversation %s (chatty=%v, active_children=%d, deferral=%d/%d); deferring timeout while conversation is active.\n",
+								time.Now().UTC().Format(time.RFC3339), toolPID, curConv, chatty, activeChildren, timeoutDeferrals, maxTimeoutDeferrals,
+							)
+							emitSupervisorNote(deferNote)
+							continue
 						}
 					}
-
-					if curBoundStory == "" {
-						if sid, stitle, spath := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second)); sid != "" {
-							streamMu.Lock()
-							if boundStoryID == "" {
-								boundStoryID = sid
-							}
-							curBoundStory = boundStoryID
-							lastOutAt = time.Now()
-							streamMu.Unlock()
-							if stitle == "" {
-								stitle = opts.Title
-							}
-							_ = controlplane.PostStoryBinding(ctx, apiURL, token, jobID, sid, stitle, spath, opts.FencingToken)
-							storyMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Bound governing story: %s (%s)\n", time.Now().UTC().Format(time.RFC3339), sid, stitle)
-							_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", storyMsg)
-							lastHeartbeatChunkAt = time.Now()
-						}
+					timedOut = true
+					if inBgDrain {
+						turnBgDrainReaped = true
 					}
-
-					if curConv != "" {
-						streamMu.Lock()
-						stepChunk := tailBrainTranscriptSteps(curConv, seenTranscriptSteps)
-						if stepChunk != "" {
-							lastOutAt = time.Now()
-						}
-						streamMu.Unlock()
-						if stepChunk != "" {
-							_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", stepChunk)
-							lastHeartbeatChunkAt = time.Now()
-						}
+					engines.StopProcessGroup(cmd)
+					select {
+					case <-waitDone:
+					case <-time.After(gracePeriod):
+						engines.KillProcessGroup(cmd)
+						<-waitDone
 					}
+					turnErr = context.DeadlineExceeded
+					break turnLoop
+				}
 
+				if jobID != "" && apiURL != "" {
 					streamMu.Lock()
 					silentMs := time.Since(lastOutAt).Milliseconds()
 					streamMu.Unlock()
@@ -803,60 +1130,126 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 						silentMs = 0
 						streamMu.Unlock()
 					}
-
 					_ = controlplane.PostTick(ctx, apiURL, token, jobID, silentMs, os.Getpid(), toolPID, elapsedSec)
 				}
 			}
-		}()
-	}
-
-	// 4. Wait for execution or cancellation / timeout
-	waitDone := make(chan error, 1)
-	go func() {
-		waitDone <- cmd.Wait()
-	}()
-
-	var waitErr error
-	var execStatus string = "completed"
-	var exitCode int = 0
-
-	select {
-	case <-execCtx.Done():
-		// Context timed out or canceled
-		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			execStatus = "timed_out"
-		} else {
-			execStatus = "canceled"
 		}
-		exitCode = 1
 
-		// Graceful SIGTERM to process group
-		engines.StopProcessGroup(cmd)
-
-		select {
-		case <-waitDone:
-			// Terminated within grace period
-		case <-time.After(gracePeriod):
-			// Escalation to SIGKILL
-			engines.KillProcessGroup(cmd)
-			<-waitDone
+		// Final sync of conversation and transcript steps from this turn's log file / brain dir
+		_, _ = syncTurnTelemetry()
+		streamMu.Lock()
+		fullOutFinal := stdoutBuf.String()
+		fullErrFinal := stderrBuf.String()
+		outFinal := fullOutFinal
+		if turnStartOutLen <= len(fullOutFinal) {
+			outFinal = fullOutFinal[turnStartOutLen:]
 		}
-		waitErr = execCtx.Err()
+		errFinal := fullErrFinal
+		if turnStartErrLen <= len(fullErrFinal) {
+			errFinal = fullErrFinal[turnStartErrLen:]
+		}
+		curConvFinal := detectedConvID
+		streamMu.Unlock()
 
-	case waitErr = <-waitDone:
-		if waitErr != nil {
-			execStatus = "failed"
-			var exitErr *exec.ExitError
-			if errors.As(waitErr, &exitErr) {
-				exitCode = exitErr.ExitCode()
-			} else {
-				exitCode = 1
+		if curConvFinal == "" {
+			if cid := discoverLogFileConversation(tmpLogPath); cid != "" {
+				curConvFinal = cid
+			} else if m := convIDRegex.FindStringSubmatch(outFinal + "\n" + errFinal); len(m) > 1 && sessionstore.IsValidConversationID(m[1]) {
+				curConvFinal = m[1]
+			} else if cid := discoverNewBrainConversation(startTime.Add(-2*time.Second), preExistingConvs); cid != "" {
+				curConvFinal = cid
+			}
+			if curConvFinal != "" {
+				streamMu.Lock()
+				detectedConvID = curConvFinal
+				streamMu.Unlock()
+				if jobID != "" && apiURL != "" {
+					_ = controlplane.PostConversation(ctx, apiURL, token, jobID, curConvFinal)
+				}
 			}
 		}
+		if curConvFinal != "" {
+			streamMu.Lock()
+			finalSteps := tailBrainTranscriptSteps(curConvFinal, seenTranscriptSteps)
+			streamMu.Unlock()
+			if finalSteps != "" && jobID != "" && apiURL != "" {
+				_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", finalSteps)
+			}
+		}
+
+		if !turnBgDrainReaped {
+			if inBg, _ := hasBackgroundDrainLog(tmpLogPath, outFinal, errFinal); inBg && (turnErr != nil || timedOut) {
+				turnBgDrainReaped = true
+			}
+		}
+		turnPrintTimeout = hasPrintTimeoutLog(tmpLogPath, outFinal, errFinal)
+
+		switch {
+		case canceled:
+			return "canceled", 1, turnErr, turnBgDrainReaped, turnPrintTimeout
+		case timedOut:
+			return "timed_out", 124, turnErr, turnBgDrainReaped, turnPrintTimeout
+		case turnErr != nil:
+			code := 1
+			var exitErr *exec.ExitError
+			if errors.As(turnErr, &exitErr) {
+				code = exitErr.ExitCode()
+			}
+			return "failed", code, turnErr, turnBgDrainReaped, turnPrintTimeout
+		default:
+			return "completed", 0, nil, turnBgDrainReaped, turnPrintTimeout
+		}
 	}
-	close(tickDone)
+
+	execStatus, exitCode, waitErr, bgDrainReaped, printTimedOut := runSingleTurn(opts.Prompt, "", false)
+
+	// Check if in-place auto-resume should be triggered when conversation ID is resolved
+	if (isMockAgy || isDirectAgy) && ctx.Err() == nil {
+		for resumeAttempts < maxAutoResumes {
+			streamMu.Lock()
+			curConv := detectedConvID
+			curStory := boundStoryID
+			rawCombined := stdoutBuf.String() + "\n" + stderrBuf.String()
+			streamMu.Unlock()
+
+			if curStory == "" {
+				if sid, _, _ := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second)); sid != "" {
+					curStory = sid
+					streamMu.Lock()
+					boundStoryID = sid
+					streamMu.Unlock()
+				}
+			}
+			_, _, curModified := captureGitSnapshot(opts.WorkingDir, gitBin)
+			storyIncomplete := isStoryIncompleteInWorktree(opts.WorkingDir, curStory)
+			needsResume := curConv != "" && !hasHeadlessPermissionDenial(rawCombined) &&
+				(bgDrainReaped || printTimedOut || (storyIncomplete && (execStatus != "completed" || len(curModified) > 0 || bgDrainIdleRegex.MatchString(rawCombined))))
+
+			if !needsResume {
+				break
+			}
+
+			resumeAttempts++
+			storyTarget := curStory
+			if storyTarget == "" {
+				storyTarget = "active story"
+			}
+			resumeNote := fmt.Sprintf(
+				"[%s] [ASE-SUPERVISOR] [auto_resume.triggered] Auto-resuming conversation %s (attempt %d/%d, Story=%s) to complete job after background drain / partial turn...\n",
+				time.Now().UTC().Format(time.RFC3339), curConv, resumeAttempts, maxAutoResumes, storyTarget,
+			)
+			emitSupervisorNote(resumeNote)
+
+			resumePrompt := fmt.Sprintf(
+				"Resume and complete /autonomous-story-execution for %s on conversation %s: finish remaining tasks, commit all worktree changes cleanly, mark story status: DONE, and complete all verification gates.",
+				storyTarget, curConv,
+			)
+			execStatus, exitCode, waitErr, bgDrainReaped, printTimedOut = runSingleTurn(resumePrompt, curConv, true)
+		}
+	}
 
 	durationMs := time.Since(startTime).Milliseconds()
+	elapsedSeconds := int(time.Since(startTime).Seconds())
 
 	// 5. Post-Execution Git Snapshot
 	headSHA, treeSHA, modified := captureGitSnapshot(opts.WorkingDir, gitBin)
@@ -880,38 +1273,14 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 	summary = redact.Egress(strings.TrimSpace(summary))
 
-	if curConv == "" {
-		if cid := discoverLogFileConversation(tmpLogPath); cid != "" {
-			curConv = cid
-		} else if m := convIDRegex.FindStringSubmatch(combinedOutput); len(m) > 1 && sessionstore.IsValidConversationID(m[1]) {
-			curConv = m[1]
-		} else if cid := discoverNewBrainConversation(startTime.Add(-2*time.Second), preExistingConvs); cid != "" {
-			curConv = cid
-		}
-		if curConv != "" && jobID != "" && apiURL != "" {
-			_ = controlplane.PostConversation(ctx, apiURL, token, jobID, curConv)
-		}
-	}
-
-	if curConv != "" && jobID != "" && apiURL != "" {
-		streamMu.Lock()
-		finalSteps := tailBrainTranscriptSteps(curConv, seenTranscriptSteps)
-		streamMu.Unlock()
-		if finalSteps != "" {
-			_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", finalSteps)
-		}
-	}
-
 	if hasHeadlessPermissionDenial(combinedOutput) {
 		execStatus = "failed"
 		if exitCode == 0 {
 			exitCode = 1
 		}
+		failureCategory = "PERMISSION_DENIED"
+		failureStage = "TOOL_EXECUTION"
 		waitErr = fmt.Errorf("PERMISSION_DENIED: headless agent tool permission was auto-denied: %s", summary)
-	}
-
-	if jobID != "" && apiURL != "" && summary != "" && !alreadyStreamed {
-		_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", summary+"\n")
 	}
 
 	detectedStoryID := storyID
@@ -953,10 +1322,27 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		detectedStoryTitle = opts.Title
 	}
 	streamMu.Lock()
-	alreadyBoundStory := boundStoryID
+	alreadyPostedStory := postedStoryID
 	streamMu.Unlock()
-	if detectedStoryID != "" && detectedStoryID != alreadyBoundStory && jobID != "" && apiURL != "" {
+	if detectedStoryID != "" && detectedStoryID != alreadyPostedStory && jobID != "" && apiURL != "" {
 		_ = controlplane.PostStoryBinding(ctx, apiURL, token, jobID, detectedStoryID, detectedStoryTitle, detectedStoryPath, opts.FencingToken)
+	}
+
+	// Enforce fail-closed BACKGROUND_DRAIN_TIMEOUT if background drain was not resolved by auto-resume
+	if bgDrainReaped && (execStatus != "completed" || isStoryIncompleteInWorktree(opts.WorkingDir, detectedStoryID)) {
+		execStatus = "timed_out"
+		if exitCode == 0 {
+			exitCode = 124
+		}
+		failureCategory = "BACKGROUND_DRAIN_TIMEOUT"
+		failureStage = "BACKGROUND_DRAIN"
+		if waitErr == nil {
+			waitErr = fmt.Errorf("BACKGROUND_DRAIN_TIMEOUT: conversation %s timed out waiting on background drain before completing story %s", curConv, detectedStoryID)
+		}
+	}
+
+	if jobID != "" && apiURL != "" && summary != "" && !alreadyStreamed {
+		_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", summary+"\n")
 	}
 
 	var convIDs []string
@@ -975,6 +1361,12 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		ConversationID:       curConv,
 		ActiveConversationID: curConv,
 		ConversationIDs:      convIDs,
+		HarnessPID:           os.Getpid(),
+		ToolPID:              lastToolPID,
+		ElapsedSeconds:       elapsedSeconds,
+		FailureCategory:      failureCategory,
+		FailureStage:         failureStage,
+		ResumeAttempts:       resumeAttempts,
 		Status:               execStatus,
 		ExitCode:             exitCode,
 		PreGitHeadSHA:        preHeadSHA,
