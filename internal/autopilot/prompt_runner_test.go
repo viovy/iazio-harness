@@ -479,3 +479,56 @@ func TestCLIPromptRunner_FailsOnJetskiHeadlessPermissionDenial(t *testing.T) {
 		t.Fatalf("expected PERMISSION_DENIED error, got: %v", err)
 	}
 }
+
+func TestDiscoverLogFileConversation_And_DiscoverStoryFromASEState(t *testing.T) {
+	if got := discoverLogFileConversation(""); got != "" {
+		t.Fatalf("expected empty conv ID for blank log path, got %q", got)
+	}
+	if got := discoverLogFileConversation("/nonexistent/path/agy.log"); got != "" {
+		t.Fatalf("expected empty conv ID for missing log path, got %q", got)
+	}
+
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "agy-run.log")
+	if err := os.WriteFile(logPath, []byte("2026-10-31 INFO Created conversation conv-logfile-998877665544\n"), 0o600); err != nil {
+		t.Fatalf("write log file: %v", err)
+	}
+	if got := discoverLogFileConversation(logPath); got != "conv-logfile-998877665544" {
+		t.Fatalf("expected conv-logfile-998877665544, got %q", got)
+	}
+
+	if sid, stitle, spath := discoverStoryFromASEState("", time.Now()); sid != "" || stitle != "" || spath != "" {
+		t.Fatalf("expected empty story result for blank workingDir, got %q %q %q", sid, stitle, spath)
+	}
+
+	after := time.Now().Add(-5 * time.Second)
+	wsDir := filepath.Join(tmpDir, "ws")
+	if err := os.MkdirAll(filepath.Join(wsDir, ".autopilot"), 0o755); err != nil {
+		t.Fatalf("mkdir .autopilot: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(wsDir, "docs", "stories"), 0o755); err != nil {
+		t.Fatalf("mkdir docs/stories: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wsDir, ".session_story_id"), []byte("STORY-GOV-3839\n"), 0o600); err != nil {
+		t.Fatalf("write .session_story_id: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wsDir, ".autopilot", "ase-state.json"), []byte(`{"story_id":"STORY-GOV-3839"}`), 0o600); err != nil {
+		t.Fatalf("write ase-state.json: %v", err)
+	}
+	storyFile := filepath.Join(wsDir, "docs", "stories", "2026-10-31-gov-3839.story.md")
+	storyBody := "---\nid: STORY-GOV-3839\ntitle: \"ASE State Discovery Test\"\nstatus: IN_PROGRESS\n---\n"
+	if err := os.WriteFile(storyFile, []byte(storyBody), 0o600); err != nil {
+		t.Fatalf("write story file: %v", err)
+	}
+
+	sid, stitle, spath := discoverStoryFromASEState(wsDir, after)
+	if sid != "STORY-GOV-3839" {
+		t.Fatalf("expected STORY-GOV-3839, got %q", sid)
+	}
+	if stitle != "ASE State Discovery Test" {
+		t.Fatalf("expected ASE State Discovery Test, got %q", stitle)
+	}
+	if spath != "docs/stories/2026-10-31-gov-3839.story.md" {
+		t.Fatalf("expected docs/stories/2026-10-31-gov-3839.story.md, got %q", spath)
+	}
+}

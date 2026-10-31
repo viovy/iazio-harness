@@ -37,6 +37,8 @@ const (
 	DefaultPromptTimeout = 7 * 24 * time.Hour
 	defaultPromptTimeout = DefaultPromptTimeout
 	defaultGracePeriod   = 5 * time.Second
+	geminiDirName        = ".gemini"
+	agyCliDirName        = "antigravity-cli"
 )
 
 // ResolveDefaultPromptTimeout returns the default prompt timeout, honoring IAZIO_PROMPT_TIMEOUT_SECONDS when set to a positive integer.
@@ -267,7 +269,7 @@ func discoverNewBrainConversation(after time.Time, preExisting map[string]bool) 
 	if err != nil || home == "" {
 		return ""
 	}
-	brainDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain")
+	brainDir := filepath.Join(home, geminiDirName, agyCliDirName, "brain")
 	if entries, err := os.ReadDir(brainDir); err == nil {
 		for _, e := range entries {
 			if !e.IsDir() || preExisting[e.Name()] {
@@ -281,7 +283,7 @@ func discoverNewBrainConversation(after time.Time, preExisting map[string]bool) 
 			}
 		}
 	}
-	convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+	convDir := filepath.Join(home, geminiDirName, agyCliDirName, "conversations")
 	if entries, err := os.ReadDir(convDir); err == nil {
 		for _, e := range entries {
 			if e.IsDir() || !strings.HasSuffix(e.Name(), ".db") {
@@ -487,12 +489,12 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 
 	preExistingConvs := map[string]bool{}
 	if home, errH := os.UserHomeDir(); errH == nil && home != "" {
-		if entries, errD := os.ReadDir(filepath.Join(home, ".gemini", "antigravity-cli", "brain")); errD == nil {
+		if entries, errD := os.ReadDir(filepath.Join(home, geminiDirName, agyCliDirName, "brain")); errD == nil {
 			for _, e := range entries {
 				preExistingConvs[e.Name()] = true
 			}
 		}
-		if entries, errD := os.ReadDir(filepath.Join(home, ".gemini", "antigravity-cli", "conversations")); errD == nil {
+		if entries, errD := os.ReadDir(filepath.Join(home, geminiDirName, agyCliDirName, "conversations")); errD == nil {
 			for _, e := range entries {
 				preExistingConvs[strings.TrimSuffix(e.Name(), ".db")] = true
 			}
