@@ -123,7 +123,7 @@ func TestDiscardWorkspace_CleanDirtyFilesAndLocks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed reading README.md after discard: %v", err)
 	}
-	if string(readmeBytes) != "# Original Content\n" {
+	if strings.ReplaceAll(string(readmeBytes), "\r\n", "\n") != "# Original Content\n" {
 		t.Errorf("expected README.md to be reset, got: %q", string(readmeBytes))
 	}
 
@@ -242,7 +242,7 @@ func TestDiscardResult_GoldenOutput(t *testing.T) {
 		t.Fatalf("failed reading golden txt: %v", err)
 	}
 	actualTxt := res.String()
-	if strings.TrimSpace(actualTxt) != strings.TrimSpace(string(expectedTxtBytes)) {
+	if strings.TrimSpace(strings.ReplaceAll(actualTxt, "\r\n", "\n")) != strings.TrimSpace(strings.ReplaceAll(string(expectedTxtBytes), "\r\n", "\n")) {
 		t.Errorf("golden text mismatch:\nGOT:\n%s\nWANT:\n%s", actualTxt, string(expectedTxtBytes))
 	}
 
@@ -255,7 +255,7 @@ func TestDiscardResult_GoldenOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed generating json: %v", err)
 	}
-	if strings.TrimSpace(string(actualJSON)) != strings.TrimSpace(string(expectedJSONBytes)) {
+	if strings.TrimSpace(strings.ReplaceAll(string(actualJSON), "\r\n", "\n")) != strings.TrimSpace(strings.ReplaceAll(string(expectedJSONBytes), "\r\n", "\n")) {
 		t.Errorf("golden json mismatch:\nGOT:\n%s\nWANT:\n%s", string(actualJSON), string(expectedJSONBytes))
 	}
 }

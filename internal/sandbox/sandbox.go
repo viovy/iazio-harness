@@ -2,6 +2,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"io/fs"
@@ -134,14 +135,16 @@ func (s *Sandbox) Diff() (string, error) {
 		return "", fmt.Errorf("sandbox is not initialized")
 	}
 
-	cmd := procutil.Command("git", "--git-dir=/dev/null", "diff", "--no-index", "--no-color", s.OriginalPath, s.SandboxPath)
+	cmd := procutil.Command("git", "-c", "core.autocrlf=false", "--git-dir=/dev/null", "diff", "--no-index", "--no-color", s.OriginalPath, s.SandboxPath)
 	cmd.Dir = s.SandboxPath
-	out, err := cmd.CombinedOutput()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 			return strings.TrimSpace(string(out)), nil
 		}
-		return "", fmt.Errorf("git diff failed: %w (output: %s)", err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("git diff failed: %w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
 	}
 	return strings.TrimSpace(string(out)), nil
 }

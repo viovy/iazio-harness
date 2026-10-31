@@ -1107,7 +1107,7 @@ func TestE2E_AgentRepoQueue_DiscardChangesButton_AndAllQueueButtons(t *testing.T
 
 	// Verify README.md was restored and untracked_temp.tmp + .git/index.lock are gone
 	readmeBytes, _ := os.ReadFile(filepath.Join(repoDir, "README.md"))
-	if string(readmeBytes) != "# Iazio Repo\n" {
+	if strings.TrimSpace(string(readmeBytes)) != "# Iazio Repo" {
 		t.Fatalf("README.md was not reset by Discard Changes: %q", string(readmeBytes))
 	}
 	if _, err := os.Stat(filepath.Join(repoDir, "untracked_temp.tmp")); !os.IsNotExist(err) {
@@ -1243,7 +1243,7 @@ func TestE2E_AgentRepo_DiscardAllRepos_AndInProgressJobCancellation(t *testing.T
 
 	// 7. Verify file contents restored and untracked files deleted
 	readmeA, _ := os.ReadFile(filepath.Join(repoDirA, "README.md"))
-	if string(readmeA) != "# Iazio Repo\n" {
+	if strings.TrimSpace(string(readmeA)) != "# Iazio Repo" {
 		t.Fatalf("repoA README.md not restored: %q", string(readmeA))
 	}
 	if _, err := os.Stat(filepath.Join(repoDirA, "untracked_alpha.tmp")); !os.IsNotExist(err) {
@@ -1251,7 +1251,7 @@ func TestE2E_AgentRepo_DiscardAllRepos_AndInProgressJobCancellation(t *testing.T
 	}
 
 	readmeB, _ := os.ReadFile(filepath.Join(repoDirB, "README.md"))
-	if string(readmeB) != "# Iazio Repo\n" {
+	if strings.TrimSpace(string(readmeB)) != "# Iazio Repo" {
 		t.Fatalf("repoB README.md not restored: %q", string(readmeB))
 	}
 	if _, err := os.Stat(filepath.Join(repoDirB, "untracked_beta.tmp")); !os.IsNotExist(err) {
@@ -1305,7 +1305,7 @@ func TestE2E_IazioHarness_PureCodeAction_DiscardAndClean(t *testing.T) {
 
 	// Verify file content restored
 	readmeBytes, _ := os.ReadFile(filepath.Join(repoDir, "README.md"))
-	if string(readmeBytes) != "# Iazio Repo\n" {
+	if strings.TrimSpace(string(readmeBytes)) != "# Iazio Repo" {
 		t.Fatalf("README.md was not reset: %s", string(readmeBytes))
 	}
 
