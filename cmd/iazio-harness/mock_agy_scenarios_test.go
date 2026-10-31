@@ -13,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/viovy/iazio-harness/internal/autopilot"
 	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/engines"
+	"github.com/viovy/iazio-harness/internal/prompt"
 )
 
 // buildMockAgy compiles cmd/mock-agy into a temporary directory and sets PATH.
@@ -1333,5 +1335,104 @@ func TestMockAgy_Scenario16_Job1350_DirtyWorktreePostExit_InPlaceAutoResume(t *t
 	allOutput := strings.Join(postedChunks, "\n")
 	if !strings.Contains(allOutput, "Turn 2 cleaned dirty worktree and completed STORY-ROOT-245") {
 		t.Fatalf("expected Turn 2 continuation output in chunks, got:\n%s", allOutput)
+	}
+}
+
+// Scenario 17: job_3ffa5d0be1649f0e (STORY-GOV-3851):
+// Real `agy --print --log-file` buffers stdout until exit, writing live progress only to
+// --log-file and ~/.gemini/antigravity-cli/brain/<convID>/.system_generated/logs/transcript.jsonl.
+// Verify that CLIPromptRunner streams the [ASE-SUPERVISOR] startup banner, discovered conversation/story IDs,
+// and live [agy] planner thinking/tool-call/response steps from transcript.jsonl as stdout chunks.
+func TestMockAgy_Scenario17_Job3ffa5d0be1649f0e_BufferedStdoutBrainTranscriptStreaming(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "buffered_stdout_brain_transcript_streaming")
+
+	var mu sync.Mutex
+	var postedChunks []string
+	var postedConvIDs []string
+	var boundStoryID string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			var body struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.Text != "" {
+				postedChunks = append(postedChunks, body.Text)
+			}
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/conversations"):
+			var body struct {
+				ConversationID string `json:"conversation_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.ConversationID != "" {
+				postedConvIDs = append(postedConvIDs, body.ConversationID)
+			}
+			w.WriteHeader(http.StatusOK)
+		case (r.Method == http.MethodPatch || r.Method == http.MethodPost) && strings.HasSuffix(r.URL.Path, "/story-binding"):
+			var body struct {
+				StoryID string `json:"story_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			boundStoryID = body.StoryID
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	worktree := initTestGitWorktree(t)
+	_ = os.WriteFile(filepath.Join(worktree, ".gitignore"), []byte(".session_story_id\n"), 0o644)
+	_ = exec.Command("git", "-C", worktree, "add", ".gitignore").Run()
+	_ = exec.Command("git", "-C", worktree, "commit", "-m", "chore: initial").Run()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	executor := prompt.NewExecutor(worktree, autopilot.NewPromptRunner(""))
+	res, err := executor.Execute(ctx, prompt.PromptPayload{
+		PromptID:     "prompt_3ffa5d0be1649f0e",
+		Repo:         ".",
+		WorktreePath: worktree,
+		Prompt:       "/autonomous-story-execution deep review and fix live output",
+		TargetAgent:  "agy",
+		JobID:        "job_3ffa5d0be1649f0e",
+		APIURL:       srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("expected executor.Execute for job_3ffa5d0be1649f0e to succeed, got: %v", err)
+	}
+	if res == nil || res.ExitCode != 0 {
+		t.Fatalf("expected exit code 0, got %+v", res)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	allChunks := strings.Join(postedChunks, "")
+	for _, expected := range []string{
+		"[ASE-SUPERVISOR] Starting prompt execution for Job job_3ffa5d0be1649f0e",
+		"[ASE-SUPERVISOR] Attached Antigravity conversation: ba042127-79e5-4cb2-b35c-5d47145ef4fa",
+		"[agy step #2] thinking: Inspecting repository live output pipeline",
+		"[agy step #2] tool read_file: /home/romeo/work/meta-repo-02/AGENTS.md",
+		"[agy step #2] tool run_command: Check autopilot status",
+		"[agy step #3] output: Completed STORY-GOV-3850 implementation and verified all gates.",
+	} {
+		if !strings.Contains(allChunks, expected) {
+			t.Fatalf("expected streamed chunks to contain %q, got:\n%s", expected, allChunks)
+		}
+	}
+	if len(postedConvIDs) == 0 || postedConvIDs[0] != "ba042127-79e5-4cb2-b35c-5d47145ef4fa" {
+		t.Fatalf("expected conversation ID ba042127-79e5-4cb2-b35c-5d47145ef4fa posted, got %v", postedConvIDs)
+	}
+	if boundStoryID != "STORY-GOV-3850" {
+		t.Fatalf("expected STORY-GOV-3850 bound via story-binding, got %q", boundStoryID)
 	}
 }

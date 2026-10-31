@@ -3,6 +3,7 @@ package autopilot
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -581,5 +582,91 @@ func TestDiscoverLogFileConversation_And_DiscoverStoryFromASEState(t *testing.T)
 	}
 	if res.StoryID != "STORY-GOV-3839" {
 		t.Fatalf("expected StoryID STORY-GOV-3839 from ASE state, got %q", res.StoryID)
+	}
+}
+
+func TestTailBrainTranscriptSteps_And_StartupBanner(t *testing.T) {
+	brainDir := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainDir)
+
+	convID := "ba042127-c63f-4b1e-a42e-95b307e61bbc"
+	logsDir := filepath.Join(brainDir, convID, ".system_generated", "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		t.Fatalf("mkdir logsDir: %v", err)
+	}
+	transcriptFile := filepath.Join(logsDir, "transcript.jsonl")
+	lines := strings.Join([]string{
+		`{"step_index":1,"type":"USER_INPUT","status":"DONE","created_at":"2026-10-31T14:00:00Z","content":"/autonomous-story-execution"}`,
+		`{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-31T14:00:05Z","thinking":"Inspecting live job state","content":"Running git status check.","tool_calls":[{"name":"run_command","arguments":"{\"CommandLine\":\"git status -sb\",\"toolSummary\":\"Check git status\"}"}]}`,
+		`{"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-31T14:00:10Z","thinking":"Reading prompt runner","tool_calls":[{"name":"read_file","arguments":{"Path":"/home/romeo/work/meta-repo/iazio-harness/internal/autopilot/prompt_runner.go"}}]}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(transcriptFile, []byte(lines), 0o600); err != nil {
+		t.Fatalf("write transcript.jsonl: %v", err)
+	}
+
+	seen := make(map[int]bool)
+	out1 := tailBrainTranscriptSteps(convID, seen)
+	if !strings.Contains(out1, "[agy step #2] thinking: Inspecting live job state") {
+		t.Fatalf("expected thinking in out1, got:\n%s", out1)
+	}
+	if !strings.Contains(out1, "[agy step #2] tool run_command: Check git status — `git status -sb`") {
+		t.Fatalf("expected tool_call summary in out1, got:\n%s", out1)
+	}
+	if !strings.Contains(out1, "[agy step #2] output: Running git status check.") {
+		t.Fatalf("expected content in out1, got:\n%s", out1)
+	}
+	if !strings.Contains(out1, "[agy step #3] tool read_file: /home/romeo/work/meta-repo/iazio-harness/internal/autopilot/prompt_runner.go") {
+		t.Fatalf("expected step #3 read_file path in out1, got:\n%s", out1)
+	}
+
+	// Second call with no new steps must return empty string
+	if out2 := tailBrainTranscriptSteps(convID, seen); out2 != "" {
+		t.Fatalf("expected empty out2 when no new steps added, got %q", out2)
+	}
+
+	var chunkMu sync.Mutex
+	var postedChunks []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/chunks") {
+			b, _ := os.ReadFile("/dev/null")
+			_ = b
+			var payload map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if payload["type"] == "OUTPUT_CHUNK" {
+				if txt, ok := payload["text"].(string); ok {
+					chunkMu.Lock()
+					postedChunks = append(postedChunks, txt)
+					chunkMu.Unlock()
+				}
+			}
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	wrapper := makeFakeAutopilot(t)
+	repoDir := initTestGitRepo(t)
+	runner := NewPromptRunner(wrapper)
+	_, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_banner_test",
+		JobID:       "job_3ffa5d0be1649f0e",
+		APIURL:      srv.URL,
+		Token:       "tok",
+		Repo:        "meta-repo-02",
+		Title:       "Banner and Transcript Test",
+		Prompt:      "/autonomous-story-execution STORY-GOV-3850",
+		TargetAgent: "autopilot",
+		WorkingDir:  repoDir,
+		Timeout:     5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunPrompt failed: %v", err)
+	}
+
+	chunkMu.Lock()
+	joinedChunks := strings.Join(postedChunks, "\n")
+	chunkMu.Unlock()
+	if !strings.Contains(joinedChunks, "[ASE-SUPERVISOR] Starting prompt execution for Job job_3ffa5d0be1649f0e") {
+		t.Fatalf("expected startup banner chunk in postedChunks, got:\n%s", joinedChunks)
 	}
 }

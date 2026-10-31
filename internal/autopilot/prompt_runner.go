@@ -2,10 +2,12 @@
 package autopilot
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -264,24 +266,37 @@ func discoverStoryFromASEState(workingDir string, after time.Time) (storyID, sto
 	return storyID, storyTitle, storyPath
 }
 
-func discoverNewBrainConversation(after time.Time, preExisting map[string]bool) string {
+func resolveBrainDir() string {
+	if override := strings.TrimSpace(os.Getenv("IAZIO_BRAIN_DIR")); override != "" {
+		return override
+	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return ""
 	}
-	brainDir := filepath.Join(home, geminiDirName, agyCliDirName, "brain")
-	if entries, err := os.ReadDir(brainDir); err == nil {
-		for _, e := range entries {
-			if !e.IsDir() || preExisting[e.Name()] {
-				continue
-			}
-			if !sessionstore.IsValidConversationID(e.Name()) {
-				continue
-			}
-			if info, errI := e.Info(); errI == nil && info.ModTime().After(after) {
-				return e.Name()
+	return filepath.Join(home, geminiDirName, agyCliDirName, "brain")
+}
+
+func discoverNewBrainConversation(after time.Time, preExisting map[string]bool) string {
+	brainDir := resolveBrainDir()
+	if brainDir != "" {
+		if entries, err := os.ReadDir(brainDir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() || preExisting[e.Name()] {
+					continue
+				}
+				if !sessionstore.IsValidConversationID(e.Name()) {
+					continue
+				}
+				if info, errI := e.Info(); errI == nil && info.ModTime().After(after) {
+					return e.Name()
+				}
 			}
 		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
 	}
 	convDir := filepath.Join(home, geminiDirName, agyCliDirName, "conversations")
 	if entries, err := os.ReadDir(convDir); err == nil {
@@ -299,6 +314,126 @@ func discoverNewBrainConversation(after time.Time, preExisting map[string]bool) 
 		}
 	}
 	return ""
+}
+
+type transcriptToolCall struct {
+	Name      string `json:"name"`
+	Arguments any    `json:"arguments"`
+	Args      any    `json:"args"`
+}
+
+type transcriptStep struct {
+	StepIndex int                  `json:"step_index"`
+	Type      string               `json:"type"`
+	Status    string               `json:"status"`
+	CreatedAt string               `json:"created_at"`
+	Thinking  string               `json:"thinking"`
+	Content   string               `json:"content"`
+	ToolCalls []transcriptToolCall `json:"tool_calls"`
+}
+
+func summarizeToolCallArg(args any) string {
+	var m map[string]any
+	switch v := args.(type) {
+	case string:
+		_ = json.Unmarshal([]byte(v), &m)
+	case map[string]any:
+		m = v
+	}
+	if m == nil {
+		return ""
+	}
+	var parts []string
+	if ts, ok := m["toolSummary"].(string); ok && strings.TrimSpace(ts) != "" {
+		parts = append(parts, strings.TrimSpace(ts))
+	}
+	if cmdLine, ok := m["CommandLine"].(string); ok && strings.TrimSpace(cmdLine) != "" {
+		cl := strings.TrimSpace(strings.ReplaceAll(cmdLine, "\n", " "))
+		if len(cl) > 120 {
+			cl = cl[:117] + "..."
+		}
+		parts = append(parts, "`"+cl+"`")
+	} else if pathVal, ok := m["Path"].(string); ok && strings.TrimSpace(pathVal) != "" {
+		parts = append(parts, strings.TrimSpace(pathVal))
+	}
+	return strings.Join(parts, " — ")
+}
+
+func firstNonEmptyLine(s string, maxLen int) string {
+	for _, line := range strings.Split(s, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			if len(trimmed) > maxLen {
+				return trimmed[:maxLen-3] + "..."
+			}
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func tailBrainTranscriptSteps(convID string, seenSteps map[int]bool) string {
+	if strings.TrimSpace(convID) == "" || !sessionstore.IsValidConversationID(convID) {
+		return ""
+	}
+	brainDir := resolveBrainDir()
+	if brainDir == "" {
+		return ""
+	}
+	transcriptPath := filepath.Join(brainDir, convID, ".system_generated", "logs", "transcript.jsonl")
+	f, err := os.Open(transcriptPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	var sb strings.Builder
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var step transcriptStep
+		if err := json.Unmarshal([]byte(line), &step); err != nil {
+			continue
+		}
+		if step.StepIndex <= 0 || seenSteps[step.StepIndex] {
+			continue
+		}
+		if step.Type != "PLANNER_RESPONSE" {
+			seenSteps[step.StepIndex] = true
+			continue
+		}
+		if step.Status != "" && step.Status != "DONE" && len(step.ToolCalls) == 0 && strings.TrimSpace(step.Content) == "" && strings.TrimSpace(step.Thinking) == "" {
+			continue
+		}
+		seenSteps[step.StepIndex] = true
+		ts := step.CreatedAt
+		if ts == "" {
+			ts = time.Now().UTC().Format(time.RFC3339)
+		}
+		if thinkLine := firstNonEmptyLine(step.Thinking, 180); thinkLine != "" {
+			sb.WriteString(fmt.Sprintf("[%s] [agy step #%d] thinking: %s\n", ts, step.StepIndex, redact.Egress(thinkLine)))
+		}
+		for _, tc := range step.ToolCalls {
+			rawArgs := tc.Arguments
+			if rawArgs == nil {
+				rawArgs = tc.Args
+			}
+			argSummary := summarizeToolCallArg(rawArgs)
+			if argSummary != "" {
+				sb.WriteString(fmt.Sprintf("[%s] [agy step #%d] tool %s: %s\n", ts, step.StepIndex, tc.Name, redact.Egress(argSummary)))
+			} else {
+				sb.WriteString(fmt.Sprintf("[%s] [agy step #%d] tool %s\n", ts, step.StepIndex, tc.Name))
+			}
+		}
+		if contentLine := firstNonEmptyLine(step.Content, 240); contentLine != "" {
+			sb.WriteString(fmt.Sprintf("[%s] [agy step #%d] output: %s\n", ts, step.StepIndex, redact.Egress(contentLine)))
+		}
+	}
+	return sb.String()
 }
 
 // PromptRunner defines the interface for executing prompts in a submodule directory.
@@ -488,12 +623,14 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 
 	preExistingConvs := map[string]bool{}
-	if home, errH := os.UserHomeDir(); errH == nil && home != "" {
-		if entries, errD := os.ReadDir(filepath.Join(home, geminiDirName, agyCliDirName, "brain")); errD == nil {
+	if brainDir := resolveBrainDir(); brainDir != "" {
+		if entries, errD := os.ReadDir(brainDir); errD == nil {
 			for _, e := range entries {
 				preExistingConvs[e.Name()] = true
 			}
 		}
+	}
+	if home, errH := os.UserHomeDir(); errH == nil && home != "" {
 		if entries, errD := os.ReadDir(filepath.Join(home, geminiDirName, agyCliDirName, "conversations")); errD == nil {
 			for _, e := range entries {
 				preExistingConvs[strings.TrimSuffix(e.Name(), ".db")] = true
@@ -506,6 +643,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	lastOutAt := startTime
 	streamedAny := false
 	detectedConvID := ""
+	seenTranscriptSteps := make(map[int]bool)
 
 	var stdoutW io.Writer = &stdoutBuf
 	var stderrW io.Writer = &stderrBuf
@@ -557,10 +695,25 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	boundStoryID := storyID
 	tickDone := make(chan struct{})
 	if jobID != "" && apiURL != "" {
+		tsStr := time.Now().UTC().Format(time.RFC3339)
+		promptPreview := strings.TrimSpace(strings.ReplaceAll(opts.Prompt, "\n", " "))
+		if len(promptPreview) > 160 {
+			promptPreview = promptPreview[:157] + "..."
+		}
+		storyLabel := boundStoryID
+		if storyLabel == "" {
+			storyLabel = "pending-allocation"
+		}
+		banner := fmt.Sprintf(
+			"[%s] [ASE-SUPERVISOR] Starting prompt execution for Job %s (HarnessPID=%d, ToolPID=%d, Agent=%s, Story=%s, Worktree=%s)\n[%s] [ASE-SUPERVISOR] Prompt: %s\n",
+			tsStr, jobID, os.Getpid(), toolPID, effectiveAgent, storyLabel, opts.WorkingDir, tsStr, redact.Egress(promptPreview),
+		)
+		_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", banner)
 		_ = controlplane.PostTick(ctx, apiURL, token, jobID, 0, os.Getpid(), toolPID, 0)
 		go func() {
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
+			lastHeartbeatChunkAt := startTime
 			for {
 				select {
 				case <-tickDone:
@@ -569,12 +722,10 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					return
 				case <-ticker.C:
 					streamMu.Lock()
-					silentMs := time.Since(lastOutAt).Milliseconds()
 					curConv := detectedConvID
 					curBoundStory := boundStoryID
 					streamMu.Unlock()
-					elapsedSec := int(time.Since(startTime).Seconds())
-					_ = controlplane.PostTick(ctx, apiURL, token, jobID, silentMs, os.Getpid(), toolPID, elapsedSec)
+
 					if curConv == "" {
 						cid := discoverLogFileConversation(tmpLogPath)
 						if cid == "" {
@@ -585,23 +736,75 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 							if detectedConvID == "" {
 								detectedConvID = cid
 							}
+							curConv = detectedConvID
+							lastOutAt = time.Now()
 							streamMu.Unlock()
 							_ = controlplane.PostConversation(ctx, apiURL, token, jobID, cid)
+							convMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Attached Antigravity conversation: %s\n", time.Now().UTC().Format(time.RFC3339), cid)
+							_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", convMsg)
+							lastHeartbeatChunkAt = time.Now()
 						}
 					}
+
 					if curBoundStory == "" {
 						if sid, stitle, spath := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second)); sid != "" {
 							streamMu.Lock()
 							if boundStoryID == "" {
 								boundStoryID = sid
 							}
+							curBoundStory = boundStoryID
+							lastOutAt = time.Now()
 							streamMu.Unlock()
 							if stitle == "" {
 								stitle = opts.Title
 							}
 							_ = controlplane.PostStoryBinding(ctx, apiURL, token, jobID, sid, stitle, spath, opts.FencingToken)
+							storyMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Bound governing story: %s (%s)\n", time.Now().UTC().Format(time.RFC3339), sid, stitle)
+							_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", storyMsg)
+							lastHeartbeatChunkAt = time.Now()
 						}
 					}
+
+					if curConv != "" {
+						streamMu.Lock()
+						stepChunk := tailBrainTranscriptSteps(curConv, seenTranscriptSteps)
+						if stepChunk != "" {
+							lastOutAt = time.Now()
+						}
+						streamMu.Unlock()
+						if stepChunk != "" {
+							_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", stepChunk)
+							lastHeartbeatChunkAt = time.Now()
+						}
+					}
+
+					streamMu.Lock()
+					silentMs := time.Since(lastOutAt).Milliseconds()
+					streamMu.Unlock()
+					elapsedSec := int(time.Since(startTime).Seconds())
+
+					if time.Since(lastHeartbeatChunkAt) >= 20*time.Second {
+						hbStory := curBoundStory
+						if hbStory == "" {
+							hbStory = "pending"
+						}
+						hbConv := curConv
+						if hbConv == "" {
+							hbConv = "pending"
+						}
+						hbMsg := fmt.Sprintf(
+							"[%s] [ASE-SUPERVISOR] Execution active (elapsed: %ds, HarnessPID=%d, ToolPID=%d, Story=%s, Conv=%s)\n",
+							time.Now().UTC().Format(time.RFC3339), elapsedSec, os.Getpid(), toolPID, hbStory, hbConv,
+						)
+						_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", hbMsg)
+						lastHeartbeatChunkAt = time.Now()
+						streamMu.Lock()
+						lastOutAt = time.Now()
+						silentMs = 0
+						streamMu.Unlock()
+					}
+
+					_ = controlplane.PostTick(ctx, apiURL, token, jobID, silentMs, os.Getpid(), toolPID, elapsedSec)
 				}
 			}
 		}()
@@ -687,6 +890,15 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		}
 		if curConv != "" && jobID != "" && apiURL != "" {
 			_ = controlplane.PostConversation(ctx, apiURL, token, jobID, curConv)
+		}
+	}
+
+	if curConv != "" && jobID != "" && apiURL != "" {
+		streamMu.Lock()
+		finalSteps := tailBrainTranscriptSteps(curConv, seenTranscriptSteps)
+		streamMu.Unlock()
+		if finalSteps != "" {
+			_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", finalSteps)
 		}
 	}
 
