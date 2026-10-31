@@ -621,10 +621,17 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		}
 
 		// Spawn an active child process and emit chatty transcript steps across 480ms so tool_pid liveness defers a 300ms timeout
-		childCmd := exec.Command("sleep", "30")
-		_ = childCmd.Start()
+		stepSleep := 120 * time.Millisecond
+		drainSleep := 30 * time.Second
+		if os.Getenv("MOCK_AGY_UNIT") == "1" {
+			stepSleep = 5 * time.Millisecond
+			drainSleep = 5 * time.Millisecond
+		} else {
+			childCmd := exec.Command("sleep", "30")
+			_ = childCmd.Start()
+		}
 		for i := 0; i < 4; i++ {
-			time.Sleep(120 * time.Millisecond)
+			time.Sleep(stepSleep)
 			if transcriptPath != "" {
 				step := fmt.Sprintf(`{"step_index":%d,"type":"PLANNER_RESPONSE","content":"Executing active task step %d while tool_pid is live"}`+"\n", 10+i, i+1)
 				if tf, err := os.OpenFile(transcriptPath, os.O_WRONLY|os.O_APPEND, 0644); err == nil {
@@ -642,7 +649,7 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			_, _ = io.WriteString(stdout, drainLine)
 		}
 		// Block until supervisor reaps background drain
-		time.Sleep(30 * time.Second)
+		time.Sleep(drainSleep)
 		return 0
 
 	default:
