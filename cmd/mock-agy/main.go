@@ -199,10 +199,12 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	var logFileWriter io.Writer
 	if logFile != "" {
 		_ = os.MkdirAll(filepath.Dir(logFile), 0755)
 		if f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 			defer f.Close()
+			logFileWriter = f
 			stdout = io.MultiWriter(stdout, f)
 			stderr = io.MultiWriter(stderr, f)
 		}
@@ -517,6 +519,49 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		_ = exec.Command("git", "add", ".").Run()
 		_ = exec.Command("git", "commit", "-m", "feat: complete STORY-ROOT-245 cleanly").Run()
 		fmt.Fprintln(stdout, "[mock-agy] Turn 2 cleaned dirty worktree and completed STORY-ROOT-245.")
+		return 0
+
+	case "buffered_stdout_brain_transcript_streaming":
+		// Scenario (job_3ffa5d0be1649f0e / STORY-GOV-3851):
+		// Real `agy --print --log-file` buffers stdout until exit, writing live progress only to
+		// --log-file and ~/.gemini/antigravity-cli/brain/<convID>/.system_generated/logs/transcript.jsonl.
+		cid := conversationID
+		if cid == "" {
+			cid = "ba042127-79e5-4cb2-b35c-5d47145ef4fa"
+		}
+		if logFileWriter != nil {
+			fmt.Fprintf(logFileWriter, "Created conversation %s\n", cid)
+		}
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+			_ = os.MkdirAll(convDir, 0755)
+			_ = os.WriteFile(filepath.Join(convDir, cid+".db"), []byte("mock-db"), 0644)
+
+			logsDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain", cid, ".system_generated", "logs")
+			_ = os.MkdirAll(logsDir, 0755)
+			transcriptPath := filepath.Join(logsDir, "transcript.jsonl")
+			step1 := `{"step_index":1,"type":"USER_INPUT","content":"/autonomous-story-execution STORY-GOV-3850"}` + "\n"
+			step2 := `{"step_index":2,"type":"PLANNER_RESPONSE","thinking":"Inspecting repository live output pipeline","tool_calls":[{"name":"read_file","arguments":{"Path":"/home/romeo/work/meta-repo-02/AGENTS.md"}},{"name":"run_command","arguments":{"CommandLine":"autopilot status","toolSummary":"Check autopilot status"}}]}` + "\n"
+			_ = os.WriteFile(transcriptPath, []byte(step1+step2), 0644)
+
+			_ = os.WriteFile(".session_story_id", []byte("STORY-GOV-3850\n"), 0644)
+			waitDur := 2200 * time.Millisecond
+			if os.Getenv("MOCK_AGY_FAST") == "1" {
+				waitDur = 100 * time.Millisecond
+			}
+			time.Sleep(waitDur)
+
+			step3 := `{"step_index":3,"type":"PLANNER_RESPONSE","content":"Completed STORY-GOV-3850 implementation and verified all gates."}` + "\n"
+			if tf, err := os.OpenFile(transcriptPath, os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+				_, _ = tf.WriteString(step3)
+				_ = tf.Close()
+			}
+		}
+		_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
+		storyFile := filepath.Join("docs", "stories", "2026-10-31-gov-3850-live-stream.story.md")
+		_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3850\ntitle: Verify live transcript streaming\nstatus: DONE\n---\n"), 0644)
+		_ = exec.Command("git", "add", "docs").Run()
+		_ = exec.Command("git", "commit", "-m", "feat(gov-3850): verify live transcript streaming [STORY-GOV-3850]").Run()
 		return 0
 
 	default:
