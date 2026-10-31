@@ -9,6 +9,9 @@ import (
 
 // SetProcGroup configures cmd to run in its own process group on Unix.
 func SetProcGroup(cmd *exec.Cmd) {
+	if cmd == nil {
+		return
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 

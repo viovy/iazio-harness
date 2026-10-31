@@ -1189,6 +1189,35 @@ func TestProcessGroupHelpers(t *testing.T) {
 	}
 }
 
+func TestWatchCancel_Paths(t *testing.T) {
+	// Case 1: done received
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	close(done)
+	watchCancel(ctx, nil, done)
+
+	// Case 2: ctx canceled before done, done finishes immediately
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	done2 := make(chan struct{})
+	close(done2)
+	cmd2 := exec.Command("sleep", "1")
+	watchCancel(ctx2, cmd2, done2)
+}
+
+func TestProcGroup_EdgeCases(t *testing.T) {
+	SetProcGroup(nil)
+	PostStartProcessGroup(nil)
+	if checkProcGroupAttrs(nil) {
+		t.Errorf("expected false for nil cmd")
+	}
+	emptyCmd := &exec.Cmd{}
+	if checkProcGroupAttrs(emptyCmd) {
+		t.Errorf("expected false for empty SysProcAttr")
+	}
+}
+
 func TestBuildArgv_UnanchoredResumeRejection(t *testing.T) {
 	engines := []string{"agy", "agent", "copilot", "opencode"}
 	prompts := []string{"resume", "RESUME", " resume ", "/autonomous-story-execution resume"}
