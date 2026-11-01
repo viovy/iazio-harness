@@ -653,6 +653,64 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		time.Sleep(drainSleep)
 		return 0
 
+	case "job_110f47f09551baba_ase_complete_bg_drain_and_pointer_story":
+		// Scenario (job_110f47f09551baba / STORY-GOV-3874):
+		// Reproduces job_110f47f09551baba where:
+		// 1. Primary story STORY-GOV-3873 and pointer story STORY-GOV-POINTERS-20261101-044815 both complete (status: DONE) and are committed cleanly.
+		// 2. .session_story_id is overwritten by the pointer bump helper with STORY-GOV-POINTERS-20261101-044815.
+		// 3. Brain transcript step #321 emits:
+		//    "Autonomous story execution is complete for both STORY-GOV-3873 and STORY-GOV-POINTERS-20261101-044815"
+		// 4. agy enters "WaitForConversationFullyIdle: root agent idle; waiting up to 1h0m0s for 1 background task(s)" without flushing stdout and blocks.
+		// 5. prompt_runner must detect ASE completion during background drain (without needing a redundant Turn 2 auto-resume or reporting BACKGROUND_DRAIN_TIMEOUT)
+		//    and preserve STORY-GOV-3873 as the primary StoryID.
+		cid := conversationID
+		if cid == "" {
+			cid = "18f40eb1-d86f-41bf-a69f-7d9de6536cb6"
+		}
+		if logFileWriter != nil {
+			fmt.Fprintf(logFileWriter, "Created conversation %s\n", cid)
+		} else {
+			fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+		}
+		_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
+		primaryStoryFile := filepath.Join("docs", "stories", "2026-11-01-gov-3873-prompts-alphabetical-sorting-and-ui-verification.story.md")
+		pointerStoryFile := filepath.Join("docs", "stories", "2026-11-01-gov-pointers-20261101-044815.story.md")
+		_ = os.WriteFile(primaryStoryFile, []byte("---\nid: STORY-GOV-3873\ntitle: Prompts Alphabetical Sorting and UI Verification\nstatus: DONE\n---\n"), 0644)
+		_ = os.WriteFile(pointerStoryFile, []byte("---\nid: STORY-GOV-POINTERS-20261101-044815\ntitle: Reconcile Submodule Pointers\nstatus: DONE\n---\n"), 0644)
+		_ = procutil.Command("git", "add", "docs").Run()
+		_ = procutil.Command("git", "commit", "-m", "chore(pointers): reconcile submodule pointers [STORY-GOV-3873]").Run()
+
+		// Simulate pointer bump overwriting .session_story_id while .autopilot/ase-state.json also exists
+		_ = os.WriteFile(".session_story_id", []byte("STORY-GOV-POINTERS-20261101-044815\n"), 0644)
+		_ = os.MkdirAll(".autopilot", 0755)
+		_ = os.WriteFile(filepath.Join(".autopilot", "ase-state.json"), []byte(`{"story_id":"STORY-GOV-3873","title":"Prompts Alphabetical Sorting and UI Verification","story_file":"docs/stories/2026-11-01-gov-3873-prompts-alphabetical-sorting-and-ui-verification.story.md"}`), 0644)
+
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+			_ = os.MkdirAll(convDir, 0755)
+			_ = os.WriteFile(filepath.Join(convDir, cid+".db"), []byte("mock-db"), 0644)
+
+			logsDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain", cid, ".system_generated", "logs")
+			_ = os.MkdirAll(logsDir, 0755)
+			transcriptPath := filepath.Join(logsDir, "transcript.jsonl")
+			step1 := `{"step_index":1,"type":"USER_INPUT","content":"/autonomous-story-execution STORY-GOV-3873"}` + "\n"
+			step321 := `{"step_index":321,"type":"PLANNER_RESPONSE","content":"Autonomous story execution is complete for both [` + "`STORY-GOV-3873`" + `](file:///home/romeo/work/meta-repo/docs/stories/2026-11-01-gov-3873-prompts-alphabetical-sorting-and-ui-verification.story.md) and [` + "`STORY-GOV-POINTERS-20261101-044815`" + `](file:///home/romeo/work/meta-repo/docs/stories/2026-11-01-gov-pointers-20261101-044815.story.md)."}` + "\n"
+			_ = os.WriteFile(transcriptPath, []byte(step1+step321), 0644)
+		}
+
+		drainLine := "2026/11/01 05:39:45 WaitForConversationFullyIdle: root agent idle; waiting up to 1h0m0s for 1 background task(s)\n"
+		if logFileWriter != nil {
+			_, _ = io.WriteString(logFileWriter, drainLine)
+		} else {
+			_, _ = io.WriteString(stdout, drainLine)
+		}
+		drainSleep := 30 * time.Second
+		if os.Getenv("MOCK_AGY_UNIT") == "1" {
+			drainSleep = 5 * time.Millisecond
+		}
+		time.Sleep(drainSleep)
+		return 0
+
 	default:
 		// Default simple execution
 		if conversationID != "" {

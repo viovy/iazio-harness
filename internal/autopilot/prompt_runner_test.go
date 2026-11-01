@@ -866,3 +866,168 @@ fi
 		t.Fatalf("expected fail-closed BACKGROUND_DRAIN_TIMEOUT, got %+v", res2)
 	}
 }
+
+func TestJob110f47f09551baba_ASECompletionDuringBackgroundDrainAndServiceFaultClassification(t *testing.T) {
+	brainDir := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainDir)
+
+	repoDir := initTestGitRepo(t)
+	storiesDir := filepath.Join(repoDir, "docs", "stories")
+	if err := os.MkdirAll(storiesDir, 0o755); err != nil {
+		t.Fatalf("mkdir stories: %v", err)
+	}
+	primaryStoryPath := filepath.Join(storiesDir, "2026-11-01-gov-3873-prompts-alphabetical-sorting-and-ui-verification.story.md")
+	pointerStoryPath := filepath.Join(storiesDir, "2026-11-01-gov-pointers-20261101-044815.story.md")
+
+	if err := os.WriteFile(primaryStoryPath, []byte("---\nid: STORY-GOV-3873\ntitle: Prompts Alphabetical Sorting and UI Verification\nstatus: IN_PROGRESS\n---\n"), 0o600); err != nil {
+		t.Fatalf("write primary story: %v", err)
+	}
+	if err := os.WriteFile(pointerStoryPath, []byte("---\nid: STORY-GOV-POINTERS-20261101-044815\ntitle: Reconcile Submodule Pointers\nstatus: DONE\n---\n"), 0o600); err != nil {
+		t.Fatalf("write pointer story: %v", err)
+	}
+
+	step321Out := "[2026-11-01T05:39:45Z] [agy step #321] output: Autonomous story execution is complete for both [`STORY-GOV-3873`](file:///home/romeo/work/meta-repo/docs/stories/2026-11-01-gov-3873-prompts-alphabetical-sorting-and-ui-verification.story.md) and [`STORY-GOV-POINTERS-20261101-044815`](file:///home/romeo/work/meta-repo/docs/stories/2026-11-01-gov-pointers-20261101-044815.story.md)."
+
+	// Must be false while STORY-GOV-3873 is still IN_PROGRESS or uncommitted
+	if isASEFlowCompletedInWorktree(repoDir, "STORY-GOV-3873", step321Out, "git") {
+		t.Fatalf("expected isASEFlowCompletedInWorktree=false while STORY-GOV-3873 is IN_PROGRESS")
+	}
+
+	// Mark STORY-GOV-3873 DONE and commit cleanly
+	if err := os.WriteFile(primaryStoryPath, []byte("---\nid: STORY-GOV-3873\ntitle: Prompts Alphabetical Sorting and UI Verification\nstatus: DONE\n---\n"), 0o600); err != nil {
+		t.Fatalf("write primary story DONE: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", "docs"},
+		{"commit", "-m", "chore: complete STORY-GOV-3873 and pointer story"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, string(out))
+		}
+	}
+
+	// Write ephemeral files (.session_story_id with pointer story, .autopilot/ase-state.json with primary story)
+	_ = os.WriteFile(filepath.Join(repoDir, ".session_story_id"), []byte("STORY-GOV-POINTERS-20261101-044815\n"), 0o600)
+	_ = os.MkdirAll(filepath.Join(repoDir, ".autopilot"), 0o755)
+	_ = os.WriteFile(filepath.Join(repoDir, ".autopilot", "ase-state.json"), []byte(`{"story_id":"STORY-GOV-3873","title":"Prompts Alphabetical Sorting and UI Verification"}`), 0o600)
+
+	// Verify pointer story deprioritization in discoverStoryFromASEState
+	discID, _, _ := discoverStoryFromASEState(repoDir, time.Now().Add(-10*time.Second))
+	if discID != "STORY-GOV-3873" {
+		t.Fatalf("expected discoverStoryFromASEState to prefer non-pointer STORY-GOV-3873 over STORY-GOV-POINTERS-*, got %q", discID)
+	}
+
+	// Verify isASEFlowCompletedInWorktree is true with clean non-ephemeral worktree + DONE stories
+	if !isASEFlowCompletedInWorktree(repoDir, "STORY-GOV-3873", step321Out, "git") {
+		t.Fatalf("expected isASEFlowCompletedInWorktree=true when stories are DONE and worktree has only ephemeral files")
+	}
+
+	// End-to-end RunPrompt test reproducing job_110f47f09551baba
+	convID := "18f40eb1-d86f-41bf-a69f-7d9de6536cb6"
+	binDir := t.TempDir()
+	mockAgyBin := filepath.Join(binDir, "mock-agy")
+	script := fmt.Sprintf(`#!/bin/sh
+LOG_FILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --log-file=*) LOG_FILE="${1#*=}" ;;
+    --log-file) shift; LOG_FILE="$1" ;;
+  esac
+  shift
+done
+
+if [ -n "$LOG_FILE" ]; then
+  echo "Created conversation %s" >> "$LOG_FILE"
+fi
+mkdir -p "%s/%s/.system_generated/logs"
+cat << 'EOF' > "%s/%s/.system_generated/logs/transcript.jsonl"
+{"step_index":1,"type":"USER_INPUT","content":"/autonomous-story-execution STORY-GOV-3873"}
+{"step_index":321,"type":"PLANNER_RESPONSE","content":"Autonomous story execution is complete for both [STORY-GOV-3873](file:///home/romeo/work/meta-repo/docs/stories/2026-11-01-gov-3873-prompts-alphabetical-sorting-and-ui-verification.story.md) and [STORY-GOV-POINTERS-20261101-044815](file:///home/romeo/work/meta-repo/docs/stories/2026-11-01-gov-pointers-20261101-044815.story.md)."}
+EOF
+if [ -n "$LOG_FILE" ]; then
+  echo "2026/11/01 05:39:45 WaitForConversationFullyIdle: root agent idle; waiting up to 1h0m0s for 1 background task(s)" >> "$LOG_FILE"
+fi
+sleep 5
+exit 0
+`, convID, brainDir, convID, brainDir, convID)
+
+	if err := os.WriteFile(mockAgyBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock-agy script: %v", err)
+	}
+
+	// Simulate transient 503 on first chunk post to verify control-plane release/restart resilience
+	var postCount int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		postCount++
+		c := postCount
+		mu.Unlock()
+		if c == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	runner := NewPromptRunner("autopilot")
+	runner.GracePeriod = 50 * time.Millisecond
+	zeroResumes := 0
+	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:                   "prompt_job_110f47f09551baba",
+		JobID:                      "job_110f47f09551baba",
+		APIURL:                     srv.URL,
+		Token:                      "tok",
+		FencingToken:               1,
+		Repo:                       "meta-repo",
+		Prompt:                     "/autonomous-story-execution STORY-GOV-3873",
+		TargetAgent:                mockAgyBin,
+		WorkingDir:                 repoDir,
+		Timeout:                    2 * time.Second,
+		BackgroundDrainGracePeriod: 100 * time.Millisecond,
+		MaxAutoResumeAttempts:      &zeroResumes,
+	})
+	if err != nil {
+		t.Fatalf("expected job_110f47f09551baba to complete cleanly during background drain, got err=%v", err)
+	}
+	if res.Status != "completed" || res.ExitCode != 0 {
+		t.Fatalf("expected Status=completed ExitCode=0, got Status=%q ExitCode=%d", res.Status, res.ExitCode)
+	}
+	if res.FailureCategory != "" || res.FailureStage != "" || res.FailureDirection != "NONE" {
+		t.Fatalf("expected clean failure classification on completed job, got category=%q stage=%q direction=%q", res.FailureCategory, res.FailureStage, res.FailureDirection)
+	}
+	if res.StoryID != "STORY-GOV-3873" {
+		t.Fatalf("expected primary StoryID STORY-GOV-3873 (not pointer story), got %q", res.StoryID)
+	}
+	if res.ResumeAttempts != 0 {
+		t.Fatalf("expected 0 auto-resume attempts when ASE flow already completed in Turn 1, got %d", res.ResumeAttempts)
+	}
+	if !strings.Contains(res.Summary, "Autonomous story execution is complete for both") {
+		t.Fatalf("expected transcript step #321 in Summary, got %q", res.Summary)
+	}
+
+	// Verify Upstream vs Downstream vs Local Execution fault classification
+	cat, stg, dir, svc := ClassifyPromptFailure("failed", "", "", "ResourceExhausted: 429 quota exceeded", nil)
+	if cat != "UPSTREAM_MODEL_UNAVAILABLE" || stg != "LLM_INFERENCE" || dir != "UPSTREAM" || svc != "antigravity-llm-provider" {
+		t.Fatalf("unexpected LLM upstream classification: %q %q %q %q", cat, stg, dir, svc)
+	}
+	cat, stg, dir, svc = ClassifyPromptFailure("failed", "", "", "gh pr merge failed: api.github.com 502 Bad Gateway", nil)
+	if cat != "UPSTREAM_SCM_UNAVAILABLE" || stg != "GIT_DELIVERY" || dir != "UPSTREAM" || svc != "github-api" {
+		t.Fatalf("unexpected GitHub upstream classification: %q %q %q %q", cat, stg, dir, svc)
+	}
+	cat, stg, dir, svc = ClassifyPromptFailure("failed", "", "", "jenkins build check timed out: 503 Service Unavailable", nil)
+	if cat != "UPSTREAM_CI_UNAVAILABLE" || stg != "CI_VERIFICATION" || dir != "UPSTREAM" || svc != "jenkins-ci" {
+		t.Fatalf("unexpected Jenkins upstream classification: %q %q %q %q", cat, stg, dir, svc)
+	}
+	cat, stg, dir, svc = ClassifyPromptFailure("failed", "", "", "controlplane post failed: iazio-harness-api connection refused", nil)
+	if cat != "DOWNSTREAM_CONTROL_PLANE_UNAVAILABLE" || stg != "CONTROL_PLANE_SYNC" || dir != "DOWNSTREAM" || svc != "iazio-harness-api" {
+		t.Fatalf("unexpected downstream control-plane classification: %q %q %q %q", cat, stg, dir, svc)
+	}
+	cat, stg, dir, svc = ClassifyPromptFailure("timed_out", "BACKGROUND_DRAIN_TIMEOUT", "BACKGROUND_DRAIN", "", nil)
+	if cat != "BACKGROUND_DRAIN_TIMEOUT" || stg != "BACKGROUND_DRAIN" || dir != "LOCAL_EXECUTION" || svc != "agy-cli" {
+		t.Fatalf("unexpected background drain local classification: %q %q %q %q", cat, stg, dir, svc)
+	}
+}

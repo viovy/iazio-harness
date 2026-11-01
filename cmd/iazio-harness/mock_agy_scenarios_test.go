@@ -1608,3 +1608,119 @@ func TestMockAgy_Scenario16_Job3ffa5d0be1649f0e_BackgroundDrainPIDLivenessAndAut
 		t.Fatalf("expected ActiveConversationID preserved on background drain timeout, got %q", resFail.ActiveConversationID)
 	}
 }
+
+// Scenario 18 (job_110f47f09551baba / STORY-GOV-3874):
+// Verifies the exact flow of job_110f47f09551baba:
+//  1. mock-agy executes STORY-GOV-3873 and pointer story STORY-GOV-POINTERS-20261101-044815, marks both status: DONE,
+//     commits cleanly, and writes step #321 ("Autonomous story execution is complete for both STORY-GOV-3873 and STORY-GOV-POINTERS-20261101-044815")
+//     to brain transcript.jsonl while .session_story_id is overwritten by STORY-GOV-POINTERS-20261101-044815.
+//  2. mock-agy then enters "WaitForConversationFullyIdle: root agent idle; waiting up to 1h0m0s for 1 background task(s)" and blocks.
+//  3. CLIPromptRunner detects ASE completion in-drain, reaps the idle background drain immediately after the short completion grace,
+//     returns Status="completed", ExitCode=0, FailureCategory="", StoryID="STORY-GOV-3873" (primary non-pointer story),
+//     ResumeAttempts=0, and streams [ase_completion.detected_during_bg_drain] and step #321 to the control plane.
+func TestMockAgy_Scenario18_Job110f47f09551baba_ASECompleteDuringBackgroundDrainAndPointerStory(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "job_110f47f09551baba_ase_complete_bg_drain_and_pointer_story")
+	t.Setenv("MOCK_AGY_FAST", "1")
+	t.Setenv("IAZIO_BG_DRAIN_GRACE_MS", "200")
+
+	var mu sync.Mutex
+	var postedChunks []string
+	var postedConvIDs []string
+	var boundStoryIDs []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			var body struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.Text != "" {
+				postedChunks = append(postedChunks, body.Text)
+			}
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/conversations"):
+			var body struct {
+				ConversationID string `json:"conversation_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.ConversationID != "" {
+				postedConvIDs = append(postedConvIDs, body.ConversationID)
+			}
+			w.WriteHeader(http.StatusOK)
+		case (r.Method == http.MethodPatch || r.Method == http.MethodPost) && strings.HasSuffix(r.URL.Path, "/story-binding"):
+			var body struct {
+				StoryID string `json:"story_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.StoryID != "" {
+				boundStoryIDs = append(boundStoryIDs, body.StoryID)
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	worktree := initTestGitWorktree(t)
+	_ = os.WriteFile(filepath.Join(worktree, ".gitignore"), []byte(".session_story_id\n.autopilot/\n"), 0o644)
+	_ = exec.Command("git", "-C", worktree, "add", ".gitignore").Run()
+	_ = exec.Command("git", "-C", worktree, "commit", "-m", "chore: initial").Run()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	runner := autopilot.NewPromptRunner("")
+	runner.BackgroundDrainGracePeriod = 200 * time.Millisecond
+
+	res, err := runner.RunPrompt(ctx, autopilot.RunPromptOptions{
+		PromptID:    "prompt_110f47f09551baba",
+		JobID:       "job_110f47f09551baba",
+		APIURL:      srv.URL,
+		Repo:        "/home/romeo/work/meta-repo",
+		WorkingDir:  worktree,
+		Prompt:      "/autonomous-story-execution STORY-GOV-3873",
+		TargetAgent: "agy",
+		Timeout:     5 * time.Second,
+	})
+	if err != nil {
+		mu.Lock()
+		chunksDebug := strings.Join(postedChunks, "")
+		mu.Unlock()
+		t.Fatalf("expected RunPrompt for job_110f47f09551baba to complete cleanly, got error: %v (res=%+v)\nchunks:\n%s", err, res, chunksDebug)
+	}
+	if res == nil || res.Status != "completed" || res.ExitCode != 0 {
+		t.Fatalf("expected completed exit 0, got %+v", res)
+	}
+	if res.FailureCategory != "" || res.FailureStage != "" || res.FailureDirection != "NONE" {
+		t.Fatalf("expected empty failure metadata on completed job_110f47f09551baba, got %+v", res)
+	}
+	if res.StoryID != "STORY-GOV-3873" {
+		t.Fatalf("expected primary StoryID STORY-GOV-3873 (not pointer story), got %q", res.StoryID)
+	}
+	if res.ActiveConversationID != "18f40eb1-d86f-41bf-a69f-7d9de6536cb6" {
+		t.Fatalf("expected conversation 18f40eb1-d86f-41bf-a69f-7d9de6536cb6, got %q", res.ActiveConversationID)
+	}
+	if res.ResumeAttempts != 0 {
+		t.Fatalf("expected 0 auto-resume attempts when ASE flow already completed in Turn 1, got %d", res.ResumeAttempts)
+	}
+
+	mu.Lock()
+	allChunks := strings.Join(postedChunks, "")
+	mu.Unlock()
+
+	for _, expected := range []string{
+		"[ASE-SUPERVISOR] Attached Antigravity conversation: 18f40eb1-d86f-41bf-a69f-7d9de6536cb6",
+		"[agy step #321] output: Autonomous story execution is complete for both",
+		"[ase_completion.detected_during_bg_drain]",
+	} {
+		if !strings.Contains(allChunks, expected) {
+			t.Fatalf("expected streamed chunks to contain %q, got:\n%s", expected, allChunks)
+		}
+	}
+}

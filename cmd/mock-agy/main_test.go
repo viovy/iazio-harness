@@ -392,4 +392,29 @@ func TestMockAgy_ScenariosUnit(t *testing.T) {
 			t.Fatalf("expected resumed message in turn 2 stdout: %s", stdout2.String())
 		}
 	})
+
+	t.Run("Scenario18_Job110f47f09551baba_ASECompleteDuringBgDrain", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		origWd, _ := os.Getwd()
+		_ = os.Chdir(tmpDir)
+		defer func() { _ = os.Chdir(origWd) }()
+
+		t.Setenv("HOME", tmpDir)
+		t.Setenv("MOCK_AGY_UNIT", "1")
+
+		_ = exec.Command("git", "init").Run()
+		_ = exec.Command("git", "config", "user.email", "test@test.local").Run()
+		_ = exec.Command("git", "config", "user.name", "Tester").Run()
+
+		logFile := filepath.Join(tmpDir, "job_110f47f09551baba.log")
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"--log-file=" + logFile, "--print=/autonomous-story-execution STORY-GOV-3873"}, "job_110f47f09551baba_ase_complete_bg_drain_and_pointer_story", &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("expected exit 0, got %d: %s", code, stderr.String())
+		}
+		logBytes, _ := os.ReadFile(logFile)
+		if !strings.Contains(string(logBytes), "WaitForConversationFullyIdle") {
+			t.Fatalf("expected WaitForConversationFullyIdle in log file: %s", string(logBytes))
+		}
+	})
 }
