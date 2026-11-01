@@ -6,12 +6,13 @@ import (
 	"bytes"
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/procutil"
 )
 
 func defaultIsProcessAlive(pid int) bool {
@@ -103,7 +104,7 @@ func scanPSDescendants(rootPID int) ([]ProcessInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "ps", "-eo", "pid,ppid,args")
+	cmd := procutil.CommandContext(ctx, "ps", "-eo", "pid,ppid,args")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err

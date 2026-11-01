@@ -8,6 +8,8 @@ import (
 	"sync"
 	"syscall"
 	"unsafe"
+
+	"github.com/viovy/iazio-harness/internal/procutil"
 )
 
 var (
@@ -64,6 +66,9 @@ var (
 
 // SetProcGroup configures cmd to run in its own job object on Windows with CREATE_NO_WINDOW.
 func SetProcGroup(cmd *exec.Cmd) {
+	if cmd == nil {
+		return
+	}
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
@@ -127,7 +132,7 @@ func KillProcessGroup(cmd *exec.Cmd) {
 		procTerminateJobObject.Call(jobHandle, 1)
 		procCloseHandle.Call(jobHandle)
 	}
-	_ = exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
+	_ = procutil.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
 	_ = cmd.Process.Kill()
 }
 

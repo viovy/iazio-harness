@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/ase/gate"
+	"github.com/viovy/iazio-harness/internal/procutil"
 )
 
 // Anomaly codes.
@@ -270,7 +270,7 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 	git := input.GitRunner
 	if git == nil {
 		git = func(args ...string) (string, error) {
-			cmd := exec.Command("git", append([]string{"-C", input.WorktreePath}, args...)...)
+			cmd := procutil.Command("git", append([]string{"-C", input.WorktreePath}, args...)...)
 			out, err := cmd.CombinedOutput()
 			return strings.TrimSpace(string(out)), err
 		}

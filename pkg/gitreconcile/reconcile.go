@@ -9,11 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/procutil"
 )
 
 var (
@@ -230,7 +231,7 @@ type GitRunner func(dir string, args ...string) (string, error)
 
 // DefaultGitRunner executes real git commands via os/exec.
 func DefaultGitRunner(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	cmd := procutil.Command("git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -302,7 +303,7 @@ func (r *Reconciler) RebaseAndVerifySubmodule(ctx context.Context, subDir, activ
 	if verifyCmd != "" {
 		parts := strings.Fields(verifyCmd)
 		if len(parts) > 0 {
-			cmd := exec.CommandContext(ctx, parts[0], parts[1:]...)
+			cmd := procutil.CommandContext(ctx, parts[0], parts[1:]...)
 			cmd.Dir = subDir
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("incremental verification failed after rebase in %s (%s): %v, output: %s",

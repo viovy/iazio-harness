@@ -7,11 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/viovy/iazio-harness/internal/procutil"
 	"github.com/viovy/iazio-harness/internal/repolock"
 )
 
@@ -111,7 +111,7 @@ func DiscardWorkspace(ctx context.Context, opts DiscardOptions) (*DiscardResult,
 
 	// 1. Resolve git directory
 	gitDir := filepath.Join(absTarget, ".git")
-	revCmd := exec.CommandContext(ctx, "git", "-C", absTarget, "rev-parse", "--git-dir")
+	revCmd := procutil.CommandContext(ctx, "git", "-C", absTarget, "rev-parse", "--git-dir")
 	revCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	if out, err := revCmd.Output(); err == nil {
 		clean := strings.TrimSpace(string(out))
@@ -152,7 +152,7 @@ func DiscardWorkspace(ctx context.Context, opts DiscardOptions) (*DiscardResult,
 	// 3. Abort in-progress git operations
 	ops := []string{"merge", "rebase", "cherry-pick", "revert"}
 	for _, op := range ops {
-		abortCmd := exec.CommandContext(ctx, "git", "-C", absTarget, op, "--abort")
+		abortCmd := procutil.CommandContext(ctx, "git", "-C", absTarget, op, "--abort")
 		abortCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 		if err := abortCmd.Run(); err == nil {
 			res.OperationsAborted = append(res.OperationsAborted, op)
@@ -164,7 +164,7 @@ func DiscardWorkspace(ctx context.Context, opts DiscardOptions) (*DiscardResult,
 
 	// 4. Hard reset of tracked files
 	reportProgress("RESET_HEAD", "Executing git reset --hard HEAD")
-	resetCmd := exec.CommandContext(ctx, "git", "-C", absTarget, "reset", "--hard", "HEAD")
+	resetCmd := procutil.CommandContext(ctx, "git", "-C", absTarget, "reset", "--hard", "HEAD")
 	resetCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	if out, err := resetCmd.CombinedOutput(); err != nil {
 		res.Duration = time.Since(start)
@@ -175,7 +175,7 @@ func DiscardWorkspace(ctx context.Context, opts DiscardOptions) (*DiscardResult,
 
 	// 5. Force-clean all untracked files and directories (-ffdx)
 	reportProgress("CLEAN_UNTRACKED", "Executing git clean -ffdx to remove all untracked and new files")
-	cleanCmd := exec.CommandContext(ctx, "git", "-C", absTarget, "clean", "-ffdx")
+	cleanCmd := procutil.CommandContext(ctx, "git", "-C", absTarget, "clean", "-ffdx")
 	cleanCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	if out, err := cleanCmd.CombinedOutput(); err != nil {
 		res.Duration = time.Since(start)
@@ -188,22 +188,22 @@ func DiscardWorkspace(ctx context.Context, opts DiscardOptions) (*DiscardResult,
 	if opts.Submodules {
 		reportProgress("SUBMODULES", "Recursively resetting and cleaning all submodules")
 		// Submodule reset
-		subReset := exec.CommandContext(ctx, "git", "-C", absTarget, "submodule", "foreach", "--recursive", "git reset --hard HEAD || true")
+		subReset := procutil.CommandContext(ctx, "git", "-C", absTarget, "submodule", "foreach", "--recursive", "git reset --hard HEAD || true")
 		subReset.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 		_ = subReset.Run()
 
 		// Submodule clean
-		subClean := exec.CommandContext(ctx, "git", "-C", absTarget, "submodule", "foreach", "--recursive", "git clean -ffdx || true")
+		subClean := procutil.CommandContext(ctx, "git", "-C", absTarget, "submodule", "foreach", "--recursive", "git clean -ffdx || true")
 		subClean.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 		_ = subClean.Run()
 
 		// Submodule update to pin
-		subUpdate := exec.CommandContext(ctx, "git", "-C", absTarget, "submodule", "update", "--init", "--recursive", "--force")
+		subUpdate := procutil.CommandContext(ctx, "git", "-C", absTarget, "submodule", "update", "--init", "--recursive", "--force")
 		subUpdate.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 		_ = subUpdate.Run()
 
 		// Count submodules
-		subCountCmd := exec.CommandContext(ctx, "git", "-C", absTarget, "submodule", "status")
+		subCountCmd := procutil.CommandContext(ctx, "git", "-C", absTarget, "submodule", "status")
 		if subOut, err := subCountCmd.Output(); err == nil {
 			lines := strings.Split(strings.TrimSpace(string(subOut)), "\n")
 			count := 0
@@ -217,7 +217,7 @@ func DiscardWorkspace(ctx context.Context, opts DiscardOptions) (*DiscardResult,
 	}
 
 	// 7. Post-condition verification
-	statusCmd := exec.CommandContext(ctx, "git", "-C", absTarget, "status", "--porcelain")
+	statusCmd := procutil.CommandContext(ctx, "git", "-C", absTarget, "status", "--porcelain")
 	statusCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	statusOut, _ := statusCmd.Output()
 	porcelain := strings.TrimSpace(string(statusOut))

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/procutil"
 )
 
 // Sandbox represents an isolated ephemeral filesystem snapshot.
@@ -132,7 +134,7 @@ func (s *Sandbox) Diff() (string, error) {
 		return "", fmt.Errorf("sandbox is not initialized")
 	}
 
-	cmd := exec.Command("git", "--git-dir=/dev/null", "diff", "--no-index", "--no-color", s.OriginalPath, s.SandboxPath)
+	cmd := procutil.Command("git", "--git-dir=/dev/null", "diff", "--no-index", "--no-color", s.OriginalPath, s.SandboxPath)
 	cmd.Dir = s.SandboxPath
 	out, err := cmd.CombinedOutput()
 	if err != nil {

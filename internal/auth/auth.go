@@ -18,6 +18,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/procutil"
 )
 
 // ClientID is the public OAuth client id for this binary.
@@ -558,11 +560,11 @@ func openBrowser(rawURL string) error {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
-		cmd = exec.Command("open", rawURL)
+		cmd = procutil.Command("open", rawURL)
 	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL)
+		cmd = procutil.Command("rundll32", "url.dll,FileProtocolHandler", rawURL)
 	default:
-		cmd = exec.Command("xdg-open", rawURL)
+		cmd = procutil.Command("xdg-open", rawURL)
 	}
 	return cmd.Start()
 }

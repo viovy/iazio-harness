@@ -7,9 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/viovy/iazio-harness/internal/procutil"
 )
 
 var (
@@ -38,13 +39,13 @@ func CaptureWorktreeSnapshot(repoDir string) (WorktreeSnapshot, error) {
 		snap.HasIndexLock = true
 	}
 
-	headOut, err := exec.Command("git", "-C", repoDir, "rev-parse", "HEAD").Output()
+	headOut, err := procutil.Command("git", "-C", repoDir, "rev-parse", "HEAD").Output()
 	if err != nil {
 		return snap, fmt.Errorf("git rev-parse HEAD failed: %w", err)
 	}
 	snap.HeadSHA = strings.TrimSpace(string(headOut))
 
-	statusOut, err := exec.Command("git", "-C", repoDir, "status", "--porcelain", "-uall").Output()
+	statusOut, err := procutil.Command("git", "-C", repoDir, "status", "--porcelain", "-uall").Output()
 	if err != nil {
 		return snap, fmt.Errorf("git status failed: %w", err)
 	}
@@ -176,11 +177,11 @@ func CaptureGitSHAs(ctx context.Context, dir string) (headSHA string, treeSHA st
 	if dir == "" {
 		return "", "", fmt.Errorf("empty directory")
 	}
-	headOut, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "HEAD").Output()
+	headOut, err := procutil.CommandContext(ctx, "git", "-C", dir, "rev-parse", "HEAD").Output()
 	if err != nil {
 		return "", "", fmt.Errorf("git rev-parse HEAD failed: %w", err)
 	}
-	treeOut, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "HEAD^{tree}").Output()
+	treeOut, err := procutil.CommandContext(ctx, "git", "-C", dir, "rev-parse", "HEAD^{tree}").Output()
 	if err != nil {
 		return "", "", fmt.Errorf("git rev-parse HEAD^{tree} failed: %w", err)
 	}
