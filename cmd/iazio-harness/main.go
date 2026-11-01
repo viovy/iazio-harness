@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	"github.com/viovy/iazio-harness/internal/diagnostics"
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/gitclean"
+	"github.com/viovy/iazio-harness/internal/procutil"
 	"github.com/viovy/iazio-harness/internal/prompt"
 	"github.com/viovy/iazio-harness/internal/proof"
 	"github.com/viovy/iazio-harness/internal/repolock"
@@ -325,15 +327,19 @@ func hasRunningGitProcess(workspacePath string) bool {
 	// 2. lsof detection for macOS/Darwin (and BSD)
 	if lsofBin, err := exec.LookPath("lsof"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		out, _ := exec.CommandContext(ctx, lsofBin, "-a", "-c", "git", "+D", cleanWorkspace, "-t").Output()
+		out, _ := procutil.CommandContext(ctx, lsofBin, "-a", "-c", "git", "+D", cleanWorkspace, "-t").Output()
 		cancel()
 		if len(strings.TrimSpace(string(out))) > 0 {
 			return true
 		}
 	}
 
+	if runtime.GOOS == "windows" {
+		return false
+	}
+
 	// 3. Fallback using ps
-	out, err := exec.Command("ps", "-eo", "command").Output()
+	out, err := procutil.Command("ps", "-eo", "command").Output()
 	if err == nil {
 		lines := strings.Split(string(out), "\n")
 		for _, line := range lines {
@@ -381,7 +387,7 @@ func isLockFileHeld(lockPath string) bool {
 	if lsofBin, err := exec.LookPath("lsof"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		out, _ := exec.CommandContext(ctx, lsofBin, cleanPath, "-t").Output()
+		out, _ := procutil.CommandContext(ctx, lsofBin, cleanPath, "-t").Output()
 		if len(strings.TrimSpace(string(out))) > 0 {
 			return true
 		}
@@ -392,7 +398,7 @@ func isLockFileHeld(lockPath string) bool {
 	if fuserBin, err := exec.LookPath("fuser"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		out, _ := exec.CommandContext(ctx, fuserBin, cleanPath).Output()
+		out, _ := procutil.CommandContext(ctx, fuserBin, cleanPath).Output()
 		if len(strings.TrimSpace(string(out))) > 0 {
 			return true
 		}
@@ -549,7 +555,7 @@ func resolveLiveGitBranch(workspacePath string) string {
 	if workspacePath == "" {
 		return ""
 	}
-	cmd := exec.Command("git", "-C", workspacePath, "branch", "--show-current")
+	cmd := procutil.Command("git", "-C", workspacePath, "branch", "--show-current")
 	out, err := cmd.Output()
 	if err == nil {
 		return strings.TrimSpace(string(out))
@@ -561,7 +567,7 @@ func resolveGitHead(workspacePath string) string {
 	if workspacePath == "" {
 		return ""
 	}
-	cmd := exec.Command("git", "-C", workspacePath, "rev-parse", "HEAD")
+	cmd := procutil.Command("git", "-C", workspacePath, "rev-parse", "HEAD")
 	out, err := cmd.Output()
 	if err == nil {
 		return strings.TrimSpace(string(out))
@@ -736,7 +742,7 @@ func resolveFleetProgressFingerprint(worktree string) string {
 	for _, f := range dirtyFiles {
 		h.Write([]byte(fmt.Sprintf("dirty:%s\n", f)))
 	}
-	if diffOut, err := exec.Command("git", "-C", worktree, "diff", "HEAD").Output(); err == nil && len(diffOut) > 0 {
+	if diffOut, err := procutil.Command("git", "-C", worktree, "diff", "HEAD").Output(); err == nil && len(diffOut) > 0 {
 		diffH := sha256.Sum256(diffOut)
 		h.Write([]byte(fmt.Sprintf("root-diff:%x\n", diffH)))
 	}
@@ -752,7 +758,7 @@ func resolveFleetProgressFingerprint(worktree string) string {
 		for _, f := range subDirty {
 			h.Write([]byte(fmt.Sprintf("sub-dirty:%s:%s\n", sub, f)))
 		}
-		if subDiff, err := exec.Command("git", "-C", subPath, "diff", "HEAD").Output(); err == nil && len(subDiff) > 0 {
+		if subDiff, err := procutil.Command("git", "-C", subPath, "diff", "HEAD").Output(); err == nil && len(subDiff) > 0 {
 			diffH := sha256.Sum256(subDiff)
 			h.Write([]byte(fmt.Sprintf("sub-diff:%s:%x\n", sub, diffH)))
 		}
@@ -2679,7 +2685,7 @@ func collectWorkspaceDirtyFiles(worktree string) []string {
 	if worktree == "" {
 		return nil
 	}
-	cmd := exec.Command("git", "-C", worktree, "status", "--porcelain")
+	cmd := procutil.Command("git", "-C", worktree, "status", "--porcelain")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil

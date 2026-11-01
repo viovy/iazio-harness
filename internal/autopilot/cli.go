@@ -8,10 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/viovy/iazio-harness/internal/procutil"
 )
 
 // CreateStoryOptions contains semantic fields required to scaffold a story via autopilot.
@@ -118,7 +119,7 @@ func (c *CLIClient) CreateStory(ctx context.Context, opts CreateStoryOptions) (*
 		"verification_commands": opts.VerificationCommands,
 	})
 	if mErr == nil {
-		cmdJSON := exec.CommandContext(ctx, c.AutopilotBinary, "story-create", "--json")
+		cmdJSON := procutil.CommandContext(ctx, c.AutopilotBinary, "story-create", "--json")
 		cmdJSON.Dir = workingDir
 		cmdJSON.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "AUTOPILOT_NON_INTERACTIVE=1")
 		cmdJSON.Stdin = bytes.NewReader(payloadBytes)
@@ -156,7 +157,7 @@ func (c *CLIClient) CreateStory(ctx context.Context, opts CreateStoryOptions) (*
 		"-stories-dir", storiesDir,
 	}
 
-	cmd := exec.CommandContext(ctx, c.AutopilotBinary, args...)
+	cmd := procutil.CommandContext(ctx, c.AutopilotBinary, args...)
 	cmd.Dir = workingDir
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "AUTOPILOT_NON_INTERACTIVE=1")
 
@@ -212,7 +213,7 @@ func (c *CLIClient) CreateStory(ctx context.Context, opts CreateStoryOptions) (*
 
 // ValidateIndex runs `autopilot story index-gate` to guarantee index consistency.
 func (c *CLIClient) ValidateIndex(ctx context.Context, workingDir string) error {
-	cmd := exec.CommandContext(ctx, c.AutopilotBinary, "story", "index-gate")
+	cmd := procutil.CommandContext(ctx, c.AutopilotBinary, "story", "index-gate")
 	if workingDir != "" {
 		cmd.Dir = workingDir
 	}

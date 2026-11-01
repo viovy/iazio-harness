@@ -88,3 +88,7 @@ func platformGetDescendantProcesses(rootPID int) ([]ProcessInfo, error) {
 
 	return descendants, nil
 }
+
+func scanPSDescendants(rootPID int) ([]ProcessInfo, error) {
+	return platformGetDescendantProcesses(rootPID)
+}

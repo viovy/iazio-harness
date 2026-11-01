@@ -23,6 +23,7 @@ import (
 
 	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/engines"
+	"github.com/viovy/iazio-harness/internal/procutil"
 	"github.com/viovy/iazio-harness/internal/redact"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 	"github.com/viovy/iazio-harness/internal/watchdog"
@@ -853,7 +854,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 		}
 
-		cmd := exec.Command(cmdBin, args...)
+		cmd := procutil.Command(cmdBin, args...)
 		cmd.Dir = opts.WorkingDir
 		cmd.Env = os.Environ()
 		if targetBranch != "" {
@@ -1392,21 +1393,21 @@ func captureGitSnapshot(dir, gitBin string) (headSHA, treeSHA string, modified [
 	}
 
 	// 1. git rev-parse HEAD
-	cmdHead := exec.Command(gitBin, "rev-parse", "HEAD")
+	cmdHead := procutil.Command(gitBin, "rev-parse", "HEAD")
 	cmdHead.Dir = dir
 	if out, err := cmdHead.Output(); err == nil {
 		headSHA = strings.TrimSpace(string(out))
 	}
 
 	// 2. git rev-parse HEAD^{tree}
-	cmdTree := exec.Command(gitBin, "rev-parse", "HEAD^{tree}")
+	cmdTree := procutil.Command(gitBin, "rev-parse", "HEAD^{tree}")
 	cmdTree.Dir = dir
 	if out, err := cmdTree.Output(); err == nil {
 		treeSHA = strings.TrimSpace(string(out))
 	}
 
 	// 3. git status --porcelain
-	cmdStatus := exec.Command(gitBin, "status", "--porcelain")
+	cmdStatus := procutil.Command(gitBin, "status", "--porcelain")
 	cmdStatus.Dir = dir
 	if out, err := cmdStatus.Output(); err == nil {
 		lines := strings.Split(strings.TrimSpace(string(out)), "\n")

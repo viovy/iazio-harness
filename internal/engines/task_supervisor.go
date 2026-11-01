@@ -4,13 +4,14 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/procutil"
 )
 
 // BackgroundTaskInfo describes an active or reaped child/background process.
@@ -116,7 +117,7 @@ func findChildProcessesUnix(parentPID int) []BackgroundTaskInfo {
 	}
 
 	// Fallback for macOS/BSD: ps -o pid=,ppid=,args=
-	cmd := exec.Command("ps", "-eo", "pid,ppid,args")
+	cmd := procutil.Command("ps", "-eo", "pid,ppid,args")
 	out, err := cmd.Output()
 	if err == nil {
 		scanner := bufio.NewScanner(strings.NewReader(string(out)))
@@ -168,7 +169,7 @@ func findChildProcessesUnix(parentPID int) []BackgroundTaskInfo {
 
 func findChildProcessesWindows(parentPID int) []BackgroundTaskInfo {
 	var results []BackgroundTaskInfo
-	cmd := exec.Command("wmic", "process", "where", fmt.Sprintf("ParentProcessId=%d", parentPID), "get", "ProcessId,CommandLine", "/format:csv")
+	cmd := procutil.Command("wmic", "process", "where", fmt.Sprintf("ParentProcessId=%d", parentPID), "get", "ProcessId,CommandLine", "/format:csv")
 	out, err := cmd.Output()
 	if err == nil {
 		scanner := bufio.NewScanner(strings.NewReader(string(out)))

@@ -4,10 +4,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/procutil"
 )
 
 func main() {
@@ -232,7 +233,7 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "[mock-agy] Initializing background MCP daemons: autopilot-mcp, chrome-devtools-mcp...")
 
 		// Spawn background sleeper that holds pipes open
-		cmd := exec.Command("sleep", "60")
+		cmd := procutil.Command("sleep", "60")
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
 		_ = cmd.Start()
@@ -277,8 +278,8 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			_ = os.Remove("ase_worktree_change.tmp")
 			_ = os.Remove(stateMarker)
 			_ = os.WriteFile("ase_committed_feature.txt", []byte("feature committed"), 0644)
-			_ = exec.Command("git", "add", "ase_committed_feature.txt").Run()
-			_ = exec.Command("git", "commit", "-m", "feat: complete ASE story flow").Run()
+			_ = procutil.Command("git", "add", "ase_committed_feature.txt").Run()
+			_ = procutil.Command("git", "commit", "-m", "feat: complete ASE story flow").Run()
 			fmt.Fprintf(stdout, "[mock-agy] Turn 2 resumed in-place with conversation %s.\n", conversationID)
 			fmt.Fprintln(stdout, "[mock-agy] Committed changes, cleaned worktree, and satisfied ASE gates.")
 			fmt.Fprintln(stdout, "[mock-agy] Story flow complete. Exit 0.")
@@ -294,8 +295,8 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		if isTurn2 {
 			_ = os.Remove(stateMarker)
 			_ = os.WriteFile("bg_hang_recovered_commit.txt", []byte("recovery committed"), 0644)
-			_ = exec.Command("git", "add", "bg_hang_recovered_commit.txt").Run()
-			_ = exec.Command("git", "commit", "-m", "chore: finish tasks after bg hang").Run()
+			_ = procutil.Command("git", "add", "bg_hang_recovered_commit.txt").Run()
+			_ = procutil.Command("git", "commit", "-m", "chore: finish tasks after bg hang").Run()
 			fmt.Fprintf(stdout, "[mock-agy] Resumed after background task hang was reaped on conversation %s.\n", conversationID)
 			fmt.Fprintln(stdout, "[mock-agy] Finished remaining tasks.")
 			return 0
@@ -318,8 +319,8 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		}
 		_ = os.Remove(marker)
 		_ = os.WriteFile("resumed_attempt_2.txt", []byte("resumed deliverable"), 0644)
-		_ = exec.Command("git", "add", "resumed_attempt_2.txt").Run()
-		_ = exec.Command("git", "commit", "-m", "chore: complete task on attempt 2").Run()
+		_ = procutil.Command("git", "add", "resumed_attempt_2.txt").Run()
+		_ = procutil.Command("git", "commit", "-m", "chore: complete task on attempt 2").Run()
 		fmt.Fprintln(stdout, "[mock-agy] Attempt 2 startup logs: resuming from checkpoint...")
 		fmt.Fprintln(stdout, "[mock-agy] Attempt 2 succeeded cleanly. Task finished.")
 		return 0
@@ -377,14 +378,14 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 					if b, err := os.ReadFile(p); err == nil && strings.Contains(string(b), "status: IN_PROGRESS") {
 						updated := strings.ReplaceAll(string(b), "status: IN_PROGRESS", "status: DONE")
 						_ = os.WriteFile(p, []byte(updated), 0644)
-						_ = exec.Command("git", "add", p).Run()
+						_ = procutil.Command("git", "add", p).Run()
 					}
 				}
 			}
 		}
 		_ = os.WriteFile("inplace_resumed_file.txt", []byte("inplace recovery content\n"), 0644)
-		_ = exec.Command("git", "add", "inplace_resumed_file.txt").Run()
-		_ = exec.Command("git", "commit", "-m", "chore: auto-resumed in-place (STORY-GOV-3799)").Run()
+		_ = procutil.Command("git", "add", "inplace_resumed_file.txt").Run()
+		_ = procutil.Command("git", "commit", "-m", "chore: auto-resumed in-place (STORY-GOV-3799)").Run()
 		if conversationID != "" {
 			fmt.Fprintf(stdout, "Resumed conversation %s\n", conversationID)
 		}
@@ -403,8 +404,8 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		}
 		_ = os.Remove("dirty_worktree_file.tmp")
 		_ = os.WriteFile("completed_story_work.txt", []byte("story work finished\n"), 0644)
-		_ = exec.Command("git", "add", ".").Run()
-		_ = exec.Command("git", "commit", "-m", "chore: complete unanchored dirty flow").Run()
+		_ = procutil.Command("git", "add", ".").Run()
+		_ = procutil.Command("git", "commit", "-m", "chore: complete unanchored dirty flow").Run()
 		cid := "mock-conv-dirty-uuid-0000-1111-2222"
 		fmt.Fprintf(stdout, "Created conversation %s\n", cid)
 		if home, err := os.UserHomeDir(); err == nil && home != "" {
@@ -426,8 +427,8 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		_ = os.WriteFile("story_initialized.txt", []byte("story initialized\n"), 0644)
-		_ = exec.Command("git", "add", ".").Run()
-		_ = exec.Command("git", "commit", "-m", "feat: start story from scratch").Run()
+		_ = procutil.Command("git", "add", ".").Run()
+		_ = procutil.Command("git", "commit", "-m", "feat: start story from scratch").Run()
 		cid := "mock-conv-clean-uuid-0000-1111-2222"
 		fmt.Fprintf(stdout, "Created conversation %s\n", cid)
 		if home, err := os.UserHomeDir(); err == nil && home != "" {
@@ -458,8 +459,8 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "[mock-agy] Allocating and verifying story id: STORY-GOV-3715")
 		testFile := "legitimate_story_mutation.txt"
 		_ = os.WriteFile(testFile, []byte("Verified story mutation content\n"), 0644)
-		_ = exec.Command("git", "add", testFile).Run()
-		_ = exec.Command("git", "commit", "-m", "feat(story): legitimate story execution [STORY-GOV-3715]").Run()
+		_ = procutil.Command("git", "add", testFile).Run()
+		_ = procutil.Command("git", "commit", "-m", "feat(story): legitimate story execution [STORY-GOV-3715]").Run()
 		for i := 1; i <= 6; i++ {
 			fmt.Fprintf(stdout, "[mock-agy] Progress checkpoint %d: verified test gates passing...\n", i)
 		}
@@ -485,8 +486,8 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		_ = os.MkdirAll(filepath.Join("lib", "screens"), 0755)
 		codeFile := filepath.Join("lib", "screens", "prompts_screen.dart")
 		_ = os.WriteFile(codeFile, []byte("// Sorted alphabetically A-Z\n"), 0644)
-		_ = exec.Command("git", "add", "docs", "lib").Run()
-		_ = exec.Command("git", "commit", "-m", "feat(iazio-web): sort prompts alphabetically in /prompts view [STORY-WEB-3838]").Run()
+		_ = procutil.Command("git", "add", "docs", "lib").Run()
+		_ = procutil.Command("git", "commit", "-m", "feat(iazio-web): sort prompts alphabetically in /prompts view [STORY-WEB-3838]").Run()
 		fmt.Fprintln(stdout, "[mock-agy] Executed story STORY-WEB-3838: sorted prompts alphabetically in iazio-web /prompts view and verified unit tests.")
 		return 0
 
@@ -516,8 +517,8 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
 		storyFile := filepath.Join("docs", "stories", "story-root-245.story.md")
 		_ = os.WriteFile(storyFile, []byte("---\nid: STORY-ROOT-245\ntitle: Fix dirty worktree post exit\nstatus: DONE\n---\n"), 0644)
-		_ = exec.Command("git", "add", ".").Run()
-		_ = exec.Command("git", "commit", "-m", "feat: complete STORY-ROOT-245 cleanly").Run()
+		_ = procutil.Command("git", "add", ".").Run()
+		_ = procutil.Command("git", "commit", "-m", "feat: complete STORY-ROOT-245 cleanly").Run()
 		fmt.Fprintln(stdout, "[mock-agy] Turn 2 cleaned dirty worktree and completed STORY-ROOT-245.")
 		return 0
 
@@ -560,8 +561,8 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
 		storyFile := filepath.Join("docs", "stories", "2026-10-31-gov-3850-live-stream.story.md")
 		_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3850\ntitle: Verify live transcript streaming\nstatus: DONE\n---\n"), 0644)
-		_ = exec.Command("git", "add", "docs").Run()
-		_ = exec.Command("git", "commit", "-m", "feat(gov-3850): verify live transcript streaming [STORY-GOV-3850]").Run()
+		_ = procutil.Command("git", "add", "docs").Run()
+		_ = procutil.Command("git", "commit", "-m", "feat(gov-3850): verify live transcript streaming [STORY-GOV-3850]").Run()
 		return 0
 
 	case "background_drain_pid_liveness_and_auto_resume":
@@ -589,8 +590,8 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			}
 			_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
 			_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3850\ntitle: Sort Prompts Alphabetically in iazio-web (/prompts) and Underlying API\nstatus: DONE\n---\n"), 0644)
-			_ = exec.Command("git", "add", "docs").Run()
-			_ = exec.Command("git", "commit", "-m", "feat(gov-3850): complete STORY-GOV-3850 after auto-resume [STORY-GOV-3850]").Run()
+			_ = procutil.Command("git", "add", "docs").Run()
+			_ = procutil.Command("git", "commit", "-m", "feat(gov-3850): complete STORY-GOV-3850 after auto-resume [STORY-GOV-3850]").Run()
 			fmt.Fprintf(stdout, "Resumed conversation %s\n", cid)
 			fmt.Fprintln(stdout, "[mock-agy] Auto-resumed conversation ba042127-c63f-4b1e-a42e-95b307e61bbc and completed STORY-GOV-3850.")
 			return 0
@@ -627,7 +628,7 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			stepSleep = 5 * time.Millisecond
 			drainSleep = 5 * time.Millisecond
 		} else {
-			childCmd := exec.Command("sleep", "30")
+			childCmd := procutil.Command("sleep", "30")
 			_ = childCmd.Start()
 		}
 		for i := 0; i < 4; i++ {

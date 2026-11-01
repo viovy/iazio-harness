@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/procutil"
 )
 
 // RepoFleetStatusResult contains the complete diagnostic posture of a repository and active agent tooling.
@@ -64,7 +64,7 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 	}
 
 	// 1. Git Status Porcelain v2 & Branch
-	cmd := exec.CommandContext(ctx, "git", "-C", cleanPath, "status", "--porcelain=v2", "--branch")
+	cmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "status", "--porcelain=v2", "--branch")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		parseGitPorcelainV2(string(out), res)
@@ -75,7 +75,7 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 
 	// 1b. Check if branch is ahead of origin/main when upstream is unconfigured
 	if res.Ahead == 0 && res.Branch != "" && res.Branch != "main" && res.Branch != "master" {
-		revCmd := exec.CommandContext(ctx, "git", "-C", cleanPath, "rev-list", "--count", "origin/main..HEAD")
+		revCmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "rev-list", "--count", "origin/main..HEAD")
 		if revOut, err := revCmd.Output(); err == nil {
 			if count, err := strconv.Atoi(strings.TrimSpace(string(revOut))); err == nil && count > 0 {
 				res.Ahead = count
@@ -84,7 +84,7 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 	}
 
 	// 2. Git Submodules
-	subCmd := exec.CommandContext(ctx, "git", "-C", cleanPath, "submodule", "status", "--recursive")
+	subCmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "submodule", "status", "--recursive")
 	if subOut, err := subCmd.CombinedOutput(); err == nil {
 		parseSubmoduleStatus(ctx, cleanPath, string(subOut), res)
 	}
@@ -202,11 +202,11 @@ func parseSubmoduleStatus(ctx context.Context, cleanPath string, out string, res
 
 			// Deep check: inspect the submodule worktree itself for uncommitted files and current branch
 			if stat, err := os.Stat(fullSubPath); err == nil && stat.IsDir() {
-				subStatusCmd := exec.CommandContext(ctx, "git", "-C", fullSubPath, "status", "--porcelain")
+				subStatusCmd := procutil.CommandContext(ctx, "git", "-C", fullSubPath, "status", "--porcelain")
 				if subOut, err := subStatusCmd.Output(); err == nil && len(strings.TrimSpace(string(subOut))) > 0 {
 					hasUncommitted = true
 				}
-				branchCmd := exec.CommandContext(ctx, "git", "-C", fullSubPath, "branch", "--show-current")
+				branchCmd := procutil.CommandContext(ctx, "git", "-C", fullSubPath, "branch", "--show-current")
 				if bOut, err := branchCmd.Output(); err == nil {
 					currBranch := strings.TrimSpace(string(bOut))
 					if currBranch == "" {
@@ -315,12 +315,7 @@ func isPIDAlive(pid int) bool {
 			return true
 		}
 	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = process.Signal(syscall.Signal(0))
-	return err == nil
+	return procutil.IsPIDAlive(pid)
 }
 
 func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
@@ -436,28 +431,30 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 }
 
 func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult) {
-	cmd := exec.Command("ps", "-ef")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return
-	}
-	lines := strings.Split(string(out), "\n")
-	for _, l := range lines {
-		if !strings.Contains(l, repoPath) {
-			continue
+	if runtime.GOOS != "windows" {
+		cmd := procutil.Command("ps", "-ef")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return
 		}
-		for _, tool := range knownAgentBinaries {
-			if strings.Contains(l, tool) {
-				fields := strings.Fields(l)
-				if len(fields) > 1 {
-					if pid, err := strconv.Atoi(fields[1]); err == nil {
-						res.AgentPID = pid
+		lines := strings.Split(string(out), "\n")
+		for _, l := range lines {
+			if !strings.Contains(l, repoPath) {
+				continue
+			}
+			for _, tool := range knownAgentBinaries {
+				if strings.Contains(l, tool) {
+					fields := strings.Fields(l)
+					if len(fields) > 1 {
+						if pid, err := strconv.Atoi(fields[1]); err == nil {
+							res.AgentPID = pid
+						}
 					}
+					res.AgentTool = tool
+					res.ToolLiveness = "LIVE"
+					res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+					return
 				}
-				res.AgentTool = tool
-				res.ToolLiveness = "LIVE"
-				res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
-				return
 			}
 		}
 	}

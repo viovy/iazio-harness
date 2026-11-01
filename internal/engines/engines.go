@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/idempotency"
+	"github.com/viovy/iazio-harness/internal/procutil"
 	"github.com/viovy/iazio-harness/internal/sandbox"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 )
@@ -189,7 +190,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 		if resolved, err := look(agentBin); err == nil {
 			agentBin = resolved
 		}
-		chatCmd := exec.CommandContext(ctx, agentBin, "create-chat")
+		chatCmd := procutil.CommandContext(ctx, agentBin, "create-chat")
 		if out, err := chatCmd.Output(); err == nil {
 			createdID := strings.TrimSpace(string(out))
 			if createdID != "" {
@@ -260,7 +261,7 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 			}
 		}
 	}
-	cmd := exec.Command(bin, argv[1:]...)
+	cmd := procutil.Command(bin, argv[1:]...)
 	workDir := WorkingDirectory(req.Kind, req.WorktreePath, req.DocsHubPath)
 	var sb *sandbox.Sandbox
 	if req.Sandbox && workDir != "" {
@@ -894,7 +895,7 @@ func isWorktreeDirty(worktree string) bool {
 	if worktree == "" {
 		return false
 	}
-	cmd := exec.Command("git", "-C", worktree, "status", "--porcelain")
+	cmd := procutil.Command("git", "-C", worktree, "status", "--porcelain")
 	out, err := cmd.Output()
 	if err != nil {
 		return false
