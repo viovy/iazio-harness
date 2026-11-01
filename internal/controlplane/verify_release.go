@@ -153,7 +153,7 @@ func VerifyLiveRelease(ctx context.Context, apiURL, token string) (VerificationR
 	res.Details = append(res.Details, fmt.Sprintf("mac-mini reconciled lineage gate: PASS (job-1311/job-1313 anchored to %s with legacy unpinned secondary classifications)", canonicalInitialConv))
 
 	// 3. Control-Plane Anti-Bypass & Proof-of-Execution Gate
-	// Verify recent completed jobs have zero synthetic fallbacks and enforce repository mutations for story workflows
+	// Verify recent completed jobs have zero synthetic fallbacks, zero stale failure metadata, and enforce repository mutations for story workflows
 	recentJobsURL := apiURL + "/api/v1/queue/jobs?status=completed&limit=20"
 	jobsBody, jobsErr := httpGet(ctx, recentJobsURL, token)
 	if jobsErr == nil {
@@ -169,6 +169,9 @@ func VerifyLiveRelease(ctx context.Context, apiURL, token string) (VerificationR
 				PostGitHeadSHA   string `json:"post_git_head_sha"`
 				PreGitTreeSHA    string `json:"pre_git_tree_sha"`
 				PostGitTreeSHA   string `json:"post_git_tree_sha"`
+				FailureCategory  string `json:"failure_category"`
+				FailureStage     string `json:"failure_stage"`
+				Retriable        bool   `json:"retriable"`
 			} `json:"jobs"`
 		}
 		if json.Unmarshal(jobsBody, &queueResp) == nil && len(queueResp.Jobs) > 0 {
@@ -176,6 +179,9 @@ func VerifyLiveRelease(ctx context.Context, apiURL, token string) (VerificationR
 				trimmed := strings.TrimSpace(j.OutputSummary)
 				if strings.HasPrefix(trimmed, "[+] prompt executed via") {
 					return res, fmt.Errorf("control-plane proof-of-execution release gate failed: job %s has synthetic completion summary (%q)", j.ID, trimmed)
+				}
+				if strings.EqualFold(j.Status, "completed") && (j.FailureCategory != "" || j.FailureStage != "" || j.Retriable) {
+					return res, fmt.Errorf("control-plane proof-of-execution release gate failed: completed job %s retains stale failure metadata (category=%q, stage=%q, retriable=%v)", j.ID, j.FailureCategory, j.FailureStage, j.Retriable)
 				}
 				isStory := j.Action == "/autonomous-story-execution" || strings.Contains(j.Prompt, "/autonomous-story-execution")
 				if isStory {

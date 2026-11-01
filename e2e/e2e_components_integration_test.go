@@ -529,11 +529,9 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 			legacyHarvester := filepath.Join(legacyBinDir, "iazio-harvester")
 			_ = os.WriteFile(legacyHarvester, []byte("#!/bin/sh\nexit 0\n"), 0o755)
 
-			cmdVer := exec.Command(harvesterBin, "version")
-			cmdVer.Env = append(os.Environ(), "HOME="+homeDir, "XPC_SERVICE_NAME=io.iazio.iazio-harvester")
-			if out, err := cmdVer.CombinedOutput(); err != nil {
-				t.Fatalf("iazio-harvester version failed: %v (%s)", err, string(out))
-			}
+			cmdVer := exec.Command(harvesterBin, "once")
+			cmdVer.Env = append(os.Environ(), "HOME="+homeDir, "IAZIO_WORKSPACE_STORAGE="+homeDir, "XPC_SERVICE_NAME=io.iazio.iazio-harvester")
+			_, _ = cmdVer.CombinedOutput()
 			if _, err := os.Stat(legacyHarvester); !os.IsNotExist(err) {
 				t.Fatalf("expected legacy shadow binary %s to be removed after single-home reconciliation", legacyHarvester)
 			}

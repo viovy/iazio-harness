@@ -30,13 +30,18 @@ import (
 )
 
 var (
-	storyIDRegex      = regexp.MustCompile(`\b(STORY-[A-Za-z0-9_-]+)\b`)
-	convIDRegex       = regexp.MustCompile(`(?i)(?:created|resumed|resuming|loaded|active|using|streaming)\s+conversation\s+([A-Za-z0-9_-]{12,64})`)
-	bgDrainIdleRegex  = regexp.MustCompile(`(?i)root agent idle;\s*waiting up to\s*[0-9hms.]+\s*for\s*(\d+)\s*background task`)
-	printTimeoutRegex = regexp.MustCompile(`(?i)print timeout after\s*[0-9hms.]+\s*with turn in progress`)
-	hex16Regex        = regexp.MustCompile(`^[0-9a-f]{16}$`)
-	hex32Regex        = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	storyIDRegex       = regexp.MustCompile(`\b(STORY-[A-Za-z0-9_-]+)\b`)
+	convIDRegex        = regexp.MustCompile(`(?i)(?:created|resumed|resuming|loaded|active|using|streaming)\s+conversation\s+([A-Za-z0-9_-]{12,64})`)
+	bgDrainIdleRegex   = regexp.MustCompile(`(?i)root agent idle;\s*waiting up to\s*[0-9hms.]+\s*for\s*(\d+)\s*background task`)
+	printTimeoutRegex  = regexp.MustCompile(`(?i)print timeout after\s*[0-9hms.]+\s*with turn in progress`)
+	aseCompletionRegex = regexp.MustCompile(`(?i)(?:autonomous story execution is complete|\[story_completed\]|story[_\s-]+completed\s+successfully|all acceptance criteria[^\n]*(?:met|verified|complete)|"ase_complete"\s*:\s*true)`)
+	hex16Regex         = regexp.MustCompile(`^[0-9a-f]{16}$`)
+	hex32Regex         = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
+
+func isPointerStoryID(sid string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sid)), "STORY-GOV-POINTERS-")
+}
 
 const (
 	// DefaultPromptTimeout is the default execution window for long-running agentic prompts (7 days).
@@ -123,6 +128,8 @@ type PromptResult struct {
 	ElapsedSeconds       int      `json:"elapsed_seconds,omitempty"`
 	FailureCategory      string   `json:"failure_category,omitempty"`
 	FailureStage         string   `json:"failure_stage,omitempty"`
+	FailureDirection     string   `json:"failure_direction,omitempty"`
+	FailureService       string   `json:"failure_service,omitempty"`
 	ResumeAttempts       int      `json:"resume_attempts,omitempty"`
 	Status               string   `json:"status"`
 	ExitCode             int      `json:"exit_code"`
@@ -219,8 +226,15 @@ func discoverStoryFromASEState(workingDir string, after time.Time) (storyID, sto
 	if subMatches, err := filepath.Glob(filepath.Join(workingDir, "*", ".session_story_id")); err == nil {
 		candidates = append(candidates, subMatches...)
 	}
+	var fallbackPointerID string
 	for _, p := range candidates {
 		if sid := checkSessionFile(p); sid != "" {
+			if isPointerStoryID(sid) {
+				if fallbackPointerID == "" {
+					fallbackPointerID = sid
+				}
+				continue
+			}
 			storyID = sid
 			break
 		}
@@ -230,6 +244,7 @@ func discoverStoryFromASEState(workingDir string, after time.Time) (storyID, sto
 		filepath.Join(workingDir, "docs", "stories", "*.story.md"),
 		filepath.Join(workingDir, "*", "docs", "stories", "*.story.md"),
 	}
+	var fallbackPointerTitle, fallbackPointerPath string
 	for _, pattern := range storyGlobs {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
@@ -261,6 +276,20 @@ func discoverStoryFromASEState(workingDir string, after time.Time) (storyID, sto
 					fileSID = m[1]
 				}
 			}
+			var relPath string
+			if rel, errRel := filepath.Rel(workingDir, mPath); errRel == nil {
+				relPath = filepath.ToSlash(rel)
+			} else {
+				relPath = filepath.ToSlash(mPath)
+			}
+			if isPointerStoryID(fileSID) {
+				if fallbackPointerID == "" || fallbackPointerID == fileSID {
+					fallbackPointerID = fileSID
+					fallbackPointerTitle = fileTitle
+					fallbackPointerPath = relPath
+				}
+				continue
+			}
 			if storyID == "" || fileSID == storyID {
 				if storyID == "" {
 					storyID = fileSID
@@ -268,14 +297,15 @@ func discoverStoryFromASEState(workingDir string, after time.Time) (storyID, sto
 				if fileTitle != "" {
 					storyTitle = fileTitle
 				}
-				if rel, errRel := filepath.Rel(workingDir, mPath); errRel == nil {
-					storyPath = filepath.ToSlash(rel)
-				} else {
-					storyPath = filepath.ToSlash(mPath)
-				}
+				storyPath = relPath
 				break
 			}
 		}
+	}
+	if storyID == "" && fallbackPointerID != "" {
+		storyID = fallbackPointerID
+		storyTitle = fallbackPointerTitle
+		storyPath = fallbackPointerPath
 	}
 	return storyID, storyTitle, storyPath
 }
@@ -459,7 +489,7 @@ func hasBackgroundDrainLog(logPath, stdoutText, stderrText string) (bool, int) {
 		lines := strings.Split(trimmed, "\n")
 		for i := len(lines) - 1; i >= 0; i-- {
 			line := strings.TrimSpace(lines[i])
-			if line == "" {
+			if line == "" || strings.Contains(line, "[ASE-SUPERVISOR]") {
 				continue
 			}
 			if m := bgDrainIdleRegex.FindStringSubmatch(line); len(m) > 0 {
@@ -509,10 +539,10 @@ func hasPrintTimeoutLog(logPath, stdoutText, stderrText string) bool {
 	return false
 }
 
-func isStoryIncompleteInWorktree(workingDir, storyID string) bool {
+func storyFrontmatterStatus(workingDir, storyID string) (found bool, status string) {
 	targetSID := strings.TrimSpace(storyID)
 	if strings.TrimSpace(workingDir) == "" || targetSID == "" {
-		return false
+		return false, ""
 	}
 	storyGlobs := []string{
 		filepath.Join(workingDir, "docs", "stories", "*.story.md"),
@@ -554,12 +584,203 @@ func isStoryIncompleteInWorktree(workingDir, storyID string) bool {
 			if !idMatched {
 				continue
 			}
-			if fmStatus == "IN_PROGRESS" || fmStatus == "READY" || fmStatus == "TODO" || fmStatus == "BLOCKED" {
-				return true
+			return true, fmStatus
+		}
+	}
+	return false, ""
+}
+
+func isStoryIncompleteInWorktree(workingDir, storyID string) bool {
+	found, fmStatus := storyFrontmatterStatus(workingDir, storyID)
+	if !found {
+		return false
+	}
+	return fmStatus == "IN_PROGRESS" || fmStatus == "READY" || fmStatus == "TODO" || fmStatus == "BLOCKED"
+}
+
+func isStoryDoneInWorktree(workingDir, storyID string) bool {
+	found, fmStatus := storyFrontmatterStatus(workingDir, storyID)
+	if !found {
+		return false
+	}
+	return fmStatus == "DONE" || fmStatus == "COMPLETED" || fmStatus == "COMPLETE"
+}
+
+func isEphemeralHarnessFile(relPath string) bool {
+	p := strings.TrimSpace(filepath.ToSlash(relPath))
+	if p == "" {
+		return true
+	}
+	base := filepath.Base(p)
+	if base == ".session_story_id" {
+		return true
+	}
+	if p == ".autopilot" || strings.HasPrefix(p, ".autopilot/") || strings.Contains(p, "/.autopilot/") {
+		return true
+	}
+	return false
+}
+
+func filterNonEphemeralModified(modified []string) []string {
+	var out []string
+	for _, m := range modified {
+		if !isEphemeralHarnessFile(m) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gitBin string) bool {
+	if strings.TrimSpace(workingDir) == "" {
+		return false
+	}
+	if gitBin == "" {
+		gitBin = "git"
+	}
+
+	var candidateStories []string
+	seenStory := make(map[string]bool)
+	addStory := func(sid string) {
+		clean := strings.ToUpper(strings.TrimSpace(sid))
+		if clean != "" && !seenStory[clean] {
+			seenStory[clean] = true
+			candidateStories = append(candidateStories, clean)
+		}
+	}
+	addStory(primaryStoryID)
+	for _, m := range storyIDRegex.FindAllStringSubmatch(combinedOutput, -1) {
+		if len(m) > 1 {
+			addStory(m[1])
+		}
+	}
+
+	for _, sid := range candidateStories {
+		if isStoryIncompleteInWorktree(workingDir, sid) {
+			return false
+		}
+	}
+
+	hasCompletionEvidence := false
+	if strings.TrimSpace(primaryStoryID) != "" && isStoryDoneInWorktree(workingDir, primaryStoryID) {
+		hasCompletionEvidence = true
+	} else if aseCompletionRegex.MatchString(combinedOutput) {
+		if len(candidateStories) == 0 {
+			hasCompletionEvidence = true
+		} else {
+			for _, sid := range candidateStories {
+				if isStoryDoneInWorktree(workingDir, sid) {
+					hasCompletionEvidence = true
+					break
+				}
+			}
+			if !hasCompletionEvidence {
+				if strings.TrimSpace(primaryStoryID) == "" {
+					hasCompletionEvidence = true
+				} else if found, _ := storyFrontmatterStatus(workingDir, primaryStoryID); !found {
+					hasCompletionEvidence = true
+				}
 			}
 		}
 	}
-	return false
+	if !hasCompletionEvidence {
+		return false
+	}
+
+	_, _, rawModified := captureGitSnapshot(workingDir, gitBin)
+	dirtyFiles := filterNonEphemeralModified(rawModified)
+	return len(dirtyFiles) == 0
+}
+
+var sdlcChildTokens = []string{
+	"autopilot",
+	"git-flow",
+	"git ",
+	"gh ",
+	"make",
+	"go test",
+	"go build",
+	"flutter",
+	"dart",
+	"playwright",
+	"npx",
+	"npm",
+	"pytest",
+	"cargo",
+	"dotnet",
+}
+
+func hasActiveSDLCChildProcess(toolPID int) (bool, string) {
+	if toolPID <= 0 {
+		return false, ""
+	}
+	children := engines.FindChildProcesses(toolPID)
+	for _, ch := range children {
+		cmdLower := strings.ToLower(strings.TrimSpace(ch.Command))
+		if cmdLower == "" || strings.HasPrefix(cmdLower, "sleep ") || cmdLower == "sleep" {
+			continue
+		}
+		for _, tok := range sdlcChildTokens {
+			if strings.Contains(cmdLower, tok) {
+				return true, ch.Command
+			}
+		}
+	}
+	return false, ""
+}
+
+// ClassifyPromptFailure classifies upstream, downstream, and local execution failures.
+func ClassifyPromptFailure(execStatus, failureCategory, failureStage, combinedOutput string, waitErr error) (category, stage, direction, service string) {
+	category = strings.TrimSpace(failureCategory)
+	stage = strings.TrimSpace(failureStage)
+	errText := combinedOutput
+	if waitErr != nil {
+		errText += " " + waitErr.Error()
+	}
+	lower := strings.ToLower(execStatus + " " + category + " " + stage + " " + errText)
+
+	switch {
+	case category == "PERMISSION_DENIED" || strings.Contains(lower, "permission_denied") || strings.Contains(lower, "auto-denied"):
+		return "PERMISSION_DENIED", "TOOL_EXECUTION", "LOCAL_EXECUTION", "iazio-harness/sandbox"
+	case category == "BACKGROUND_DRAIN_TIMEOUT" || strings.Contains(lower, "background_drain_timeout"):
+		return "BACKGROUND_DRAIN_TIMEOUT", "BACKGROUND_DRAIN", "LOCAL_EXECUTION", "agy-cli"
+	case category == "UPSTREAM_MODEL_UNAVAILABLE" || category == "TOOL_QUOTA_OR_AUTH" || strings.Contains(lower, "429") || strings.Contains(lower, "resourceexhausted") || strings.Contains(lower, "resource_exhausted") || strings.Contains(lower, "quota") || strings.Contains(lower, "insufficient_quota"):
+		return "UPSTREAM_MODEL_UNAVAILABLE", "LLM_INFERENCE", "UPSTREAM", "antigravity-llm-provider"
+	case category == "UPSTREAM_AUTH_PROVIDER_OUTAGE" || strings.Contains(lower, "hydra") || strings.Contains(lower, "oauth2") || strings.Contains(lower, "bws ") || strings.Contains(lower, "bitwarden"):
+		return "UPSTREAM_AUTH_PROVIDER_OUTAGE", "PREFLIGHT", "UPSTREAM", "ory-hydra-bws"
+	case category == "UPSTREAM_SCM_UNAVAILABLE" || strings.Contains(lower, "api.github.com") || (strings.Contains(lower, "github.com") && (strings.Contains(lower, "502") || strings.Contains(lower, "503") || strings.Contains(lower, "504") || strings.Contains(lower, "connection refused"))):
+		return "UPSTREAM_SCM_UNAVAILABLE", "GIT_DELIVERY", "UPSTREAM", "github-api"
+	case category == "UPSTREAM_CI_UNAVAILABLE" || strings.Contains(lower, "jenkins") || strings.Contains(lower, "sonarqube"):
+		return "UPSTREAM_CI_UNAVAILABLE", "CI_VERIFICATION", "UPSTREAM", "jenkins-ci"
+	case category == "UPSTREAM_LLM_UNAVAILABLE" || (strings.Contains(lower, "llm") || strings.Contains(lower, "gemini") || strings.Contains(lower, "anthropic") || strings.Contains(lower, "openai") || strings.Contains(lower, "model provider")) && (strings.Contains(lower, "502") || strings.Contains(lower, "503") || strings.Contains(lower, "504") || strings.Contains(lower, "unavailable")):
+		return "UPSTREAM_MODEL_UNAVAILABLE", "LLM_INFERENCE", "UPSTREAM", "antigravity-llm-provider"
+	case category == "DOWNSTREAM_CONTROL_PLANE_UNAVAILABLE" || category == "DOWNSTREAM_CONTROL_PLANE_OUTAGE" || strings.Contains(lower, "iazio-harness-api") || strings.Contains(lower, "controlplane") || strings.Contains(lower, "control_plane_unavailable"):
+		return "DOWNSTREAM_CONTROL_PLANE_UNAVAILABLE", "CONTROL_PLANE_SYNC", "DOWNSTREAM", "iazio-harness-api"
+	case category == "DOWNSTREAM_DATABASE_UNAVAILABLE" || strings.Contains(lower, "postgres") || strings.Contains(lower, "pgvector") || strings.Contains(lower, "sqlstate"):
+		return "DOWNSTREAM_DATABASE_UNAVAILABLE", "QUEUE_DISPATCH", "DOWNSTREAM", "postgresql"
+	case category == "DOWNSTREAM_INGEST_OR_HARVESTER_OUTAGE" || strings.Contains(lower, "iazio-api") || strings.Contains(lower, "iazio-harvester") || strings.Contains(lower, "/v1/ingest/batches"):
+		return "DOWNSTREAM_INGEST_OR_HARVESTER_OUTAGE", "TELEMETRY_HARVEST", "DOWNSTREAM", "iazio-api/iazio-harvester"
+	case category == "DOWNSTREAM_RAG_OR_MCP_UNAVAILABLE" || strings.Contains(lower, "iazio-rag-api") || strings.Contains(lower, "iazio-mcp"):
+		return "DOWNSTREAM_RAG_OR_MCP_UNAVAILABLE", "TOOL_EXECUTION", "DOWNSTREAM", "iazio-rag-api/iazio-mcp"
+	case category == "STORY_NOT_FOUND" || strings.Contains(lower, "story not found") || strings.Contains(lower, "story_not_found"):
+		return "STORY_NOT_FOUND", "STORY_VALIDATION", "LOCAL_EXECUTION", "backlog"
+	case category == "WORKSPACE_PREP_ERROR" || strings.Contains(lower, "workspace_prep") || strings.Contains(lower, "stale git lock"):
+		return "WORKSPACE_PREP_ERROR", "WORKSPACE_PREP", "LOCAL_EXECUTION", "iazio-agent/workspace"
+	case category == "ASE_GATE_INCOMPLETE" || strings.Contains(lower, "dirty_worktree_post_exit") || strings.Contains(lower, "incomplete_ase_flow"):
+		return "ASE_GATE_INCOMPLETE", "COMPLETION_GATE", "LOCAL_EXECUTION", "autopilot/ase-gate"
+	default:
+		if category == "" {
+			if execStatus == "timed_out" {
+				category = "EXECUTION_TIMEOUT"
+			} else {
+				category = "TOOL_CRASH"
+			}
+		}
+		if stage == "" {
+			stage = "TOOL_EXECUTION"
+		}
+		return category, stage, "LOCAL_EXECUTION", "iazio-harness/engine"
+	}
 }
 
 func hasActiveConversationActivity(convID string, toolPID int, lastTranscriptOrOutputAt time.Time, activeWindow time.Duration) (chatty bool, activeChildren int) {
@@ -777,11 +998,12 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 
 	var streamMu sync.Mutex
-	var stdoutBuf, stderrBuf bytes.Buffer
+	var stdoutBuf, stderrBuf, transcriptBuf bytes.Buffer
 	lastOutAt := startTime
 	streamedAny := false
 	detectedConvID := ""
 	boundStoryID := storyID
+	var storyTitle, storyPath string
 	postedStoryID := ""
 	seenTranscriptSteps := make(map[int]bool)
 
@@ -961,20 +1183,26 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			streamMu.Lock()
 			alreadyPostedStory := postedStoryID
 			streamMu.Unlock()
-			if curBoundStory == "" || alreadyPostedStory == "" {
+			if curBoundStory == "" || alreadyPostedStory == "" || isPointerStoryID(curBoundStory) {
 				sid, stitle, spath := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second))
-				if sid == "" {
+				if sid == "" || (curBoundStory != "" && !isPointerStoryID(curBoundStory) && isPointerStoryID(sid)) {
 					sid = curBoundStory
 				}
 				if sid != "" {
 					streamMu.Lock()
-					if boundStoryID == "" {
+					if boundStoryID == "" || (isPointerStoryID(boundStoryID) && !isPointerStoryID(sid)) {
 						boundStoryID = sid
+						if stitle != "" {
+							storyTitle = stitle
+						}
+						if spath != "" {
+							storyPath = spath
+						}
 					}
 					curBoundStory = boundStoryID
-					shouldPost := postedStoryID == ""
+					shouldPost := postedStoryID == "" || (isPointerStoryID(postedStoryID) && !isPointerStoryID(curBoundStory))
 					if shouldPost {
-						postedStoryID = sid
+						postedStoryID = curBoundStory
 					}
 					lastOutAt = time.Now()
 					streamMu.Unlock()
@@ -982,8 +1210,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 						stitle = opts.Title
 					}
 					if shouldPost && jobID != "" && apiURL != "" {
-						_ = controlplane.PostStoryBinding(ctx, apiURL, token, jobID, sid, stitle, spath, opts.FencingToken)
-						storyMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Bound governing story: %s (%s)\n", time.Now().UTC().Format(time.RFC3339), sid, stitle)
+						_ = controlplane.PostStoryBinding(ctx, apiURL, token, jobID, curBoundStory, stitle, spath, opts.FencingToken)
+						storyMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Bound governing story: %s (%s)\n", time.Now().UTC().Format(time.RFC3339), curBoundStory, stitle)
 						_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", storyMsg)
 						lastHeartbeatChunkAt = time.Now()
 					}
@@ -994,6 +1222,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				streamMu.Lock()
 				stepChunk := tailBrainTranscriptSteps(curConv, seenTranscriptSteps)
 				if stepChunk != "" {
+					_, _ = transcriptBuf.WriteString(stepChunk)
 					lastOutAt = time.Now()
 					bgDrainSince = time.Time{}
 				}
@@ -1007,7 +1236,10 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		}
 
 		const maxTimeoutDeferrals = 12
+		const maxBgDrainDeferrals = 4
 		timeoutDeferrals := 0
+		bgDrainDeferrals := 0
+		var turnCompletedDuringDrain bool
 
 	turnLoop:
 		for {
@@ -1034,6 +1266,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				streamMu.Lock()
 				fullOut := stdoutBuf.String()
 				fullErr := stderrBuf.String()
+				fullTranscript := transcriptBuf.String()
 				outSnapshot := fullOut
 				if turnStartOutLen <= len(fullOut) {
 					outSnapshot = fullOut[turnStartOutLen:]
@@ -1047,9 +1280,38 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 
 				inBgDrain, bgTasks := hasBackgroundDrainLog(tmpLogPath, outSnapshot, errSnapshot)
 				if inBgDrain {
+					// If ASE/story execution is already completed in the worktree/transcript, settle immediately as completed!
+					if isASEFlowCompletedInWorktree(opts.WorkingDir, curBoundStory, fullOut+"\n"+fullTranscript+"\n"+fullErr, gitBin) {
+						turnCompletedDuringDrain = true
+						turnBgDrainReaped = false
+						compNote := fmt.Sprintf(
+							"[%s] [ASE-SUPERVISOR] [ase_completion.detected_during_bg_drain] ASE flow and story %s verified DONE in worktree while root agent entered background drain (ToolPID=%d, Conv=%s, Tasks=%d); settling turn as completed.\n",
+							time.Now().UTC().Format(time.RFC3339), curBoundStory, toolPID, curConv, bgTasks,
+						)
+						emitSupervisorNote(compNote)
+						engines.StopProcessGroup(cmd)
+						select {
+						case <-waitDone:
+						case <-time.After(gracePeriod):
+							engines.KillProcessGroup(cmd)
+							<-waitDone
+						}
+						turnErr = nil
+						break turnLoop
+					}
 					if bgDrainSince.IsZero() {
 						bgDrainSince = time.Now()
 					} else if time.Since(bgDrainSince) >= bgDrainGrace {
+						if sdlcActive, sdlcCmd := hasActiveSDLCChildProcess(toolPID); sdlcActive && bgDrainDeferrals < maxBgDrainDeferrals {
+							bgDrainDeferrals++
+							bgDrainSince = time.Now()
+							deferDrainNote := fmt.Sprintf(
+								"[%s] [ASE-SUPERVISOR] [background_task.sdlc_active] Deferring background drain reap (deferral=%d/%d) while active SDLC child process is running under ToolPID=%d: %s\n",
+								time.Now().UTC().Format(time.RFC3339), bgDrainDeferrals, maxBgDrainDeferrals, toolPID, redact.Egress(sdlcCmd),
+							)
+							emitSupervisorNote(deferDrainNote)
+							continue
+						}
 						turnBgDrainReaped = true
 						reapNote := fmt.Sprintf(
 							"[%s] [ASE-SUPERVISOR] [background_task.auto_reaped] Root agent idle in background drain (ToolPID=%d, Conv=%s, Tasks=%d); reaping idle background task(s) after %s to unblock auto-resume.\n",
@@ -1172,10 +1434,39 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		if curConvFinal != "" {
 			streamMu.Lock()
 			finalSteps := tailBrainTranscriptSteps(curConvFinal, seenTranscriptSteps)
+			if finalSteps != "" {
+				transcriptBuf.WriteString(finalSteps)
+			}
 			streamMu.Unlock()
 			if finalSteps != "" && jobID != "" && apiURL != "" {
 				_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", finalSteps)
 			}
+		}
+
+		streamMu.Lock()
+		curTurnStory := boundStoryID
+		fullTranscriptFinal := transcriptBuf.String()
+		streamMu.Unlock()
+		if curTurnStory == "" || isPointerStoryID(curTurnStory) {
+			if sid, stitle, spath := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second)); sid != "" {
+				if curTurnStory == "" || (isPointerStoryID(curTurnStory) && !isPointerStoryID(sid)) {
+					curTurnStory = sid
+					streamMu.Lock()
+					boundStoryID = sid
+					if storyTitle == "" && stitle != "" {
+						storyTitle = stitle
+					}
+					if storyPath == "" && spath != "" {
+						storyPath = spath
+					}
+					streamMu.Unlock()
+				}
+			}
+		}
+
+		if !canceled && !hasHeadlessPermissionDenial(fullOutFinal+"\n"+fullTranscriptFinal+"\n"+fullErrFinal) &&
+			(turnCompletedDuringDrain || isASEFlowCompletedInWorktree(opts.WorkingDir, curTurnStory, fullOutFinal+"\n"+fullTranscriptFinal+"\n"+fullErrFinal, gitBin)) {
+			return "completed", 0, nil, false, false
 		}
 
 		if !turnBgDrainReaped {
@@ -1210,21 +1501,32 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			streamMu.Lock()
 			curConv := detectedConvID
 			curStory := boundStoryID
-			rawCombined := stdoutBuf.String() + "\n" + stderrBuf.String()
+			rawCombined := stdoutBuf.String() + "\n" + transcriptBuf.String() + "\n" + stderrBuf.String()
 			streamMu.Unlock()
 
-			if curStory == "" {
+			if curStory == "" || isPointerStoryID(curStory) {
 				if sid, _, _ := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second)); sid != "" {
-					curStory = sid
-					streamMu.Lock()
-					boundStoryID = sid
-					streamMu.Unlock()
+					if curStory == "" || (isPointerStoryID(curStory) && !isPointerStoryID(sid)) {
+						curStory = sid
+						streamMu.Lock()
+						boundStoryID = sid
+						streamMu.Unlock()
+					}
 				}
 			}
+			if !hasHeadlessPermissionDenial(rawCombined) && isASEFlowCompletedInWorktree(opts.WorkingDir, curStory, rawCombined, gitBin) {
+				execStatus = "completed"
+				exitCode = 0
+				waitErr = nil
+				bgDrainReaped = false
+				printTimedOut = false
+				break
+			}
 			_, _, curModified := captureGitSnapshot(opts.WorkingDir, gitBin)
+			nonEphemeralModified := filterNonEphemeralModified(curModified)
 			storyIncomplete := isStoryIncompleteInWorktree(opts.WorkingDir, curStory)
 			needsResume := curConv != "" && !hasHeadlessPermissionDenial(rawCombined) &&
-				(bgDrainReaped || printTimedOut || (storyIncomplete && (execStatus != "completed" || len(curModified) > 0 || bgDrainIdleRegex.MatchString(rawCombined))))
+				(bgDrainReaped || printTimedOut || (storyIncomplete && (execStatus != "completed" || len(nonEphemeralModified) > 0 || bgDrainIdleRegex.MatchString(rawCombined))))
 
 			if !needsResume {
 				break
@@ -1258,13 +1560,24 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	// 6. Output Summary & Redaction
 	streamMu.Lock()
 	rawOut := stdoutBuf.String()
+	rawTranscript := transcriptBuf.String()
 	rawErr := stderrBuf.String()
 	alreadyStreamed := streamedAny
 	curConv := detectedConvID
+	curBoundStory := boundStoryID
+	curBoundTitle := storyTitle
+	curBoundPath := storyPath
 	streamMu.Unlock()
 
-	combinedOutput := rawOut + "\n" + rawErr
+	combinedOutput := rawOut + "\n" + rawTranscript + "\n" + rawErr
 	summary := rawOut
+	if trimmedTranscript := strings.TrimSpace(rawTranscript); trimmedTranscript != "" && !strings.Contains(summary, trimmedTranscript) {
+		if strings.TrimSpace(summary) == "" {
+			summary = rawTranscript
+		} else {
+			summary = strings.TrimRight(summary, "\n") + "\n" + rawTranscript
+		}
+	}
 	if strings.TrimSpace(summary) == "" {
 		if len(rawErr) > 0 {
 			summary = rawErr
@@ -1284,39 +1597,60 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		waitErr = fmt.Errorf("PERMISSION_DENIED: headless agent tool permission was auto-denied: %s", summary)
 	}
 
-	detectedStoryID := storyID
-	var detectedStoryPath string
-	var detectedStoryTitle string
+	detectedStoryID := curBoundStory
+	if detectedStoryID == "" {
+		detectedStoryID = storyID
+	}
+	detectedStoryPath := curBoundPath
+	detectedStoryTitle := curBoundTitle
 
 	if aseSID, aseTitle, asePath := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second)); aseSID != "" {
-		if detectedStoryID == "" {
+		if detectedStoryID == "" || (isPointerStoryID(detectedStoryID) && !isPointerStoryID(aseSID)) {
 			detectedStoryID = aseSID
-		}
-		if aseTitle != "" {
-			detectedStoryTitle = aseTitle
-		}
-		if asePath != "" {
-			detectedStoryPath = asePath
+			if aseTitle != "" {
+				detectedStoryTitle = aseTitle
+			}
+			if asePath != "" {
+				detectedStoryPath = asePath
+			}
+		} else {
+			if detectedStoryTitle == "" && aseTitle != "" {
+				detectedStoryTitle = aseTitle
+			}
+			if detectedStoryPath == "" && asePath != "" {
+				detectedStoryPath = asePath
+			}
 		}
 	}
 
 	for _, f := range modified {
 		if (strings.HasPrefix(f, "docs/stories/") || strings.Contains(f, "/docs/stories/")) && strings.HasSuffix(f, ".story.md") {
+			if m := storyIDRegex.FindStringSubmatch(f); len(m) > 1 {
+				candID := strings.ToUpper(m[1])
+				if detectedStoryID == "" || (isPointerStoryID(detectedStoryID) && !isPointerStoryID(candID)) {
+					detectedStoryID = candID
+					detectedStoryPath = f
+					break
+				}
+			}
 			if detectedStoryPath == "" {
 				detectedStoryPath = f
 			}
-			if detectedStoryID == "" {
-				if m := storyIDRegex.FindStringSubmatch(f); len(m) > 1 {
-					detectedStoryID = m[1]
-				}
-			}
-			break
 		}
 	}
 
-	if detectedStoryID == "" {
-		if m := storyIDRegex.FindStringSubmatch(summary); len(m) > 1 {
-			detectedStoryID = m[1]
+	if detectedStoryID == "" || isPointerStoryID(detectedStoryID) {
+		for _, m := range storyIDRegex.FindAllStringSubmatch(combinedOutput, -1) {
+			if len(m) > 1 {
+				candID := strings.ToUpper(m[1])
+				if !isPointerStoryID(candID) {
+					detectedStoryID = candID
+					break
+				}
+				if detectedStoryID == "" {
+					detectedStoryID = candID
+				}
+			}
 		}
 	}
 	if detectedStoryTitle == "" && opts.Title != "" {
@@ -1329,7 +1663,16 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		_ = controlplane.PostStoryBinding(ctx, apiURL, token, jobID, detectedStoryID, detectedStoryTitle, detectedStoryPath, opts.FencingToken)
 	}
 
-	// Enforce fail-closed BACKGROUND_DRAIN_TIMEOUT if background drain was not resolved by auto-resume
+	if !hasHeadlessPermissionDenial(combinedOutput) && isASEFlowCompletedInWorktree(opts.WorkingDir, detectedStoryID, combinedOutput, gitBin) {
+		execStatus = "completed"
+		exitCode = 0
+		waitErr = nil
+		bgDrainReaped = false
+		failureCategory = ""
+		failureStage = ""
+	}
+
+	// Enforce fail-closed BACKGROUND_DRAIN_TIMEOUT if background drain was not resolved by auto-resume or completion verification
 	if bgDrainReaped && (execStatus != "completed" || isStoryIncompleteInWorktree(opts.WorkingDir, detectedStoryID)) {
 		execStatus = "timed_out"
 		if exitCode == 0 {
@@ -1340,6 +1683,12 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		if waitErr == nil {
 			waitErr = fmt.Errorf("BACKGROUND_DRAIN_TIMEOUT: conversation %s timed out waiting on background drain before completing story %s", curConv, detectedStoryID)
 		}
+	}
+
+	failureDirection := "NONE"
+	failureService := ""
+	if execStatus != "completed" {
+		failureCategory, failureStage, failureDirection, failureService = ClassifyPromptFailure(execStatus, failureCategory, failureStage, combinedOutput, waitErr)
 	}
 
 	if jobID != "" && apiURL != "" && summary != "" && !alreadyStreamed {
@@ -1367,6 +1716,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		ElapsedSeconds:       elapsedSeconds,
 		FailureCategory:      failureCategory,
 		FailureStage:         failureStage,
+		FailureDirection:     failureDirection,
+		FailureService:       failureService,
 		ResumeAttempts:       resumeAttempts,
 		Status:               execStatus,
 		ExitCode:             exitCode,
