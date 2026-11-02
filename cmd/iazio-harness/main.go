@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -53,6 +54,26 @@ var (
 func main() {
 	flushTracer := telemetry.InitGlobalTracer("iazio-harness", "")
 	defer flushTracer()
+
+	destURL, isGateway := telemetry.ResolveTelemetryDestination(os.Getenv("IAZIO_HARNESS_API_URL"), os.Getenv)
+	if destURL == "" {
+		destURL, isGateway = telemetry.ResolveTelemetryDestination(os.Getenv("IAZIO_API_URL"), os.Getenv)
+	}
+	if destURL != "" {
+		host, _ := os.Hostname()
+		tok := strings.TrimSpace(os.Getenv("IAZIO_INGEST_TOKEN"))
+		sink := telemetry.NewElasticSink(telemetry.ElasticConfig{
+			URL:         destURL,
+			IsGateway:   isGateway,
+			AuthToken:   tok,
+			ServiceName: "iazio-harness",
+			Version:     version,
+			HostName:    host,
+		})
+		telemetry.SetGlobalSink(sink)
+		defer sink.Close()
+		slog.SetDefault(slog.New(telemetry.NewSlogHandler(sink, slog.Default().Handler())))
+	}
 
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())

@@ -248,9 +248,14 @@ func TestZipkinExporterErrorAndClose(t *testing.T) {
 
 func TestResolveZipkinFromConfig(t *testing.T) {
 	origHome := os.Getenv("HOME")
+	origUserProfile := os.Getenv("USERPROFILE")
 	tempHome := t.TempDir()
+	os.Setenv("USERPROFILE", tempHome)
 	os.Setenv("HOME", tempHome)
-	defer os.Setenv("HOME", origHome)
+	defer func() {
+		os.Setenv("HOME", origHome)
+		os.Setenv("USERPROFILE", origUserProfile)
+	}()
 
 	// No file -> empty
 	if got := resolveZipkinFromConfig(); got != "" {
