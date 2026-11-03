@@ -124,6 +124,9 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 	// 4. Process Discovery & Provenance
 	discoverAgentProcesses(cleanPath, res)
 
+	// 4b. Reconcile ad-hoc ASE session state and provenance
+	reconcileAdhocASEState(cleanPath, res)
+
 	// 5. Finalize Diagnostic Summary
 	buildDiagnosticSummary(res)
 
@@ -273,8 +276,59 @@ func parseASEState(repoPath string, res *RepoFleetStatusResult) {
 		if res.ASEState == "IDLE" {
 			res.ASEState = "RUNNING"
 		}
-	} else if res.WorktreeState == "DIRTY_MODIFIED" && res.ASEState == "IDLE" {
+	}
+
+	// Check .session_story_id and tmp/ase-resume-*.json for interactive / ad-hoc ASE sessions
+	if b, err := os.ReadFile(filepath.Join(repoPath, ".session_story_id")); err == nil {
+		storyID := strings.TrimSpace(string(b))
+		if strings.HasPrefix(storyID, "STORY-") {
+			if res.ActiveStoryID == "" {
+				res.ActiveStoryID = storyID
+			}
+			nonMainBranch := res.Branch != "" && res.Branch != "main" && res.Branch != "master" && res.Branch != "HEAD"
+			hasResumeFile := false
+			if matches, _ := filepath.Glob(filepath.Join(repoPath, "tmp", "ase-resume-*.json")); len(matches) > 0 {
+				hasResumeFile = true
+			}
+			if nonMainBranch || len(res.NonMainSubmodules) > 0 || hasResumeFile {
+				if res.ASEState == "IDLE" || res.ASEState == "FAILED_DIRTY" {
+					res.ASEState = "RUNNING"
+				}
+				if res.CurrentPhase == "" {
+					res.CurrentPhase = "ADHOC_ASE"
+				}
+			}
+		}
+	}
+
+	if len(locks) == 0 && res.WorktreeState == "DIRTY_MODIFIED" && res.ASEState == "IDLE" {
 		res.ASEState = "FAILED_DIRTY"
+	}
+}
+
+func isDiagnosticCmdLine(cmdLine string) bool {
+	lower := strings.ToLower(cmdLine)
+	return strings.Contains(lower, "fleet-status") ||
+		strings.Contains(lower, "status --json") ||
+		strings.Contains(lower, "auth status")
+}
+
+func reconcileAdhocASEState(repoPath string, res *RepoFleetStatusResult) {
+	if res.ToolLiveness == "LIVE" && res.ExecutionProvenance == "INDEPENDENT_USER_SESSION" {
+		if res.ASEState == "IDLE" || res.ASEState == "FAILED_DIRTY" {
+			res.ASEState = "RUNNING"
+		}
+	}
+	if res.ASEState == "RUNNING" && res.ActiveStoryID != "" &&
+		res.ExecutionProvenance != "COORDINATED_HARNESS" &&
+		res.ExecutionProvenance != "COORDINATED_HARNESS_FAILED" {
+		res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+		if res.ToolLiveness == "NONE" || res.ToolLiveness == "TERMINATED" || res.ToolLiveness == "" {
+			res.ToolLiveness = "LIVE"
+		}
+		if res.AgentTool == "" {
+			res.AgentTool = "autopilot-ase"
+		}
 	}
 }
 
@@ -337,9 +391,12 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 		return
 	}
 
+	selfPID := os.Getpid()
+	parentPID := os.Getppid()
+
 	for _, name := range entries {
 		pid, err := strconv.Atoi(name)
-		if err != nil || pid <= 1 {
+		if err != nil || pid <= 1 || pid == selfPID || pid == parentPID {
 			continue
 		}
 
@@ -359,6 +416,9 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 		cmdlineBytes, _ := os.ReadFile(filepath.Join("/proc", name, "cmdline"))
 		cmdArgs := strings.Split(string(cmdlineBytes), "\x00")
 		if len(cmdArgs) == 0 || cmdArgs[0] == "" {
+			continue
+		}
+		if isDiagnosticCmdLine(strings.Join(cmdArgs, " ")) {
 			continue
 		}
 
@@ -432,6 +492,8 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 
 func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult) {
 	if runtime.GOOS != "windows" {
+		selfPID := os.Getpid()
+		parentPID := os.Getppid()
 		cmd := procutil.Command("ps", "-ef")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -439,17 +501,22 @@ func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult)
 		}
 		lines := strings.Split(string(out), "\n")
 		for _, l := range lines {
-			if !strings.Contains(l, repoPath) {
+			if !strings.Contains(l, repoPath) || isDiagnosticCmdLine(l) {
+				continue
+			}
+			fields := strings.Fields(l)
+			pid := 0
+			if len(fields) > 1 {
+				if p, err := strconv.Atoi(fields[1]); err == nil {
+					pid = p
+				}
+			}
+			if pid == selfPID || pid == parentPID {
 				continue
 			}
 			for _, tool := range knownAgentBinaries {
 				if strings.Contains(l, tool) {
-					fields := strings.Fields(l)
-					if len(fields) > 1 {
-						if pid, err := strconv.Atoi(fields[1]); err == nil {
-							res.AgentPID = pid
-						}
-					}
+					res.AgentPID = pid
 					res.AgentTool = tool
 					res.ToolLiveness = "LIVE"
 					res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
@@ -462,7 +529,7 @@ func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult)
 		res.ToolLiveness = "KILLED"
 		res.ASEState = "ORPHANED"
 		res.ExecutionProvenance = "COORDINATED_HARNESS_FAILED"
-	} else if res.ASEState == "FAILED_DIRTY" || !res.IsClean {
+	} else if res.ASEState == "FAILED_DIRTY" || (!res.IsClean && res.ASEState != "RUNNING") {
 		res.ToolLiveness = "TERMINATED"
 	}
 }

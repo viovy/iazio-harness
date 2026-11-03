@@ -276,3 +276,40 @@ func TestDiscoverAgentProcessesFallback_AndReap(t *testing.T) {
 		t.Errorf("ReapOrphanedProcesses failed: %v", err)
 	}
 }
+
+func TestInspectRepoFleetStatus_AdhocASESessionStoryID(t *testing.T) {
+	tmpDir := t.TempDir()
+	cmd := exec.Command("git", "init", "-b", "chore/gov-5135-test")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	exec.Command("git", "-C", tmpDir, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", tmpDir, "config", "user.name", "Test User").Run()
+	_ = os.WriteFile(filepath.Join(tmpDir, "README.md"), []byte("# Test\n"), 0644)
+	exec.Command("git", "-C", tmpDir, "add", ".").Run()
+	exec.Command("git", "-C", tmpDir, "commit", "-m", "init").Run()
+
+	// Write .session_story_id on a non-main story branch
+	_ = os.WriteFile(filepath.Join(tmpDir, ".session_story_id"), []byte("STORY-GOV-5135\n"), 0644)
+
+	res, err := InspectRepoFleetStatus(context.Background(), tmpDir)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus error: %v", err)
+	}
+	if res.ASEState != "RUNNING" {
+		t.Errorf("expected ASEState=RUNNING for active .session_story_id on story branch, got %s", res.ASEState)
+	}
+	if res.ActiveStoryID != "STORY-GOV-5135" {
+		t.Errorf("expected ActiveStoryID=STORY-GOV-5135, got %s", res.ActiveStoryID)
+	}
+	if res.ExecutionProvenance != "INDEPENDENT_USER_SESSION" {
+		t.Errorf("expected ExecutionProvenance=INDEPENDENT_USER_SESSION, got %s", res.ExecutionProvenance)
+	}
+	if res.ToolLiveness != "LIVE" {
+		t.Errorf("expected ToolLiveness=LIVE, got %s", res.ToolLiveness)
+	}
+	if !isDiagnosticCmdLine("iazio-harness fleet-status --repo /tmp/foo --json") {
+		t.Errorf("expected fleet-status invocation to be classified as diagnostic")
+	}
+}
