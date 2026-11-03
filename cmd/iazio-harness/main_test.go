@@ -208,6 +208,12 @@ func TestRunDispatch(t *testing.T) {
 	if err := run([]string{"auth"}); err != nil {
 		t.Errorf("unexpected error on auth: %v", err)
 	}
+	if err := run([]string{"auth", "status", "--json"}); err != nil {
+		t.Errorf("unexpected error on auth status --json: %v", err)
+	}
+	if err := run([]string{"auth", "logout", "--json"}); err != nil {
+		t.Errorf("unexpected error on auth logout --json: %v", err)
+	}
 
 	// Auth login noninteractive
 	t.Setenv("IAZIO_HARNESS_NONINTERACTIVE", "1")
