@@ -55,10 +55,16 @@ func main() {
 	flushTracer := telemetry.InitGlobalTracer("iazio-harness", "")
 	defer flushTracer()
 
-	destURL, isGateway := telemetry.ResolveTelemetryDestination(os.Getenv("IAZIO_HARNESS_API_URL"), os.Getenv)
-	if destURL == "" {
-		destURL, isGateway = telemetry.ResolveTelemetryDestination(os.Getenv("IAZIO_API_URL"), os.Getenv)
+	api := os.Getenv("IAZIO_HARNESS_API_URL")
+	if api == "" {
+		api = os.Getenv("IAZIO_API_URL")
 	}
+	if api == "" {
+		if cfg, err := auth.LoadOptional(); err == nil && cfg.APIBaseURL != "" {
+			api = cfg.APIBaseURL
+		}
+	}
+	destURL, isGateway := telemetry.ResolveTelemetryDestination(api, os.Getenv)
 	if destURL != "" {
 		host, _ := os.Hostname()
 		tok := strings.TrimSpace(os.Getenv("IAZIO_INGEST_TOKEN"))
@@ -108,15 +114,43 @@ func run(args []string) error {
 		fmt.Println(formatVersion())
 		return nil
 	case "auth":
-		if len(args) > 1 && args[1] == "login" {
+		wantJSON := false
+		subcmd := ""
+		for _, a := range args[1:] {
+			if a == "--json" || a == "-json" {
+				wantJSON = true
+			} else if subcmd == "" && !strings.HasPrefix(a, "-") {
+				subcmd = a
+			}
+		}
+		switch subcmd {
+		case "login":
 			return auth.Login(context.Background())
+		case "logout":
+			if err := auth.Logout(); err != nil {
+				return err
+			}
+			if wantJSON {
+				fmt.Println(`{"status": "logged_out"}`)
+			} else {
+				fmt.Println("Logged out successfully.")
+			}
+			return nil
+		case "status", "":
+			st, err := auth.Status()
+			if err != nil {
+				return err
+			}
+			if wantJSON {
+				b, _ := json.MarshalIndent(st, "", "  ")
+				fmt.Println(string(b))
+			} else {
+				fmt.Print(st.String())
+			}
+			return nil
+		default:
+			return fmt.Errorf("unknown auth subcommand: %s", subcmd)
 		}
-		st, err := auth.Status()
-		if err != nil {
-			return err
-		}
-		fmt.Println(st.String())
-		return nil
 	case "run":
 		return runJobWithContext(ctx, args[1:])
 	case "story":

@@ -106,6 +106,33 @@ func TestStatus(t *testing.T) {
 	}
 }
 
+func TestStatus_AgentFallback(t *testing.T) {
+	dir := t.TempDir()
+	harnessFile := filepath.Join(dir, "harness.json")
+	agentFile := filepath.Join(dir, "agent.json")
+	_ = os.WriteFile(agentFile, []byte(`{"refresh_token":"agent-rt","api_base_url":"https://tian.go.ro/agent-api"}`), 0o600)
+	t.Setenv("IAZIO_HARNESS_CONFIG", harnessFile)
+	t.Setenv("IAZIO_AGENT_CONFIG", agentFile)
+
+	st, err := Status()
+	if err != nil || !st.RefreshPresent || st.ConfigPath != agentFile || st.APIBaseURL != "https://tian.go.ro/agent-api" {
+		t.Errorf("expected fallback to agent config, got %+v, err=%v", st, err)
+	}
+
+	cfg, err := LoadOptional()
+	if err != nil || cfg.RefreshToken != "agent-rt" || cfg.APIBaseURL != "https://tian.go.ro/agent-api" {
+		t.Errorf("expected LoadOptional fallback to agent config, got %+v, err=%v", cfg, err)
+	}
+
+	if err := Logout(); err != nil {
+		t.Fatalf("unexpected logout err: %v", err)
+	}
+	stPostLogout, err := Status()
+	if err != nil || stPostLogout.RefreshPresent {
+		t.Errorf("expected tokens cleared after Logout, got %+v, err=%v", stPostLogout, err)
+	}
+}
+
 func TestResolveEndpoints(t *testing.T) {
 	t.Setenv("IAZIO_HARNESS_CONFIG", t.TempDir()+"/none.json")
 	t.Setenv("IAZIO_AUTH_URL", "https://auth.example.com")

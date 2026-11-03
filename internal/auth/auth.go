@@ -46,6 +46,7 @@ type File struct {
 	AuthURL       string `json:"auth_url,omitempty"`
 	TokenURL      string `json:"token_url,omitempty"`
 	DeviceAuthURL string `json:"device_auth_url,omitempty"`
+	APIBaseURL    string `json:"api_base_url,omitempty"`
 }
 
 // Endpoints are the OAuth URLs for this process.
@@ -57,8 +58,9 @@ type Endpoints struct {
 
 // Report is the redacted, offline auth status.
 type Report struct {
-	ConfigPath     string
-	RefreshPresent bool
+	ConfigPath     string `json:"config_path"`
+	RefreshPresent bool   `json:"refresh_token_present"`
+	APIBaseURL     string `json:"api_base_url,omitempty"`
 }
 
 // String prints the config path and whether a refresh token is present.
@@ -68,7 +70,11 @@ func (r Report) String() string {
 	if r.RefreshPresent {
 		state = "present"
 	}
-	return fmt.Sprintf("config: %s\nrefresh_token: %s\n", r.ConfigPath, state)
+	res := fmt.Sprintf("config: %s\nrefresh_token: %s\n", r.ConfigPath, state)
+	if r.APIBaseURL != "" {
+		res += fmt.Sprintf("api_base_url: %s\n", r.APIBaseURL)
+	}
+	return res
 }
 
 // ConfigPath returns IAZIO_HARNESS_CONFIG or ~/.iazio/harness.json.
@@ -81,6 +87,18 @@ func ConfigPath() string {
 		return ".iazio/harness.json"
 	}
 	return home + "/.iazio/harness.json"
+}
+
+// AgentConfigPath returns IAZIO_AGENT_CONFIG or ~/.iazio/agent.json.
+func AgentConfigPath() string {
+	if p := strings.TrimSpace(os.Getenv("IAZIO_AGENT_CONFIG")); p != "" {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ".iazio/agent.json"
+	}
+	return home + "/.iazio/agent.json"
 }
 
 // IsNonInteractive reports whether this process must not open a browser or device prompt.
@@ -112,16 +130,70 @@ func GateBeforeCLI() error {
 func Status() (Report, error) {
 	path := ConfigPath()
 	cfg, err := load(path)
+	if err == nil {
+		if strings.TrimSpace(cfg.RefreshToken) == "" {
+			agentPath := AgentConfigPath()
+			if aCfg, aErr := load(agentPath); aErr == nil && strings.TrimSpace(aCfg.RefreshToken) != "" {
+				return Report{
+					ConfigPath:     agentPath,
+					RefreshPresent: true,
+					APIBaseURL:     aCfg.APIBaseURL,
+				}, nil
+			}
+		}
+		return Report{
+			ConfigPath:     path,
+			RefreshPresent: strings.TrimSpace(cfg.RefreshToken) != "",
+			APIBaseURL:     cfg.APIBaseURL,
+		}, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		agentPath := AgentConfigPath()
+		if aCfg, aErr := load(agentPath); aErr == nil {
+			return Report{
+				ConfigPath:     agentPath,
+				RefreshPresent: strings.TrimSpace(aCfg.RefreshToken) != "",
+				APIBaseURL:     aCfg.APIBaseURL,
+			}, nil
+		}
+		return Report{ConfigPath: path}, nil
+	}
+	return Report{}, err
+}
+
+// LoadOptional returns the active client configuration, falling back to iazio-agent configuration.
+func LoadOptional() (*File, error) {
+	return loadOptional()
+}
+
+// Logout clears tokens from both harness and agent configuration.
+func Logout() error {
+	_ = clearTokensInFile(ConfigPath())
+	_ = clearTokensInFile(AgentConfigPath())
+	return nil
+}
+
+func clearTokensInFile(path string) error {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return Report{ConfigPath: path}, nil
+			return nil
 		}
-		return Report{}, err
+		return err
 	}
-	return Report{
-		ConfigPath:     path,
-		RefreshPresent: strings.TrimSpace(cfg.RefreshToken) != "",
-	}, nil
+	var existing map[string]any
+	if err := json.Unmarshal(b, &existing); err != nil {
+		return nil
+	}
+	keys := []string{"refresh_token", "access_token", "token_type", "expiry"}
+	for _, k := range keys {
+		delete(existing, k)
+	}
+	out, err := json.MarshalIndent(existing, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(out, '\n'), 0600)
 }
 
 // ResolveEndpoints returns authorize, token, and device URLs from the environment, then the config file.
@@ -151,6 +223,9 @@ func Bearer(ctx context.Context) (string, error) {
 	}
 	if strings.TrimSpace(cfg.RefreshToken) == "" {
 		return "", ErrNoRefreshToken
+	}
+	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+		path = AgentConfigPath()
 	}
 	return refresh(ctx, path, cfg)
 }
@@ -204,7 +279,36 @@ func refreshPresent() (bool, error) {
 }
 
 func loadOptional() (*File, error) {
-	cfg, err := load(ConfigPath())
+	path := ConfigPath()
+	cfg, err := load(path)
+	if err == nil && (strings.TrimSpace(cfg.RefreshToken) != "" || strings.TrimSpace(cfg.AccessToken) != "") {
+		return cfg, nil
+	}
+	agentCfg, aErr := load(AgentConfigPath())
+	if aErr == nil {
+		if cfg == nil {
+			return agentCfg, nil
+		}
+		if strings.TrimSpace(cfg.RefreshToken) == "" {
+			cfg.RefreshToken = agentCfg.RefreshToken
+		}
+		if strings.TrimSpace(cfg.AccessToken) == "" {
+			cfg.AccessToken = agentCfg.AccessToken
+		}
+		if strings.TrimSpace(cfg.AuthURL) == "" {
+			cfg.AuthURL = agentCfg.AuthURL
+		}
+		if strings.TrimSpace(cfg.TokenURL) == "" {
+			cfg.TokenURL = agentCfg.TokenURL
+		}
+		if strings.TrimSpace(cfg.DeviceAuthURL) == "" {
+			cfg.DeviceAuthURL = agentCfg.DeviceAuthURL
+		}
+		if strings.TrimSpace(cfg.APIBaseURL) == "" {
+			cfg.APIBaseURL = agentCfg.APIBaseURL
+		}
+		return cfg, nil
+	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return &File{}, nil
