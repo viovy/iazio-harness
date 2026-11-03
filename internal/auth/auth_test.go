@@ -15,6 +15,7 @@ import (
 
 func TestGateBeforeCLI(t *testing.T) {
 	t.Setenv("IAZIO_HARNESS_CONFIG", t.TempDir()+"/missing.json")
+	t.Setenv("IAZIO_AGENT_CONFIG", t.TempDir()+"/missing-agent.json")
 	t.Setenv("IAZIO_HARNESS_NONINTERACTIVE", "1")
 	t.Setenv("INVOCATION_ID", "")
 	if err := GateBeforeCLI(); err == nil {
@@ -83,6 +84,7 @@ func TestStatus(t *testing.T) {
 	dir := t.TempDir()
 	missingFile := filepath.Join(dir, "missing.json")
 	t.Setenv("IAZIO_HARNESS_CONFIG", missingFile)
+	t.Setenv("IAZIO_AGENT_CONFIG", filepath.Join(dir, "missing-agent.json"))
 
 	st, err := Status()
 	if err != nil || st.RefreshPresent {
@@ -134,7 +136,10 @@ func TestStatus_AgentFallback(t *testing.T) {
 }
 
 func TestResolveEndpoints(t *testing.T) {
-	t.Setenv("IAZIO_HARNESS_CONFIG", t.TempDir()+"/none.json")
+	cfgFile := t.TempDir() + "/none.json"
+	t.Setenv("IAZIO_HARNESS_CONFIG", cfgFile)
+	t.Setenv("IAZIO_AGENT_CONFIG", t.TempDir()+"/none-agent.json")
+	t.Setenv("IAZIO_HARNESS_API_URL", "")
 	t.Setenv("IAZIO_AUTH_URL", "https://auth.example.com")
 	t.Setenv("IAZIO_TOKEN_URL", "https://token.example.com")
 	t.Setenv("IAZIO_DEVICE_AUTH_URL", "https://device.example.com")
@@ -145,6 +150,21 @@ func TestResolveEndpoints(t *testing.T) {
 	}
 	if ep.AuthURL != "https://auth.example.com" || ep.TokenURL != "https://token.example.com" || ep.DeviceAuthURL != "https://device.example.com" {
 		t.Errorf("endpoints mismatch: %+v", ep)
+	}
+
+	// Derive Hydra endpoints from SetAPIBaseURL when env vars are unset
+	t.Setenv("IAZIO_AUTH_URL", "")
+	t.Setenv("IAZIO_TOKEN_URL", "")
+	t.Setenv("IAZIO_DEVICE_AUTH_URL", "")
+	if err := SetAPIBaseURL("https://tian.go.ro/iazio-harness-api"); err != nil {
+		t.Fatalf("SetAPIBaseURL err: %v", err)
+	}
+	ep2, err := ResolveEndpoints()
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if ep2.AuthURL != "https://tian.go.ro/hydra/oauth2/auth" || ep2.TokenURL != "https://tian.go.ro/hydra/oauth2/token" {
+		t.Errorf("expected Hydra derived endpoints, got %+v", ep2)
 	}
 }
 
@@ -208,6 +228,8 @@ func TestLoginFlows(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "auth.json")
 	t.Setenv("IAZIO_HARNESS_CONFIG", cfgPath)
+	t.Setenv("IAZIO_AGENT_CONFIG", filepath.Join(dir, "none-agent.json"))
+	t.Setenv("IAZIO_HARNESS_API_URL", "")
 	t.Setenv("IAZIO_HARNESS_NONINTERACTIVE", "1")
 
 	// Noninteractive without token fails
@@ -341,6 +363,8 @@ func TestDeviceLogin(t *testing.T) {
 
 	cfgPath := filepath.Join(t.TempDir(), "harness.json")
 	t.Setenv("IAZIO_HARNESS_CONFIG", cfgPath)
+	t.Setenv("IAZIO_AGENT_CONFIG", filepath.Join(t.TempDir(), "none-agent.json"))
+	t.Setenv("IAZIO_HARNESS_API_URL", "")
 
 	ep := Endpoints{
 		DeviceAuthURL: ts.URL + "/device",
@@ -551,6 +575,9 @@ func TestDeviceLogin_ErrorCases(t *testing.T) {
 
 func TestInteractiveLogin_ErrorPaths(t *testing.T) {
 	ctx := context.Background()
+	t.Setenv("IAZIO_HARNESS_CONFIG", t.TempDir()+"/none.json")
+	t.Setenv("IAZIO_AGENT_CONFIG", t.TempDir()+"/none-agent.json")
+	t.Setenv("IAZIO_HARNESS_API_URL", "")
 
 	// ep with missing token url
 	t.Setenv("IAZIO_TOKEN_URL", "")

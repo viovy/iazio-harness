@@ -116,15 +116,35 @@ func run(args []string) error {
 	case "auth":
 		wantJSON := false
 		subcmd := ""
-		for _, a := range args[1:] {
-			if a == "--json" || a == "-json" {
+		var explicitURL string
+		rest := args[1:]
+		for i := 0; i < len(rest); i++ {
+			a := rest[i]
+			switch {
+			case a == "--json" || a == "-json":
 				wantJSON = true
-			} else if subcmd == "" && !strings.HasPrefix(a, "-") {
+			case a == "--url" || a == "-url":
+				if i+1 >= len(rest) {
+					return fmt.Errorf("%s requires a value", a)
+				}
+				i++
+				explicitURL = rest[i]
+			case strings.HasPrefix(a, "--url="):
+				explicitURL = strings.TrimPrefix(a, "--url=")
+			case strings.HasPrefix(a, "-url="):
+				explicitURL = strings.TrimPrefix(a, "-url=")
+			case subcmd == "" && !strings.HasPrefix(a, "-"):
 				subcmd = a
 			}
 		}
 		switch subcmd {
 		case "login":
+			if strings.TrimSpace(explicitURL) != "" {
+				if err := auth.SetAPIBaseURL(explicitURL); err != nil {
+					return fmt.Errorf("save --url: %w", err)
+				}
+				fmt.Printf("Configured API URL: %s (persisted to %s)\n", strings.TrimRight(strings.TrimSpace(explicitURL), "/"), auth.ConfigPath())
+			}
 			return auth.Login(context.Background())
 		case "logout":
 			if err := auth.Logout(); err != nil {

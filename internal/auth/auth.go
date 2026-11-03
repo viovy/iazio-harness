@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -24,6 +25,12 @@ import (
 
 // ClientID is the public OAuth client id for this binary.
 const ClientID = "iazio-harness-cli"
+
+// DefaultScope is the default OAuth2 scope requested for iazio-harness-cli.
+const DefaultScope = "openid offline_access profile email harness:read harness:write credentials:manage"
+
+// DefaultLoopbackPort is the pre-registered loopback callback port in Ory Hydra for iazio-harness-cli.
+const DefaultLoopbackPort = 8096
 
 // ErrNoRefreshToken is returned when a run or a noninteractive login has no stored refresh token.
 var ErrNoRefreshToken = errors.New("no refresh token")
@@ -58,9 +65,12 @@ type Endpoints struct {
 
 // Report is the redacted, offline auth status.
 type Report struct {
-	ConfigPath     string `json:"config_path"`
-	RefreshPresent bool   `json:"refresh_token_present"`
-	APIBaseURL     string `json:"api_base_url,omitempty"`
+	ConfigPath         string `json:"config_path"`
+	ClientID           string `json:"client_id,omitempty"`
+	RefreshPresent     bool   `json:"refresh_token_present"`
+	AccessTokenPresent bool   `json:"access_token_present,omitempty"`
+	TokenStatus        string `json:"token_status,omitempty"`
+	APIBaseURL         string `json:"api_base_url,omitempty"`
 }
 
 // String prints the config path and whether a refresh token is present.
@@ -71,8 +81,14 @@ func (r Report) String() string {
 		state = "present"
 	}
 	res := fmt.Sprintf("config: %s\nrefresh_token: %s\n", r.ConfigPath, state)
+	if r.ClientID != "" {
+		res += fmt.Sprintf("client_id: %s\n", r.ClientID)
+	}
 	if r.APIBaseURL != "" {
 		res += fmt.Sprintf("api_base_url: %s\n", r.APIBaseURL)
+	}
+	if r.TokenStatus != "" {
+		res += fmt.Sprintf("token: %s\n", r.TokenStatus)
 	}
 	return res
 }
@@ -101,6 +117,25 @@ func AgentConfigPath() string {
 	return home + "/.iazio/agent.json"
 }
 
+// SetAPIBaseURL validates and persists api_base_url into ConfigPath().
+func SetAPIBaseURL(rawURL string) error {
+	clean := strings.TrimSpace(rawURL)
+	u, err := url.Parse(clean)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("invalid --url %q: must be a valid HTTP or HTTPS URL", rawURL)
+	}
+	path := ConfigPath()
+	cfg, err := load(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		cfg = &File{}
+	}
+	cfg.APIBaseURL = clean
+	return save(path, cfg)
+}
+
 // IsNonInteractive reports whether this process must not open a browser or device prompt.
 // IAZIO_HARNESS_NONINTERACTIVE=1 or a non-empty INVOCATION_ID selects that mode.
 func IsNonInteractive() bool {
@@ -126,6 +161,28 @@ func GateBeforeCLI() error {
 	return fmt.Errorf("%w: run auth login", ErrNoRefreshToken)
 }
 
+func buildReport(path string, cfg *File) Report {
+	if cfg == nil {
+		cfg = &File{}
+	}
+	rep := Report{
+		ConfigPath:         path,
+		ClientID:           firstNonEmpty(cfg.ClientID, ClientID),
+		RefreshPresent:     strings.TrimSpace(cfg.RefreshToken) != "",
+		AccessTokenPresent: strings.TrimSpace(cfg.AccessToken) != "",
+		APIBaseURL:         strings.TrimSpace(cfg.APIBaseURL),
+	}
+	switch {
+	case accessUsable(cfg):
+		rep.TokenStatus = "available"
+	case rep.RefreshPresent:
+		rep.TokenStatus = "refresh_token present"
+	default:
+		rep.TokenStatus = "none — run `auth login`"
+	}
+	return rep
+}
+
 // Status reads the local file only. It does not call the network and does not return token bytes.
 func Status() (Report, error) {
 	path := ConfigPath()
@@ -134,29 +191,17 @@ func Status() (Report, error) {
 		if strings.TrimSpace(cfg.RefreshToken) == "" {
 			agentPath := AgentConfigPath()
 			if aCfg, aErr := load(agentPath); aErr == nil && strings.TrimSpace(aCfg.RefreshToken) != "" {
-				return Report{
-					ConfigPath:     agentPath,
-					RefreshPresent: true,
-					APIBaseURL:     aCfg.APIBaseURL,
-				}, nil
+				return buildReport(agentPath, aCfg), nil
 			}
 		}
-		return Report{
-			ConfigPath:     path,
-			RefreshPresent: strings.TrimSpace(cfg.RefreshToken) != "",
-			APIBaseURL:     cfg.APIBaseURL,
-		}, nil
+		return buildReport(path, cfg), nil
 	}
 	if errors.Is(err, os.ErrNotExist) {
 		agentPath := AgentConfigPath()
 		if aCfg, aErr := load(agentPath); aErr == nil {
-			return Report{
-				ConfigPath:     agentPath,
-				RefreshPresent: strings.TrimSpace(aCfg.RefreshToken) != "",
-				APIBaseURL:     aCfg.APIBaseURL,
-			}, nil
+			return buildReport(agentPath, aCfg), nil
 		}
-		return Report{ConfigPath: path}, nil
+		return buildReport(path, nil), nil
 	}
 	return Report{}, err
 }
@@ -196,16 +241,31 @@ func clearTokensInFile(path string) error {
 	return os.WriteFile(path, append(out, '\n'), 0600)
 }
 
-// ResolveEndpoints returns authorize, token, and device URLs from the environment, then the config file.
+func deriveHydraEndpointsFromAPI(apiBase string) (authURL, tokenURL, deviceURL string) {
+	raw := strings.TrimSpace(apiBase)
+	if raw == "" {
+		return "", "", ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", "", ""
+	}
+	base := u.Scheme + "://" + u.Host + "/hydra"
+	return base + "/oauth2/auth", base + "/oauth2/token", base + "/oauth2/fallbacks/device/code"
+}
+
+// ResolveEndpoints returns authorize, token, and device URLs from the environment, then the config file, or derived from api_base_url.
 func ResolveEndpoints() (Endpoints, error) {
 	cfg, err := loadOptional()
 	if err != nil {
 		return Endpoints{}, err
 	}
+	apiBase := firstNonEmpty(os.Getenv("IAZIO_HARNESS_API_URL"), os.Getenv("IAZIO_API_URL"), cfg.APIBaseURL)
+	derivedAuth, derivedToken, derivedDevice := deriveHydraEndpointsFromAPI(apiBase)
 	ep := Endpoints{
-		AuthURL:       firstNonEmpty(os.Getenv("IAZIO_AUTH_URL"), cfg.AuthURL),
-		TokenURL:      firstNonEmpty(os.Getenv("IAZIO_TOKEN_URL"), cfg.TokenURL),
-		DeviceAuthURL: firstNonEmpty(os.Getenv("IAZIO_DEVICE_AUTH_URL"), cfg.DeviceAuthURL),
+		AuthURL:       firstNonEmpty(os.Getenv("IAZIO_AUTH_URL"), cfg.AuthURL, derivedAuth),
+		TokenURL:      firstNonEmpty(os.Getenv("IAZIO_TOKEN_URL"), cfg.TokenURL, derivedToken),
+		DeviceAuthURL: firstNonEmpty(os.Getenv("IAZIO_DEVICE_AUTH_URL"), cfg.DeviceAuthURL, derivedDevice),
 	}
 	return ep, nil
 }
@@ -243,8 +303,9 @@ func Login(ctx context.Context) error {
 	if present, err := refreshPresent(); err != nil {
 		return err
 	} else if present {
-		_, err = Bearer(ctx)
-		return err
+		if _, err = Bearer(ctx); err == nil {
+			return nil
+		}
 	}
 	return interactiveLogin(ctx)
 }
@@ -263,7 +324,7 @@ func interactiveLogin(ctx context.Context) error {
 	if ep.AuthURL == "" {
 		return fmt.Errorf("%w: auth", ErrEndpointRequired)
 	}
-	if err := loopbackLogin(ctx, ep); err != nil && ep.DeviceAuthURL != "" {
+	if err := loopbackLogin(ctx, ep); err != nil && ep.DeviceAuthURL != "" && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		return deviceLogin(ctx, ep)
 	} else {
 		return err
@@ -289,11 +350,17 @@ func loadOptional() (*File, error) {
 		if cfg == nil {
 			return agentCfg, nil
 		}
-		if strings.TrimSpace(cfg.RefreshToken) == "" {
+		if strings.TrimSpace(cfg.RefreshToken) == "" && strings.TrimSpace(agentCfg.RefreshToken) != "" {
 			cfg.RefreshToken = agentCfg.RefreshToken
+			if strings.TrimSpace(agentCfg.ClientID) != "" {
+				cfg.ClientID = agentCfg.ClientID
+			}
 		}
 		if strings.TrimSpace(cfg.AccessToken) == "" {
 			cfg.AccessToken = agentCfg.AccessToken
+			if strings.TrimSpace(cfg.Expiry) == "" {
+				cfg.Expiry = agentCfg.Expiry
+			}
 		}
 		if strings.TrimSpace(cfg.AuthURL) == "" {
 			cfg.AuthURL = agentCfg.AuthURL
@@ -342,7 +409,7 @@ func save(path string, cfg *File) error {
 		return err
 	}
 	b = append(b, '\n')
-	dir := dirOf(path)
+	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
@@ -352,7 +419,11 @@ func save(path string, cfg *File) error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(path)
+		return os.Rename(tmp, path)
+	}
+	return nil
 }
 
 func dirOf(path string) string {
@@ -403,15 +474,17 @@ func refresh(ctx context.Context, path string, cfg *File) (string, error) {
 	if ep.TokenURL == "" {
 		return "", fmt.Errorf("%w: token", ErrEndpointRequired)
 	}
+	clientID := firstNonEmpty(cfg.ClientID, ClientID)
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", cfg.RefreshToken)
-	form.Set("client_id", ClientID)
+	form.Set("client_id", clientID)
 	tok, err := postForm(ctx, ep.TokenURL, form)
 	if err != nil {
 		return "", err
 	}
 	applyToken(cfg, tok)
+	cfg.ClientID = clientID
 	cfg.AuthURL = firstNonEmpty(cfg.AuthURL, ep.AuthURL)
 	cfg.TokenURL = firstNonEmpty(cfg.TokenURL, ep.TokenURL)
 	cfg.DeviceAuthURL = firstNonEmpty(cfg.DeviceAuthURL, ep.DeviceAuthURL)
@@ -468,6 +541,9 @@ func postForm(ctx context.Context, endpoint string, form url.Values) (tokenRespo
 }
 
 func loopbackLogin(ctx context.Context, ep Endpoints) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	verifier, challenge, err := newPKCE()
 	if err != nil {
 		return err
@@ -476,9 +552,12 @@ func loopbackLogin(ctx context.Context, ep Endpoints) error {
 	if err != nil {
 		return err
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", DefaultLoopbackPort))
 	if err != nil {
-		return err
+		ln, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return err
+		}
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	redirect := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
@@ -555,7 +634,7 @@ func AuthorizeURL(ep Endpoints, redirect, state, challenge string) (string, erro
 	q.Set("state", state)
 	q.Set("code_challenge", challenge)
 	q.Set("code_challenge_method", "S256")
-	q.Set("scope", "offline_access openid profile")
+	q.Set("scope", DefaultScope)
 	u.RawQuery = q.Encode()
 	return u.String(), nil
 }
@@ -563,7 +642,7 @@ func AuthorizeURL(ep Endpoints, redirect, state, challenge string) (string, erro
 func deviceLogin(ctx context.Context, ep Endpoints) error {
 	form := url.Values{}
 	form.Set("client_id", ClientID)
-	form.Set("scope", "offline_access openid profile")
+	form.Set("scope", DefaultScope)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.DeviceAuthURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
