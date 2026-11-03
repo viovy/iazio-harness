@@ -15,6 +15,7 @@ import (
 
 func TestGateBeforeCLI(t *testing.T) {
 	t.Setenv("IAZIO_HARNESS_CONFIG", t.TempDir()+"/missing.json")
+	t.Setenv("IAZIO_AGENT_CONFIG", t.TempDir()+"/missing-agent.json")
 	t.Setenv("IAZIO_HARNESS_NONINTERACTIVE", "1")
 	t.Setenv("INVOCATION_ID", "")
 	if err := GateBeforeCLI(); err == nil {
@@ -83,6 +84,7 @@ func TestStatus(t *testing.T) {
 	dir := t.TempDir()
 	missingFile := filepath.Join(dir, "missing.json")
 	t.Setenv("IAZIO_HARNESS_CONFIG", missingFile)
+	t.Setenv("IAZIO_AGENT_CONFIG", filepath.Join(dir, "missing-agent.json"))
 
 	st, err := Status()
 	if err != nil || st.RefreshPresent {
@@ -134,7 +136,10 @@ func TestStatus_AgentFallback(t *testing.T) {
 }
 
 func TestResolveEndpoints(t *testing.T) {
-	t.Setenv("IAZIO_HARNESS_CONFIG", t.TempDir()+"/none.json")
+	cfgFile := t.TempDir() + "/none.json"
+	t.Setenv("IAZIO_HARNESS_CONFIG", cfgFile)
+	t.Setenv("IAZIO_AGENT_CONFIG", t.TempDir()+"/none-agent.json")
+	t.Setenv("IAZIO_HARNESS_API_URL", "")
 	t.Setenv("IAZIO_AUTH_URL", "https://auth.example.com")
 	t.Setenv("IAZIO_TOKEN_URL", "https://token.example.com")
 	t.Setenv("IAZIO_DEVICE_AUTH_URL", "https://device.example.com")
@@ -145,6 +150,21 @@ func TestResolveEndpoints(t *testing.T) {
 	}
 	if ep.AuthURL != "https://auth.example.com" || ep.TokenURL != "https://token.example.com" || ep.DeviceAuthURL != "https://device.example.com" {
 		t.Errorf("endpoints mismatch: %+v", ep)
+	}
+
+	// Derive Hydra endpoints from SetAPIBaseURL when env vars are unset
+	t.Setenv("IAZIO_AUTH_URL", "")
+	t.Setenv("IAZIO_TOKEN_URL", "")
+	t.Setenv("IAZIO_DEVICE_AUTH_URL", "")
+	if err := SetAPIBaseURL("https://tian.go.ro/iazio-harness-api"); err != nil {
+		t.Fatalf("SetAPIBaseURL err: %v", err)
+	}
+	ep2, err := ResolveEndpoints()
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if ep2.AuthURL != "https://tian.go.ro/hydra/oauth2/auth" || ep2.TokenURL != "https://tian.go.ro/hydra/oauth2/token" {
+		t.Errorf("expected Hydra derived endpoints, got %+v", ep2)
 	}
 }
 
@@ -208,6 +228,8 @@ func TestLoginFlows(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "auth.json")
 	t.Setenv("IAZIO_HARNESS_CONFIG", cfgPath)
+	t.Setenv("IAZIO_AGENT_CONFIG", filepath.Join(dir, "none-agent.json"))
+	t.Setenv("IAZIO_HARNESS_API_URL", "")
 	t.Setenv("IAZIO_HARNESS_NONINTERACTIVE", "1")
 
 	// Noninteractive without token fails
@@ -341,6 +363,8 @@ func TestDeviceLogin(t *testing.T) {
 
 	cfgPath := filepath.Join(t.TempDir(), "harness.json")
 	t.Setenv("IAZIO_HARNESS_CONFIG", cfgPath)
+	t.Setenv("IAZIO_AGENT_CONFIG", filepath.Join(t.TempDir(), "none-agent.json"))
+	t.Setenv("IAZIO_HARNESS_API_URL", "")
 
 	ep := Endpoints{
 		DeviceAuthURL: ts.URL + "/device",
@@ -382,6 +406,90 @@ func TestLoopbackLogin_Cancel(t *testing.T) {
 	err := loopbackLogin(ctx, ep)
 	if err == nil {
 		t.Errorf("expected context canceled error")
+	}
+}
+
+func TestLoopbackLogin_FullAndErrorCases(t *testing.T) {
+	origOpener := BrowserOpener
+	defer func() { BrowserOpener = origOpener }()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(tokenResponse{
+			AccessToken:  "loopback-at",
+			RefreshToken: "loopback-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+		})
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "harness.json")
+	t.Setenv("IAZIO_HARNESS_CONFIG", cfgFile)
+	t.Setenv("IAZIO_AGENT_CONFIG", filepath.Join(dir, "agent.json"))
+
+	ep := Endpoints{
+		AuthURL:  "https://tian.go.ro/hydra/oauth2/auth",
+		TokenURL: ts.URL + "/token",
+	}
+
+	// 1. Success callback
+	BrowserOpener = func(rawAuthURL string) error {
+		u, _ := url.Parse(rawAuthURL)
+		redir := u.Query().Get("redirect_uri")
+		st := u.Query().Get("state")
+		go func() {
+			_, _ = http.Get(strings.TrimSuffix(redir, "/callback") + "/other")
+			resp, err := http.Get(redir + "?state=" + url.QueryEscape(st) + "&code=ok-code")
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+		}()
+		return nil
+	}
+	if err := loopbackLogin(context.Background(), ep); err != nil {
+		t.Fatalf("loopbackLogin success case failed: %v", err)
+	}
+
+	// 2. State mismatch, oauth error, missing code
+	for _, q := range []string{"state=bad", "error=access_denied", "missing_code"} {
+		BrowserOpener = func(rawAuthURL string) error {
+			u, _ := url.Parse(rawAuthURL)
+			redir := u.Query().Get("redirect_uri")
+			st := u.Query().Get("state")
+			target := redir + "?" + q
+			if q == "error=access_denied" {
+				target = redir + "?state=" + url.QueryEscape(st) + "&error=access_denied"
+			} else if q == "missing_code" {
+				target = redir + "?state=" + url.QueryEscape(st)
+			}
+			go func() {
+				resp, err := http.Get(target)
+				if err == nil {
+					_ = resp.Body.Close()
+				}
+			}()
+			return nil
+		}
+		if err := loopbackLogin(context.Background(), ep); err == nil {
+			t.Fatalf("expected error for %s", q)
+		}
+	}
+
+	// 3. SetAPIBaseURL invalid URL and Report.String fields
+	if err := SetAPIBaseURL("://bad"); err == nil {
+		t.Fatal("expected error for invalid URL")
+	}
+	rep := Report{
+		ConfigPath:     cfgFile,
+		ClientID:       ClientID,
+		RefreshPresent: true,
+		APIBaseURL:     "https://tian.go.ro/iazio-harness-api",
+		TokenStatus:    "available",
+	}
+	if !strings.Contains(rep.String(), "api_base_url:") || !strings.Contains(rep.String(), "token:") {
+		t.Fatalf("unexpected Report.String(): %s", rep.String())
 	}
 }
 
@@ -551,6 +659,9 @@ func TestDeviceLogin_ErrorCases(t *testing.T) {
 
 func TestInteractiveLogin_ErrorPaths(t *testing.T) {
 	ctx := context.Background()
+	t.Setenv("IAZIO_HARNESS_CONFIG", t.TempDir()+"/none.json")
+	t.Setenv("IAZIO_AGENT_CONFIG", t.TempDir()+"/none-agent.json")
+	t.Setenv("IAZIO_HARNESS_API_URL", "")
 
 	// ep with missing token url
 	t.Setenv("IAZIO_TOKEN_URL", "")
