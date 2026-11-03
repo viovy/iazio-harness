@@ -409,6 +409,90 @@ func TestLoopbackLogin_Cancel(t *testing.T) {
 	}
 }
 
+func TestLoopbackLogin_FullAndErrorCases(t *testing.T) {
+	origOpener := BrowserOpener
+	defer func() { BrowserOpener = origOpener }()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(tokenResponse{
+			AccessToken:  "loopback-at",
+			RefreshToken: "loopback-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+		})
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "harness.json")
+	t.Setenv("IAZIO_HARNESS_CONFIG", cfgFile)
+	t.Setenv("IAZIO_AGENT_CONFIG", filepath.Join(dir, "agent.json"))
+
+	ep := Endpoints{
+		AuthURL:  "https://tian.go.ro/hydra/oauth2/auth",
+		TokenURL: ts.URL + "/token",
+	}
+
+	// 1. Success callback
+	BrowserOpener = func(rawAuthURL string) error {
+		u, _ := url.Parse(rawAuthURL)
+		redir := u.Query().Get("redirect_uri")
+		st := u.Query().Get("state")
+		go func() {
+			_, _ = http.Get(strings.TrimSuffix(redir, "/callback") + "/other")
+			resp, err := http.Get(redir + "?state=" + url.QueryEscape(st) + "&code=ok-code")
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+		}()
+		return nil
+	}
+	if err := loopbackLogin(context.Background(), ep); err != nil {
+		t.Fatalf("loopbackLogin success case failed: %v", err)
+	}
+
+	// 2. State mismatch, oauth error, missing code
+	for _, q := range []string{"state=bad", "error=access_denied", "missing_code"} {
+		BrowserOpener = func(rawAuthURL string) error {
+			u, _ := url.Parse(rawAuthURL)
+			redir := u.Query().Get("redirect_uri")
+			st := u.Query().Get("state")
+			target := redir + "?" + q
+			if q == "error=access_denied" {
+				target = redir + "?state=" + url.QueryEscape(st) + "&error=access_denied"
+			} else if q == "missing_code" {
+				target = redir + "?state=" + url.QueryEscape(st)
+			}
+			go func() {
+				resp, err := http.Get(target)
+				if err == nil {
+					_ = resp.Body.Close()
+				}
+			}()
+			return nil
+		}
+		if err := loopbackLogin(context.Background(), ep); err == nil {
+			t.Fatalf("expected error for %s", q)
+		}
+	}
+
+	// 3. SetAPIBaseURL invalid URL and Report.String fields
+	if err := SetAPIBaseURL("://bad"); err == nil {
+		t.Fatal("expected error for invalid URL")
+	}
+	rep := Report{
+		ConfigPath:     cfgFile,
+		ClientID:       ClientID,
+		RefreshPresent: true,
+		APIBaseURL:     "https://tian.go.ro/iazio-harness-api",
+		TokenStatus:    "available",
+	}
+	if !strings.Contains(rep.String(), "api_base_url:") || !strings.Contains(rep.String(), "token:") {
+		t.Fatalf("unexpected Report.String(): %s", rep.String())
+	}
+}
+
 func TestAuthHelpers_Comprehensive(t *testing.T) {
 	// 1. randomString and newPKCE
 	rStr, err := randomString(16)

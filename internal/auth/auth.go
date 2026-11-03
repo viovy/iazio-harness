@@ -43,6 +43,9 @@ const accessSkew = 60 * time.Second
 // HTTPClient is the client used for token requests. Tests may replace it.
 var HTTPClient = http.DefaultClient
 
+// BrowserOpener opens the given URL in the user's browser. Tests may replace it.
+var BrowserOpener = openBrowser
+
 // File is the on-disk harness client configuration.
 type File struct {
 	ClientID      string `json:"client_id,omitempty"`
@@ -598,7 +601,11 @@ func loopbackLogin(ctx context.Context, ep Endpoints) error {
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
 	}()
-	if err := openBrowser(authURL); err != nil {
+	opener := BrowserOpener
+	if opener == nil {
+		opener = openBrowser
+	}
+	if err := opener(authURL); err != nil {
 		fmt.Fprintf(os.Stderr, "Open this URL to log in:\n%s\n", authURL)
 	}
 	var code string
