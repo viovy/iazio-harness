@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -20,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/ase/gate"
@@ -52,6 +54,17 @@ var (
 )
 
 func main() {
+	// Ignore SIGPIPE so multi-day executions never terminate if parent iazio-agent self-restarts and closes stdout/stderr pipes.
+	signal.Ignore(syscall.SIGPIPE)
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 8192)
+			n := runtime.Stack(buf, false)
+			_, _ = fmt.Fprintf(os.Stderr, "[iazio-harness] PANIC RECOVERED: %v\n%s\n", r, string(buf[:n]))
+			os.Exit(1)
+		}
+	}()
+
 	flushTracer := telemetry.InitGlobalTracer("iazio-harness", "")
 	defer flushTracer()
 

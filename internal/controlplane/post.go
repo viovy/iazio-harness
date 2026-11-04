@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/auth"
 )
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
@@ -46,6 +48,11 @@ func IsTransientError(err error) bool {
 }
 
 func doPostWithRetry(ctx context.Context, url, token string, raw []byte, opName string) error {
+	if strings.TrimSpace(token) == "" {
+		if bTok, bErr := auth.Bearer(ctx); bErr == nil && strings.TrimSpace(bTok) != "" {
+			token = strings.TrimSpace(bTok)
+		}
+	}
 	backoff := DefaultInitialBackoff
 	var lastErr error
 	for attempt := 0; attempt <= DefaultMaxRetries; attempt++ {
@@ -69,6 +76,12 @@ func doPostWithRetry(ctx context.Context, url, token string, raw []byte, opName 
 				return nil
 			}
 			lastErr = fmt.Errorf("%s: %s", opName, resp.Status)
+			if resp.StatusCode == http.StatusUnauthorized && attempt < DefaultMaxRetries {
+				if refreshed, rErr := auth.Bearer(ctx); rErr == nil && strings.TrimSpace(refreshed) != "" && strings.TrimSpace(refreshed) != token {
+					token = strings.TrimSpace(refreshed)
+					continue
+				}
+			}
 			if !IsTransientStatus(resp.StatusCode) || attempt == DefaultMaxRetries {
 				return lastErr
 			}
@@ -123,6 +136,47 @@ func PostTick(ctx context.Context, baseURL, token, jobID string, silentForMs int
 		return err
 	}
 	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/v1/jobs/"+jobID+"/chunks", token, raw, "tick post")
+}
+
+// JobHeartbeatOptions specifies the lease heartbeat and runtime telemetry sent to /api/v1/agent/jobs/{id}/heartbeat.
+type JobHeartbeatOptions struct {
+	FencingToken         int64  `json:"fencing_token"`
+	LeaseToken           string `json:"lease_token,omitempty"`
+	StoryID              string `json:"story_id,omitempty"`
+	WorktreePath         string `json:"worktree_path,omitempty"`
+	Repo                 string `json:"repo,omitempty"`
+	AgentPID             int    `json:"agent_pid,omitempty"`
+	ToolPID              int    `json:"tool_pid,omitempty"`
+	ActiveConversationID string `json:"active_conversation_id,omitempty"`
+	ElapsedSeconds       int64  `json:"elapsed_seconds,omitempty"`
+}
+
+// PostJobHeartbeat directly extends the job execution lease at /api/v1/agent/jobs/{id}/heartbeat while the tool agent process is alive.
+func PostJobHeartbeat(ctx context.Context, baseURL, token, jobID string, opts JobHeartbeatOptions) error {
+	raw, err := json.Marshal(opts)
+	if err != nil {
+		return err
+	}
+	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/api/v1/agent/jobs/"+jobID+"/heartbeat", token, raw, "job heartbeat post")
+}
+
+// PostAgentJobComplete directly reports job completion or failure to /api/v1/agent/jobs/{id}/complete.
+// This acts as a fail-safe completion path when an edge iazio-agent supervisor restarts during a multi-day run.
+func PostAgentJobComplete(ctx context.Context, baseURL, token, jobID string, fencingToken int64, result any, errMsg string) error {
+	payload := map[string]any{
+		"fencing_token": fencingToken,
+	}
+	if result != nil {
+		payload["result"] = result
+	}
+	if strings.TrimSpace(errMsg) != "" {
+		payload["error"] = strings.TrimSpace(errMsg)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return doPostWithRetry(ctx, strings.TrimRight(baseURL, "/")+"/api/v1/agent/jobs/"+jobID+"/complete", token, raw, "agent job complete post")
 }
 
 // PostConversation registers an early or streamed conversation ID with the control plane.

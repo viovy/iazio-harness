@@ -18,22 +18,25 @@ import (
 
 // PromptPayload represents the structured JSON input received from iazio-agent.
 type PromptPayload struct {
-	PromptID         string `json:"prompt_id"`
-	JobID            string `json:"job_id,omitempty"`
-	APIURL           string `json:"api_url,omitempty"`
-	Token            string `json:"token,omitempty"`
-	FencingToken     int64  `json:"fencing_token,omitempty"`
-	StoryID          string `json:"story_id,omitempty"`
-	Repo             string `json:"repo"`
-	WorktreePath     string `json:"worktree_path,omitempty"`
-	Submodule        string `json:"submodule,omitempty"`
-	Branch           string `json:"branch,omitempty"`
-	Title            string `json:"title,omitempty"`
-	Prompt           string `json:"prompt"`
-	NormalizedPrompt string `json:"normalized_prompt,omitempty"`
-	TargetAgent      string `json:"target_agent,omitempty"`
-	TimeoutSeconds   int    `json:"timeout_seconds,omitempty"`
-	TraceID          string `json:"trace_id,omitempty"`
+	PromptID             string `json:"prompt_id"`
+	JobID                string `json:"job_id,omitempty"`
+	APIURL               string `json:"api_url,omitempty"`
+	Token                string `json:"token,omitempty"`
+	LeaseToken           string `json:"lease_token,omitempty"`
+	FencingToken         int64  `json:"fencing_token,omitempty"`
+	ResumeConversationID string `json:"resume_conversation_id,omitempty"`
+	ConversationID       string `json:"conversation_id,omitempty"`
+	StoryID              string `json:"story_id,omitempty"`
+	Repo                 string `json:"repo"`
+	WorktreePath         string `json:"worktree_path,omitempty"`
+	Submodule            string `json:"submodule,omitempty"`
+	Branch               string `json:"branch,omitempty"`
+	Title                string `json:"title,omitempty"`
+	Prompt               string `json:"prompt"`
+	NormalizedPrompt     string `json:"normalized_prompt,omitempty"`
+	TargetAgent          string `json:"target_agent,omitempty"`
+	TimeoutSeconds       int    `json:"timeout_seconds,omitempty"`
+	TraceID              string `json:"trace_id,omitempty"`
 }
 
 // Executor coordinates submodule resolution, workspace file locking, and execution delegation.
@@ -159,21 +162,27 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 		payload.Prompt = prepRes.Prompt
 	}
 
+	resumeConvID := strings.TrimSpace(payload.ResumeConversationID)
+	if resumeConvID == "" {
+		resumeConvID = strings.TrimSpace(payload.ConversationID)
+	}
 	opts := autopilot.RunPromptOptions{
-		PromptID:     payload.PromptID,
-		JobID:        strings.TrimSpace(payload.JobID),
-		APIURL:       strings.TrimSpace(payload.APIURL),
-		Token:        strings.TrimSpace(payload.Token),
-		FencingToken: payload.FencingToken,
-		StoryID:      payload.StoryID,
-		Repo:        payload.Repo,
-		Branch:      strings.TrimSpace(payload.Branch),
-		Title:       payload.Title,
-		Prompt:      payload.Prompt,
-		TargetAgent: payload.TargetAgent,
-		WorkingDir:  workingDir,
-		TraceID:     payload.TraceID,
-		Timeout:     timeout,
+		PromptID:             payload.PromptID,
+		JobID:                strings.TrimSpace(payload.JobID),
+		APIURL:               strings.TrimSpace(payload.APIURL),
+		Token:                strings.TrimSpace(payload.Token),
+		LeaseToken:           strings.TrimSpace(payload.LeaseToken),
+		FencingToken:         payload.FencingToken,
+		ResumeConversationID: resumeConvID,
+		StoryID:              payload.StoryID,
+		Repo:                 payload.Repo,
+		Branch:               strings.TrimSpace(payload.Branch),
+		Title:                payload.Title,
+		Prompt:               payload.Prompt,
+		TargetAgent:          payload.TargetAgent,
+		WorkingDir:           workingDir,
+		TraceID:              payload.TraceID,
+		Timeout:              timeout,
 	}
 
 	result, err := e.runner.RunPrompt(ctx, opts)

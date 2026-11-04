@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/viovy/iazio-harness/internal/auth"
 	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/procutil"
@@ -45,14 +46,30 @@ func isPointerStoryID(sid string) bool {
 
 const (
 	// DefaultPromptTimeout is the default execution window for long-running agentic prompts (7 days).
-	DefaultPromptTimeout         = 7 * 24 * time.Hour
-	defaultPromptTimeout         = DefaultPromptTimeout
-	defaultGracePeriod           = 5 * time.Second
-	defaultBackgroundDrainGrace  = 60 * time.Second
-	defaultMaxAutoResumeAttempts = 3
-	geminiDirName                = ".gemini"
-	agyCliDirName                = "antigravity-cli"
+	DefaultPromptTimeout            = 7 * 24 * time.Hour
+	defaultPromptTimeout            = DefaultPromptTimeout
+	defaultGracePeriod              = 5 * time.Second
+	defaultBackgroundDrainGrace     = 60 * time.Second
+	defaultMaxAutoResumeAttempts    = 3
+	defaultASEMaxAutoResumeAttempts = 16
+	geminiDirName                   = ".gemini"
+	agyCliDirName                   = "antigravity-cli"
 )
+
+func isPromptRunnerTestBinary() bool {
+	for _, arg := range os.Args {
+		if strings.HasPrefix(arg, "-test.") {
+			return true
+		}
+	}
+	if len(os.Args) > 0 {
+		base := strings.ToLower(filepath.Base(os.Args[0]))
+		if strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe") {
+			return true
+		}
+	}
+	return false
+}
 
 // ResolveDefaultPromptTimeout returns the default prompt timeout, honoring IAZIO_PROMPT_TIMEOUT_SECONDS when set to a positive integer.
 func ResolveDefaultPromptTimeout() time.Duration {
@@ -88,7 +105,9 @@ type RunPromptOptions struct {
 	JobID                      string        `json:"job_id,omitempty"`
 	APIURL                     string        `json:"api_url,omitempty"`
 	Token                      string        `json:"token,omitempty"`
+	LeaseToken                 string        `json:"lease_token,omitempty"`
 	FencingToken               int64         `json:"fencing_token,omitempty"`
+	ResumeConversationID       string        `json:"resume_conversation_id,omitempty"`
 	StoryID                    string        `json:"story_id,omitempty"`
 	Repo                       string        `json:"repo"`
 	Branch                     string        `json:"branch,omitempty"`
@@ -101,6 +120,21 @@ type RunPromptOptions struct {
 	GracePeriod                time.Duration `json:"grace_period,omitempty"`
 	BackgroundDrainGracePeriod time.Duration `json:"background_drain_grace_period,omitempty"`
 	MaxAutoResumeAttempts      *int          `json:"max_auto_resume_attempts,omitempty"`
+}
+
+func resolvePromptAuthToken(ctx context.Context, explicit string) string {
+	if tok := strings.TrimSpace(explicit); tok != "" {
+		return tok
+	}
+	for _, k := range []string{"IAZIO_HARNESS_TOKEN", "IAZIO_AGENT_TOKEN", "IAZIO_AUTH_TOKEN"} {
+		if tok := strings.TrimSpace(os.Getenv(k)); tok != "" {
+			return tok
+		}
+	}
+	if tok, err := auth.Bearer(ctx); err == nil && strings.TrimSpace(tok) != "" {
+		return strings.TrimSpace(tok)
+	}
+	return ""
 }
 
 func hasHeadlessPermissionDenial(text string) bool {
@@ -871,6 +905,9 @@ func (r *CLIPromptRunner) resolveMaxAutoResumeAttempts(opts RunPromptOptions) in
 			return n
 		}
 	}
+	if strings.Contains(opts.Prompt, "/autonomous-story-execution") || strings.TrimSpace(opts.StoryID) != "" {
+		return defaultASEMaxAutoResumeAttempts
+	}
 	return defaultMaxAutoResumeAttempts
 }
 
@@ -968,9 +1005,25 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	if apiURL == "" {
 		apiURL = strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_URL"))
 	}
-	token := strings.TrimSpace(opts.Token)
-	if token == "" {
-		token = strings.TrimSpace(os.Getenv("IAZIO_HARNESS_TOKEN"))
+	resolveToken := func() string {
+		return resolvePromptAuthToken(ctx, opts.Token)
+	}
+	token := resolveToken()
+	fencingToken := opts.FencingToken
+	if fencingToken == 0 {
+		if rawFT := strings.TrimSpace(os.Getenv("IAZIO_FENCING_TOKEN")); rawFT != "" {
+			if parsedFT, errFT := strconv.ParseInt(rawFT, 10, 64); errFT == nil {
+				fencingToken = parsedFT
+			}
+		}
+	}
+	leaseToken := strings.TrimSpace(opts.LeaseToken)
+	if leaseToken == "" {
+		leaseToken = strings.TrimSpace(os.Getenv("IAZIO_LEASE_TOKEN"))
+	}
+	initialResumeConv := strings.TrimSpace(opts.ResumeConversationID)
+	if initialResumeConv == "" {
+		initialResumeConv = strings.TrimSpace(os.Getenv("IAZIO_RESUME_CONVERSATION_ID"))
 	}
 	targetBranch := strings.TrimSpace(opts.Branch)
 	traceID := opts.TraceID
@@ -1001,7 +1054,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	var stdoutBuf, stderrBuf, transcriptBuf bytes.Buffer
 	lastOutAt := startTime
 	streamedAny := false
-	detectedConvID := ""
+	detectedConvID := initialResumeConv
 	boundStoryID := storyID
 	var storyTitle, storyPath string
 	postedStoryID := ""
@@ -1029,8 +1082,111 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		}
 		streamMu.Unlock()
 		if jobID != "" && apiURL != "" {
-			_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", msg)
+			_ = controlplane.PostChunk(ctx, apiURL, resolveToken(), jobID, "stdout", msg)
 		}
+	}
+
+	initialParentPID := os.Getppid()
+	var localWatchdog *watchdog.Watchdog
+	wdFile := strings.TrimSpace(os.Getenv("IAZIO_HARNESS_WATCHDOG_FILE"))
+	if jobID != "" && (!isPromptRunnerTestBinary() || wdFile != "") {
+		statusFile := ""
+		if wdFile != "" {
+			statusFile = wdFile + ".status"
+		}
+		localWatchdog = watchdog.New(watchdog.Options{
+			StateFile:  wdFile,
+			StatusFile: statusFile,
+		})
+	}
+
+	syncLocalWatchdogAndLiveness := func(toolPID int, activeConv, activeStory, status string, exitCode int, errMsg string) {
+		if jobID == "" {
+			return
+		}
+		if localWatchdog != nil {
+			switch status {
+			case watchdog.StatusCompleted:
+				localWatchdog.Complete(jobID, exitCode)
+			case watchdog.StatusFailed:
+				localWatchdog.Fail(jobID, exitCode, errMsg)
+			default:
+				localWatchdog.Track(watchdog.TrackedJob{
+					JobID:          jobID,
+					WorktreePath:   opts.WorkingDir,
+					APIURL:         apiURL,
+					Engine:         effectiveAgent,
+					Prompt:         opts.Prompt,
+					StoryID:        activeStory,
+					ConversationID: activeConv,
+					PID:            os.Getpid(),
+					HarnessPID:     os.Getpid(),
+					ToolPID:        toolPID,
+					StartedAt:      startTime.UTC(),
+					Status:         watchdog.StatusRunning,
+				})
+			}
+		}
+
+		liveDir := strings.TrimSpace(os.Getenv("IAZIO_LIVENESS_DIR"))
+		if liveDir == "" && !isPromptRunnerTestBinary() {
+			if home, errH := os.UserHomeDir(); errH == nil && home != "" {
+				liveDir = filepath.Join(home, ".iazio", "liveness")
+			}
+		}
+		if liveDir == "" {
+			return
+		}
+		streamMu.Lock()
+		lastOut := lastOutAt
+		streamMu.Unlock()
+		nowUTC := time.Now().UTC()
+		lastEvent := lastOut.UTC()
+		if status != watchdog.StatusRunning || time.Since(lastOut) < 30*time.Second || (toolPID > 0 && len(engines.FindChildProcesses(toolPID)) > 0) {
+			lastEvent = nowUTC
+		}
+		if errM := os.MkdirAll(liveDir, 0o755); errM != nil {
+			return
+		}
+		rec := map[string]any{
+			"job_id":          jobID,
+			"conversation_id": strings.TrimSpace(activeConv),
+			"story_id":        strings.TrimSpace(activeStory),
+			"harness_pid":     os.Getpid(),
+			"tool_pid":        toolPID,
+			"status":          status,
+			"exit_code":       exitCode,
+			"last_event_time": lastEvent,
+			"updated_at":      nowUTC,
+		}
+		if strings.TrimSpace(errMsg) != "" {
+			rec["last_error"] = strings.TrimSpace(errMsg)
+		}
+		if b, errJ := json.Marshal(rec); errJ == nil {
+			_ = os.WriteFile(filepath.Join(liveDir, jobID+".json"), b, 0o644)
+			cleanConv := strings.TrimPrefix(strings.TrimSpace(activeConv), "agy-")
+			if cleanConv != "" {
+				_ = os.WriteFile(filepath.Join(liveDir, cleanConv+".json"), b, 0o644)
+			}
+		}
+	}
+
+	emitJobHeartbeat := func(toolPID int, activeConv, activeStory string) {
+		syncLocalWatchdogAndLiveness(toolPID, activeConv, activeStory, watchdog.StatusRunning, 0, "")
+		if jobID == "" || apiURL == "" {
+			return
+		}
+		_ = controlplane.PostJobHeartbeat(ctx, apiURL, resolveToken(), jobID, controlplane.JobHeartbeatOptions{
+			FencingToken:         fencingToken,
+			LeaseToken:           leaseToken,
+			StoryID:              activeStory,
+			WorktreePath:         opts.WorkingDir,
+			Repo:                 opts.Repo,
+			AgentPID:             os.Getpid(),
+			ToolPID:              toolPID,
+			ActiveConversationID: activeConv,
+			ElapsedSeconds:       int64(time.Since(startTime).Seconds()),
+		})
 	}
 
 	// Capture pre-execution Git state
@@ -1116,6 +1272,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 			streamMu.Lock()
 			storyLabel := boundStoryID
+			activeConv := detectedConvID
 			streamMu.Unlock()
 			if storyLabel == "" {
 				storyLabel = "pending-allocation"
@@ -1124,10 +1281,17 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				"[%s] [ASE-SUPERVISOR] Starting prompt execution for Job %s (HarnessPID=%d, ToolPID=%d, Agent=%s, Story=%s, Worktree=%s)\n[%s] [ASE-SUPERVISOR] Prompt: %s\n",
 				tsStr, jobID, os.Getpid(), toolPID, effectiveAgent, storyLabel, opts.WorkingDir, tsStr, redact.Egress(promptPreview),
 			)
-			_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", banner)
-			_ = controlplane.PostTick(ctx, apiURL, token, jobID, 0, os.Getpid(), toolPID, int(time.Since(startTime).Seconds()))
+			tok := resolveToken()
+			_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", banner)
+			_ = controlplane.PostTick(ctx, apiURL, tok, jobID, 0, os.Getpid(), toolPID, int(time.Since(startTime).Seconds()))
+			emitJobHeartbeat(toolPID, activeConv, boundStoryID)
 		} else if isResumeTurn && jobID != "" && apiURL != "" {
-			_ = controlplane.PostTick(ctx, apiURL, token, jobID, 0, os.Getpid(), toolPID, int(time.Since(startTime).Seconds()))
+			tok := resolveToken()
+			if resumeConvID != "" {
+				_ = controlplane.PostConversation(ctx, apiURL, tok, jobID, resumeConvID)
+			}
+			_ = controlplane.PostTick(ctx, apiURL, tok, jobID, 0, os.Getpid(), toolPID, int(time.Since(startTime).Seconds()))
+			emitJobHeartbeat(toolPID, resumeConvID, boundStoryID)
 		}
 
 		waitDone := make(chan error, 1)
@@ -1148,6 +1312,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		}
 		deadline := time.Now().Add(turnTimeout)
 		lastHeartbeatChunkAt := time.Now()
+		lastJobHeartbeatAt := time.Now()
 		var bgDrainSince time.Time
 		var timedOut bool
 		var canceled bool
@@ -1172,10 +1337,13 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					lastOutAt = time.Now()
 					streamMu.Unlock()
 					if jobID != "" && apiURL != "" {
-						_ = controlplane.PostConversation(ctx, apiURL, token, jobID, cid)
+						tok := resolveToken()
+						_ = controlplane.PostConversation(ctx, apiURL, tok, jobID, cid)
 						convMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Attached Antigravity conversation: %s\n", time.Now().UTC().Format(time.RFC3339), cid)
-						_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", convMsg)
+						_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", convMsg)
+						emitJobHeartbeat(toolPID, cid, curBoundStory)
 						lastHeartbeatChunkAt = time.Now()
+						lastJobHeartbeatAt = time.Now()
 					}
 				}
 			}
@@ -1210,10 +1378,13 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 						stitle = opts.Title
 					}
 					if shouldPost && jobID != "" && apiURL != "" {
-						_ = controlplane.PostStoryBinding(ctx, apiURL, token, jobID, curBoundStory, stitle, spath, opts.FencingToken)
+						tok := resolveToken()
+						_ = controlplane.PostStoryBinding(ctx, apiURL, tok, jobID, curBoundStory, stitle, spath, fencingToken)
 						storyMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Bound governing story: %s (%s)\n", time.Now().UTC().Format(time.RFC3339), curBoundStory, stitle)
-						_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", storyMsg)
+						_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", storyMsg)
+						emitJobHeartbeat(toolPID, curConv, curBoundStory)
 						lastHeartbeatChunkAt = time.Now()
+						lastJobHeartbeatAt = time.Now()
 					}
 				}
 			}
@@ -1228,15 +1399,17 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				}
 				streamMu.Unlock()
 				if stepChunk != "" && jobID != "" && apiURL != "" {
-					_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", stepChunk)
+					_ = controlplane.PostChunk(ctx, apiURL, resolveToken(), jobID, "stdout", stepChunk)
 					lastHeartbeatChunkAt = time.Now()
 				}
 			}
 			return curConv, curBoundStory
 		}
 
-		const maxTimeoutDeferrals = 12
-		const maxBgDrainDeferrals = 4
+		// Multi-day (>24h) ASE resilience: allow up to 336 active turn timeout deferrals (7+ days)
+		// and up to 720 background drain deferrals (12 hours) while active SDLC children are running under toolPID.
+		const maxTimeoutDeferrals = 336
+		const maxBgDrainDeferrals = 720
 		timeoutDeferrals := 0
 		bgDrainDeferrals := 0
 		var turnCompletedDuringDrain bool
@@ -1262,6 +1435,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 
 			case <-ticker.C:
 				curConv, curBoundStory := syncTurnTelemetry()
+				toolAlive := toolPID > 0 && watchdog.IsProcessAlive(toolPID)
 
 				streamMu.Lock()
 				fullOut := stdoutBuf.String()
@@ -1330,7 +1504,11 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					}
 					if jobID != "" && apiURL != "" {
 						elapsedSec := int(time.Since(startTime).Seconds())
-						_ = controlplane.PostTick(ctx, apiURL, token, jobID, time.Since(lastActivity).Milliseconds(), os.Getpid(), toolPID, elapsedSec)
+						_ = controlplane.PostTick(ctx, apiURL, resolveToken(), jobID, time.Since(lastActivity).Milliseconds(), os.Getpid(), toolPID, elapsedSec)
+						if toolAlive && time.Since(lastJobHeartbeatAt) >= 10*time.Second {
+							emitJobHeartbeat(toolPID, curConv, curBoundStory)
+							lastJobHeartbeatAt = time.Now()
+						}
 					}
 					continue
 				} else {
@@ -1338,7 +1516,6 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				}
 
 				if time.Now().After(deadline) {
-					toolAlive := toolPID > 0 && watchdog.IsProcessAlive(toolPID)
 					if toolAlive && curConv != "" && !inBgDrain && timeoutDeferrals < maxTimeoutDeferrals {
 						chatty, activeChildren := hasActiveConversationActivity(curConv, toolPID, lastActivity, turnTimeout)
 						if chatty || activeChildren > 0 {
@@ -1349,6 +1526,10 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 								time.Now().UTC().Format(time.RFC3339), toolPID, curConv, chatty, activeChildren, timeoutDeferrals, maxTimeoutDeferrals,
 							)
 							emitSupervisorNote(deferNote)
+							if jobID != "" && apiURL != "" {
+								emitJobHeartbeat(toolPID, curConv, curBoundStory)
+								lastJobHeartbeatAt = time.Now()
+							}
 							continue
 						}
 					}
@@ -1372,6 +1553,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					silentMs := time.Since(lastOutAt).Milliseconds()
 					streamMu.Unlock()
 					elapsedSec := int(time.Since(startTime).Seconds())
+					tok := resolveToken()
 
 					if time.Since(lastHeartbeatChunkAt) >= 20*time.Second {
 						hbStory := curBoundStory
@@ -1386,14 +1568,18 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 							"[%s] [ASE-SUPERVISOR] Execution active (elapsed: %ds, HarnessPID=%d, ToolPID=%d, Story=%s, Conv=%s)\n",
 							time.Now().UTC().Format(time.RFC3339), elapsedSec, os.Getpid(), toolPID, hbStory, hbConv,
 						)
-						_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", hbMsg)
+						_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", hbMsg)
 						lastHeartbeatChunkAt = time.Now()
 						streamMu.Lock()
 						lastOutAt = time.Now()
 						silentMs = 0
 						streamMu.Unlock()
 					}
-					_ = controlplane.PostTick(ctx, apiURL, token, jobID, silentMs, os.Getpid(), toolPID, elapsedSec)
+					_ = controlplane.PostTick(ctx, apiURL, tok, jobID, silentMs, os.Getpid(), toolPID, elapsedSec)
+					if toolAlive && time.Since(lastJobHeartbeatAt) >= 10*time.Second {
+						emitJobHeartbeat(toolPID, curConv, curBoundStory)
+						lastJobHeartbeatAt = time.Now()
+					}
 				}
 			}
 		}
@@ -1427,7 +1613,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				detectedConvID = curConvFinal
 				streamMu.Unlock()
 				if jobID != "" && apiURL != "" {
-					_ = controlplane.PostConversation(ctx, apiURL, token, jobID, curConvFinal)
+					_ = controlplane.PostConversation(ctx, apiURL, resolveToken(), jobID, curConvFinal)
+					emitJobHeartbeat(toolPID, curConvFinal, boundStoryID)
 				}
 			}
 		}
@@ -1439,7 +1626,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 			streamMu.Unlock()
 			if finalSteps != "" && jobID != "" && apiURL != "" {
-				_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", finalSteps)
+				_ = controlplane.PostChunk(ctx, apiURL, resolveToken(), jobID, "stdout", finalSteps)
 			}
 		}
 
@@ -1493,7 +1680,10 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		}
 	}
 
-	execStatus, exitCode, waitErr, bgDrainReaped, printTimedOut := runSingleTurn(opts.Prompt, "", false)
+	firstTurnIsResume := initialResumeConv != ""
+	execStatus, exitCode, waitErr, bgDrainReaped, printTimedOut := runSingleTurn(opts.Prompt, initialResumeConv, firstTurnIsResume)
+
+	isASEFlow := strings.Contains(opts.Prompt, "/autonomous-story-execution") || strings.TrimSpace(opts.StoryID) != "" || boundStoryID != ""
 
 	// Check if in-place auto-resume should be triggered when conversation ID is resolved
 	if (isMockAgy || isDirectAgy) && ctx.Err() == nil {
@@ -1514,6 +1704,12 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					}
 				}
 			}
+			if curStory != "" {
+				isASEFlow = true
+				if opts.MaxAutoResumeAttempts == nil && r.MaxAutoResumeAttempts == nil && strings.TrimSpace(os.Getenv("IAZIO_MAX_AUTO_RESUME_ATTEMPTS")) == "" && maxAutoResumes < defaultASEMaxAutoResumeAttempts {
+					maxAutoResumes = defaultASEMaxAutoResumeAttempts
+				}
+			}
 			if !hasHeadlessPermissionDenial(rawCombined) && isASEFlowCompletedInWorktree(opts.WorkingDir, curStory, rawCombined, gitBin) {
 				execStatus = "completed"
 				exitCode = 0
@@ -1524,9 +1720,11 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 			_, _, curModified := captureGitSnapshot(opts.WorkingDir, gitBin)
 			nonEphemeralModified := filterNonEphemeralModified(curModified)
+			hasDirtyWorktree := len(nonEphemeralModified) > 0
 			storyIncomplete := isStoryIncompleteInWorktree(opts.WorkingDir, curStory)
+			aseDirtyIncomplete := isASEFlow && hasDirtyWorktree
 			needsResume := curConv != "" && !hasHeadlessPermissionDenial(rawCombined) &&
-				(bgDrainReaped || printTimedOut || (storyIncomplete && (execStatus != "completed" || len(nonEphemeralModified) > 0 || bgDrainIdleRegex.MatchString(rawCombined))))
+				(bgDrainReaped || printTimedOut || aseDirtyIncomplete || (storyIncomplete && (execStatus != "completed" || hasDirtyWorktree || bgDrainIdleRegex.MatchString(rawCombined))))
 
 			if !needsResume {
 				break
@@ -1538,8 +1736,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				storyTarget = "active story"
 			}
 			resumeNote := fmt.Sprintf(
-				"[%s] [ASE-SUPERVISOR] [auto_resume.triggered] Auto-resuming conversation %s (attempt %d/%d, Story=%s) to complete job after background drain / partial turn...\n",
-				time.Now().UTC().Format(time.RFC3339), curConv, resumeAttempts, maxAutoResumes, storyTarget,
+				"[%s] [ASE-SUPERVISOR] [auto_resume.triggered] Auto-resuming conversation %s (attempt %d/%d, Story=%s, dirty_files=%d) to complete job after background drain / partial turn...\n",
+				time.Now().UTC().Format(time.RFC3339), curConv, resumeAttempts, maxAutoResumes, storyTarget, len(nonEphemeralModified),
 			)
 			emitSupervisorNote(resumeNote)
 
@@ -1660,7 +1858,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	alreadyPostedStory := postedStoryID
 	streamMu.Unlock()
 	if detectedStoryID != "" && detectedStoryID != alreadyPostedStory && jobID != "" && apiURL != "" {
-		_ = controlplane.PostStoryBinding(ctx, apiURL, token, jobID, detectedStoryID, detectedStoryTitle, detectedStoryPath, opts.FencingToken)
+		_ = controlplane.PostStoryBinding(ctx, apiURL, resolveToken(), jobID, detectedStoryID, detectedStoryTitle, detectedStoryPath, fencingToken)
 	}
 
 	if !hasHeadlessPermissionDenial(combinedOutput) && isASEFlowCompletedInWorktree(opts.WorkingDir, detectedStoryID, combinedOutput, gitBin) {
@@ -1685,6 +1883,19 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		}
 	}
 
+	nonEphemeralFinal := filterNonEphemeralModified(modified)
+	if (isMockAgy || isDirectAgy) && isASEFlow && execStatus == "completed" && len(nonEphemeralFinal) > 0 {
+		execStatus = "failed"
+		if exitCode == 0 {
+			exitCode = 1
+		}
+		failureCategory = "ASE_GATE_INCOMPLETE"
+		failureStage = "COMPLETION_GATE"
+		if waitErr == nil {
+			waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: dirty_worktree_post_exit (%d uncommitted file(s) remaining: %s)", len(nonEphemeralFinal), strings.Join(nonEphemeralFinal, ", "))
+		}
+	}
+
 	failureDirection := "NONE"
 	failureService := ""
 	if execStatus != "completed" {
@@ -1692,7 +1903,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 
 	if jobID != "" && apiURL != "" && summary != "" && !alreadyStreamed {
-		_ = controlplane.PostChunk(ctx, apiURL, token, jobID, "stdout", summary+"\n")
+		_ = controlplane.PostChunk(ctx, apiURL, resolveToken(), jobID, "stdout", summary+"\n")
 	}
 
 	var convIDs []string
@@ -1730,11 +1941,55 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		DurationMs:           durationMs,
 	}
 
+	completeErrMsg := ""
+	if execStatus != "completed" {
+		if waitErr != nil {
+			completeErrMsg = fmt.Sprintf("autopilot execution %s: %v", execStatus, waitErr)
+		} else {
+			completeErrMsg = fmt.Sprintf("autopilot execution %s (exit=%d)", execStatus, exitCode)
+		}
+		syncLocalWatchdogAndLiveness(lastToolPID, curConv, detectedStoryID, watchdog.StatusFailed, exitCode, completeErrMsg)
+	} else {
+		syncLocalWatchdogAndLiveness(lastToolPID, curConv, detectedStoryID, watchdog.StatusCompleted, 0, "")
+	}
+
+	// Multi-day (>24h) orphan completion fallback: if parent iazio-agent upgraded and self-restarted mid-run,
+	// settle the job directly on iazio-harness-api so completion is never lost when stdout pipe is closed.
+	parentOrphaned := os.Getenv("IAZIO_FORCE_DIRECT_COMPLETE") == "1" ||
+		(!isPromptRunnerTestBinary() && (initialParentPID <= 1 || os.Getppid() != initialParentPID || !watchdog.IsProcessAlive(initialParentPID)))
+	if jobID != "" && apiURL != "" && parentOrphaned {
+		_ = controlplane.PostAgentJobComplete(ctx, apiURL, resolveToken(), jobID, fencingToken, result, completeErrMsg)
+	}
+
 	if waitErr != nil && execStatus != "completed" {
 		return result, fmt.Errorf("autopilot execution %s: %w", execStatus, waitErr)
 	}
 
 	return result, nil
+}
+
+func parseGitPorcelainPaths(raw string) []string {
+	var paths []string
+	trimmed := strings.TrimRight(raw, "\r\n")
+	if trimmed == "" {
+		return paths
+	}
+	for _, line := range strings.Split(trimmed, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if len(line) < 3 {
+			continue
+		}
+		pathPart := strings.TrimSpace(line[2:])
+		if idx := strings.Index(pathPart, " -> "); idx != -1 {
+			pathPart = strings.TrimSpace(pathPart[idx+4:])
+		}
+		pathPart = strings.Trim(pathPart, `"`)
+		pathPart = filepath.ToSlash(pathPart)
+		if pathPart != "" {
+			paths = append(paths, pathPart)
+		}
+	}
+	return paths
 }
 
 func captureGitSnapshot(dir, gitBin string) (headSHA, treeSHA string, modified []string) {
@@ -1757,25 +2012,39 @@ func captureGitSnapshot(dir, gitBin string) (headSHA, treeSHA string, modified [
 		treeSHA = strings.TrimSpace(string(out))
 	}
 
-	// 3. git status --porcelain
-	cmdStatus := procutil.Command(gitBin, "status", "--porcelain")
+	// 3. git status --porcelain --ignore-submodules=none (plus nested submodule dirty file expansion)
+	cmdStatus := procutil.Command(gitBin, "status", "--porcelain", "--ignore-submodules=none")
 	cmdStatus.Dir = dir
-	if out, err := cmdStatus.Output(); err == nil {
-		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-		for _, line := range lines {
-			line = strings.TrimRight(line, "\r")
-			if len(line) < 3 {
-				continue
+	out, err := cmdStatus.Output()
+	if err != nil {
+		cmdFallback := procutil.Command(gitBin, "status", "--porcelain")
+		cmdFallback.Dir = dir
+		out, err = cmdFallback.Output()
+	}
+	if err == nil {
+		seen := make(map[string]bool)
+		addMod := func(p string) {
+			if p != "" && !seen[p] {
+				seen[p] = true
+				modified = append(modified, p)
 			}
-			pathPart := strings.TrimSpace(line[2:])
-			if idx := strings.Index(pathPart, " -> "); idx != -1 {
-				pathPart = strings.TrimSpace(pathPart[idx+4:])
+		}
+		for _, pathPart := range parseGitPorcelainPaths(string(out)) {
+			subDir := filepath.Join(dir, filepath.FromSlash(pathPart))
+			if _, statErr := os.Stat(filepath.Join(subDir, ".git")); statErr == nil {
+				subStatus := procutil.Command(gitBin, "status", "--porcelain")
+				subStatus.Dir = subDir
+				if subOut, subErr := subStatus.Output(); subErr == nil {
+					subPaths := parseGitPorcelainPaths(string(subOut))
+					if len(subPaths) > 0 {
+						for _, sp := range subPaths {
+							addMod(pathPart + "/" + sp)
+						}
+						continue
+					}
+				}
 			}
-			pathPart = strings.Trim(pathPart, `"`)
-			pathPart = filepath.ToSlash(pathPart)
-			if pathPart != "" {
-				modified = append(modified, pathPart)
-			}
+			addMod(pathPart)
 		}
 	}
 
