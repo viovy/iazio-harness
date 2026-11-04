@@ -1031,3 +1031,159 @@ exit 0
 		t.Fatalf("unexpected background drain local classification: %q %q %q %q", cat, stg, dir, svc)
 	}
 }
+
+func TestJob9a39902fd8c9aabf_InitialResumeConversationHeartbeatAndSubmoduleResidualGate(t *testing.T) {
+	brainDir := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainDir)
+
+	repoDir := initTestGitRepo(t)
+	subDir := filepath.Join(repoDir, "iazio-agent")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("mkdir submodule: %v", err)
+	}
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.name", "Test User"},
+		{"config", "user.email", "test@example.com"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = subDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("sub git %v: %v (%s)", args, err, string(out))
+		}
+	}
+	subMain := filepath.Join(subDir, "main.go")
+	if err := os.WriteFile(subMain, []byte("package main\n"), 0o600); err != nil {
+		t.Fatalf("write sub main.go: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", "main.go"},
+		{"commit", "-m", "initial submodule commit"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = subDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("sub git %v: %v (%s)", args, err, string(out))
+		}
+	}
+	for _, args := range [][]string{
+		{"add", "iazio-agent"},
+		{"commit", "-m", "chore: track iazio-agent submodule gitlink"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("super git %v: %v (%s)", args, err, string(out))
+		}
+	}
+
+	pinnedConv := "29c18bab-aa8a-4d78-8426-4808d832582a"
+	binDir := t.TempDir()
+	mockAgyBin := filepath.Join(binDir, "mock-agy")
+	stateMarker := filepath.Join(binDir, "turn_count")
+	script := fmt.Sprintf(`#!/bin/sh
+CONV_ARG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --conversation=*) CONV_ARG="${1#*=}" ;;
+    --conversation) shift; CONV_ARG="$1" ;;
+  esac
+  shift
+done
+
+if [ "$CONV_ARG" != "%s" ]; then
+  echo "ERROR: expected --conversation=%s, got $CONV_ARG" >&2
+  exit 2
+fi
+
+if [ ! -f "%s" ]; then
+  echo "1" > "%s"
+  # Simulate leaving dirty modified file inside submodule without completing ASE
+  echo "package main // dirty residual" > iazio-agent/main.go
+  echo "Resumed conversation $CONV_ARG turn 1 (left dirty submodule)"
+  exit 0
+else
+  # Turn 2 (auto-resumed): commit submodule cleanly, sync gitlink, and mark story DONE
+  git -C iazio-agent add main.go >/dev/null 2>&1 || true
+  git -C iazio-agent commit -m "fix: commit submodule residual" >/dev/null 2>&1 || true
+  mkdir -p docs/stories
+  printf -- "---\nid: STORY-IAZIO-0183\nstatus: DONE\n---\n# Story\n" > docs/stories/2026-11-04-iazio-0183.story.md
+  git add iazio-agent docs/stories/2026-11-04-iazio-0183.story.md >/dev/null 2>&1 || true
+  git commit -m "chore: complete STORY-IAZIO-0183" >/dev/null 2>&1 || true
+  echo "Autonomous story execution is complete for STORY-IAZIO-0183 on $CONV_ARG"
+  exit 0
+fi
+`, pinnedConv, pinnedConv, stateMarker, stateMarker)
+	if err := os.WriteFile(mockAgyBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock-agy: %v", err)
+	}
+
+	var hbMu sync.Mutex
+	var hbReqs []map[string]any
+	var completeReqs []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/heartbeat") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			hbMu.Lock()
+			hbReqs = append(hbReqs, body)
+			hbMu.Unlock()
+		} else if strings.HasSuffix(r.URL.Path, "/complete") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			hbMu.Lock()
+			completeReqs = append(completeReqs, body)
+			hbMu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	wdFile := filepath.Join(t.TempDir(), "harness-watchdog.json")
+	liveDir := filepath.Join(t.TempDir(), "liveness")
+	t.Setenv("IAZIO_HARNESS_WATCHDOG_FILE", wdFile)
+	t.Setenv("IAZIO_LIVENESS_DIR", liveDir)
+	t.Setenv("IAZIO_FORCE_DIRECT_COMPLETE", "1")
+
+	runner := NewPromptRunner("autopilot")
+	runner.GracePeriod = 50 * time.Millisecond
+	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:             "prompt_job_9a39902fd8c9aabf",
+		JobID:                "job_9a39902fd8c9aabf",
+		APIURL:               srv.URL,
+		Token:                "tok-9a3990",
+		LeaseToken:           "lease-9a3990",
+		FencingToken:         12,
+		ResumeConversationID: pinnedConv,
+		Repo:                 "meta-repo",
+		Prompt:               "/autonomous-story-execution implement STORY-IAZIO-0183",
+		TargetAgent:          mockAgyBin,
+		WorkingDir:           repoDir,
+		Timeout:              5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("expected RunPrompt to auto-resume and complete cleanly, got err=%v", err)
+	}
+	if res.ActiveConversationID != pinnedConv {
+		t.Fatalf("expected ActiveConversationID=%q, got %q", pinnedConv, res.ActiveConversationID)
+	}
+	if res.ResumeAttempts != 1 {
+		t.Fatalf("expected 1 auto-resume attempt triggered by dirty submodule file, got %d", res.ResumeAttempts)
+	}
+	hbMu.Lock()
+	hbCount := len(hbReqs)
+	compCount := len(completeReqs)
+	hbMu.Unlock()
+	if hbCount == 0 {
+		t.Fatalf("expected built-in PostJobHeartbeat requests to /api/v1/agent/jobs/{id}/heartbeat, got 0")
+	}
+	if compCount == 0 {
+		t.Fatalf("expected orphan fallback PostAgentJobComplete request to /api/v1/agent/jobs/{id}/complete, got 0")
+	}
+	if _, err := os.Stat(filepath.Join(liveDir, pinnedConv+".json")); err != nil {
+		t.Fatalf("expected conversation liveness record at %s: %v", filepath.Join(liveDir, pinnedConv+".json"), err)
+	}
+	if _, err := os.Stat(wdFile); err != nil {
+		t.Fatalf("expected local watchdog state file at %s: %v", wdFile, err)
+	}
+}
