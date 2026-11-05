@@ -342,3 +342,174 @@ func TestReadGitWorktreeBranch(t *testing.T) {
 		t.Fatalf("expected main from gitdir file, got %q", got)
 	}
 }
+
+func TestHasExactRepoPathBoundary_AndLineContainsExactRepoPath(t *testing.T) {
+	base := "/Users/romeo/work/meta-repo"
+	if !HasExactRepoPathBoundary("/Users/romeo/work/meta-repo", base) {
+		t.Errorf("expected exact match to return true")
+	}
+	if !HasExactRepoPathBoundary("/Users/romeo/work/meta-repo/iazio-agent", base) {
+		t.Errorf("expected child submodule path to return true")
+	}
+	if HasExactRepoPathBoundary("/Users/romeo/work/meta-repo-02", base) {
+		t.Errorf("expected sibling slot meta-repo-02 to return false")
+	}
+	if HasExactRepoPathBoundary("/Users/romeo/work/meta-repo-03/iazio-agent", base) {
+		t.Errorf("expected sibling slot child meta-repo-03/iazio-agent to return false")
+	}
+
+	if !LineContainsExactRepoPath("agy --cwd /Users/romeo/work/meta-repo --print", base) {
+		t.Errorf("expected exact path in cmdline to match")
+	}
+	if !LineContainsExactRepoPath("autopilot -C /Users/romeo/work/meta-repo/vigo verify", base) {
+		t.Errorf("expected child path in cmdline to match")
+	}
+	if LineContainsExactRepoPath("agy --cwd /Users/romeo/work/meta-repo-03 --print", base) {
+		t.Errorf("expected sibling meta-repo-03 in cmdline NOT to match meta-repo")
+	}
+}
+
+func TestInspectRepoFleetStatus_CompletedStoryVigo0235_Tier1SelfRemediation(t *testing.T) {
+	tmpDir := t.TempDir()
+	cmd := exec.Command("git", "init", "-b", "main")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	exec.Command("git", "-C", tmpDir, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", tmpDir, "config", "user.name", "Test User").Run()
+
+	// Create DONE story file for STORY-VIGO-0235 and index.yml for STORY-GOV-3133
+	storiesDir := filepath.Join(tmpDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0o755)
+	storyContent := "---\nid: \"STORY-VIGO-0235\"\nstatus: DONE\n---\n# STORY-VIGO-0235\n"
+	_ = os.WriteFile(filepath.Join(storiesDir, "2026-11-03-vigo-0235-vigo-bws.story.md"), []byte(storyContent), 0o644)
+	_ = os.WriteFile(filepath.Join(storiesDir, "index.yml"), []byte("stories:\n  - id: STORY-GOV-3133\n    status: DONE\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(tmpDir, ".gitignore"), []byte(".session_story_id\n.autopilot/\ntmp/\n"), 0o644)
+	exec.Command("git", "-C", tmpDir, "add", ".").Run()
+	exec.Command("git", "-C", tmpDir, "commit", "-m", "chore: initial main with completed story").Run()
+
+	// Reproduce exact mac-mini bug:
+	// 1. Leftover .session_story_id with STORY-VIGO-0235
+	_ = os.WriteFile(filepath.Join(tmpDir, ".session_story_id"), []byte("STORY-VIGO-0235\n"), 0o644)
+	// 2. Leftover .autopilot/state.json with current_phase="VERIFICATION"
+	_ = os.MkdirAll(filepath.Join(tmpDir, ".autopilot"), 0o755)
+	_ = os.WriteFile(filepath.Join(tmpDir, ".autopilot", "state.json"), []byte(`{"story_id":"","current_phase":"VERIFICATION","verification_status":"PASSED"}`), 0o644)
+	// 3. Unrelated historical tmp/ase-resume-STORY-GOV-3133.json
+	_ = os.MkdirAll(filepath.Join(tmpDir, "tmp"), 0o755)
+	_ = os.WriteFile(filepath.Join(tmpDir, "tmp", "ase-resume-STORY-GOV-3133.json"), []byte(`{"story_id":"STORY-GOV-3133","phase":"5"}`), 0o644)
+
+	res, err := InspectRepoFleetStatus(context.Background(), tmpDir)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus error: %v", err)
+	}
+	if res.ASEState != "IDLE" {
+		t.Errorf("expected ASEState=IDLE after Tier 1 remediation of completed STORY-VIGO-0235, got %s", res.ASEState)
+	}
+	if res.ActiveStoryID != "" {
+		t.Errorf("expected ActiveStoryID to be cleared for completed story, got %q", res.ActiveStoryID)
+	}
+	if res.CurrentPhase != "" {
+		t.Errorf("expected CurrentPhase to be cleared, got %q", res.CurrentPhase)
+	}
+	if !res.RemediationApplied || len(res.RemediationActions) == 0 {
+		t.Errorf("expected RemediationApplied=true with recorded actions, got applied=%v actions=%v", res.RemediationApplied, res.RemediationActions)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, ".session_story_id")); !os.IsNotExist(err) {
+		t.Errorf("expected .session_story_id to be removed by Tier 1 remediation")
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "tmp", "ase-resume-STORY-GOV-3133.json")); !os.IsNotExist(err) {
+		t.Errorf("expected completed historical tmp/ase-resume-STORY-GOV-3133.json to be pruned")
+	}
+}
+
+func TestReconcileAdhocASEState_IdleInteractiveShellDoesNotPauseQueue(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Simulate an open interactive agy shell sitting on clean main with no bound story and no locks
+	res := &RepoFleetStatusResult{
+		RepoPath:            tmpDir,
+		Branch:              "main",
+		IsClean:             true,
+		WorktreeState:       "CLEAN",
+		ASEState:            "IDLE",
+		AgentTool:           "agy",
+		AgentPID:            49113,
+		ToolLiveness:        "LIVE",
+		ExecutionProvenance: "INDEPENDENT_USER_SESSION",
+	}
+	reconcileAdhocASEState(tmpDir, res)
+	if res.ASEState != "IDLE" {
+		t.Errorf("expected idle interactive agy shell on clean main with no story/lock to remain ASEState=IDLE, got %s", res.ASEState)
+	}
+
+	// Simulate an active autopilot-ase tool or bound IN_PROGRESS story with live agy tool -> must become RUNNING
+	resActive := &RepoFleetStatusResult{
+		RepoPath:            tmpDir,
+		Branch:              "main",
+		IsClean:             true,
+		WorktreeState:       "CLEAN",
+		ASEState:            "IDLE",
+		ActiveStoryID:       "STORY-GOV-5156",
+		AgentTool:           "agy",
+		AgentPID:            49113,
+		ToolLiveness:        "LIVE",
+		ExecutionProvenance: "INDEPENDENT_USER_SESSION",
+	}
+	reconcileAdhocASEState(tmpDir, resActive)
+	if resActive.ASEState != "RUNNING" {
+		t.Errorf("expected live agy tool with active non-DONE story to become ASEState=RUNNING, got %s", resActive.ASEState)
+	}
+}
+
+func TestRemediateRepo_Tier2SafeGradleCacheAndTier3ForceClean(t *testing.T) {
+	tmpDir := t.TempDir()
+	cmd := exec.Command("git", "init", "-b", "main")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	exec.Command("git", "-C", tmpDir, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", tmpDir, "config", "user.name", "Test User").Run()
+
+	gradleFile := filepath.Join(tmpDir, "android", ".gradle", "8.14", "fileHashes", "fileHashes.bin")
+	_ = os.MkdirAll(filepath.Join(tmpDir, "android", ".gradle", "8.14", "fileHashes"), 0o755)
+	_ = os.WriteFile(gradleFile, []byte("v1"), 0o644)
+	exec.Command("git", "-C", tmpDir, "add", ".").Run()
+	exec.Command("git", "-C", tmpDir, "commit", "-m", "chore: initial").Run()
+
+	// Modify tracked gradle cache file
+	_ = os.WriteFile(gradleFile, []byte("v2-daemon-noise"), 0o644)
+
+	remRes, err := RemediateRepo(context.Background(), RemediateOptions{
+		RepoPath: tmpDir,
+		Strategy: StrategySafe,
+	})
+	if err != nil {
+		t.Fatalf("RemediateRepo StrategySafe error: %v", err)
+	}
+	if !remRes.Success || remRes.Skipped {
+		t.Fatalf("expected StrategySafe success without skip, got %+v", remRes)
+	}
+	if remRes.FleetStatus == nil || !remRes.FleetStatus.IsClean {
+		t.Errorf("expected FleetStatus.IsClean=true after Tier 2 safe remediation of gradle cache, got %+v", remRes.FleetStatus)
+	}
+
+	// Modify real file and test StrategyForceClean
+	realFile := filepath.Join(tmpDir, "main.go")
+	_ = os.WriteFile(realFile, []byte("package main\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(tmpDir, ".session_story_id"), []byte("STORY-GOV-9999\n"), 0o644)
+
+	forceRes, err := RemediateRepo(context.Background(), RemediateOptions{
+		RepoPath: tmpDir,
+		Strategy: StrategyForceClean,
+	})
+	if err != nil {
+		t.Fatalf("RemediateRepo StrategyForceClean error: %v", err)
+	}
+	if !forceRes.Success || forceRes.FleetStatus == nil || !forceRes.FleetStatus.IsClean {
+		t.Errorf("expected StrategyForceClean to restore clean state, got %+v", forceRes)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, ".session_story_id")); !os.IsNotExist(err) {
+		t.Errorf("expected .session_story_id to be removed by StrategyForceClean")
+	}
+}

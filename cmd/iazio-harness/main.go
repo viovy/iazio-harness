@@ -194,6 +194,10 @@ func run(args []string) error {
 		return runCodebaseCommand(args[1:])
 	case "status", "fleet-status", "inspect":
 		return runFleetStatusCommand(args[1:])
+	case "repo":
+		return runRepoCommand(args[1:])
+	case "remediate":
+		return runRepoRemediateCommand(args[1:])
 	case "heal-ase":
 		return runHealASECommand(args[1:])
 	case "discard", "clean-git", "git-clean", "reset-workspace":
@@ -2661,7 +2665,7 @@ func resolveExecutionOptions(job controlplane.JobDetail, promptBody string) (mod
 
 func runFleetStatusCommand(args []string) error {
 	repoPath := "."
-	var jsonOutput bool
+	var jsonOutput, autoRemediate bool
 	for i := 0; i < len(args); i++ {
 		switch {
 		case (args[i] == "--repo" || args[i] == "--worktree-path") && i+1 < len(args):
@@ -2673,9 +2677,14 @@ func runFleetStatusCommand(args []string) error {
 			repoPath = strings.TrimPrefix(args[i], "--worktree-path=")
 		case args[i] == "--json":
 			jsonOutput = true
+		case args[i] == "--auto-remediate" || args[i] == "--auto-remediate=true":
+			autoRemediate = true
 		}
 	}
-	res, err := diagnostics.InspectRepoFleetStatus(context.Background(), repoPath)
+	res, err := diagnostics.InspectRepoFleetStatusWithOptions(context.Background(), repoPath, diagnostics.InspectOptions{
+		AutoRemediateTier1: true,
+		AutoRemediateSafe:  autoRemediate,
+	})
 	if err != nil {
 		return err
 	}
@@ -2685,6 +2694,65 @@ func runFleetStatusCommand(args []string) error {
 		return enc.Encode(res)
 	}
 	fmt.Print(res.DiagnosticSummary)
+	return nil
+}
+
+func runRepoCommand(args []string) error {
+	if len(args) == 0 {
+		return runFleetStatusCommand(args)
+	}
+	switch args[0] {
+	case "evaluate", "status", "inspect":
+		return runFleetStatusCommand(args[1:])
+	case "remediate", "heal":
+		return runRepoRemediateCommand(args[1:])
+	default:
+		return runFleetStatusCommand(args)
+	}
+}
+
+func runRepoRemediateCommand(args []string) error {
+	repoPath := "."
+	strategy := string(diagnostics.StrategySafe)
+	var jsonOutput bool
+	for i := 0; i < len(args); i++ {
+		switch {
+		case (args[i] == "--repo" || args[i] == "--worktree-path") && i+1 < len(args):
+			i++
+			repoPath = args[i]
+		case strings.HasPrefix(args[i], "--repo="):
+			repoPath = strings.TrimPrefix(args[i], "--repo=")
+		case strings.HasPrefix(args[i], "--worktree-path="):
+			repoPath = strings.TrimPrefix(args[i], "--worktree-path=")
+		case (args[i] == "--strategy" || args[i] == "--tier") && i+1 < len(args):
+			i++
+			strategy = args[i]
+		case strings.HasPrefix(args[i], "--strategy="):
+			strategy = strings.TrimPrefix(args[i], "--strategy=")
+		case strings.HasPrefix(args[i], "--tier="):
+			strategy = strings.TrimPrefix(args[i], "--tier=")
+		case args[i] == "--force" || args[i] == "-f":
+			strategy = string(diagnostics.StrategyForceClean)
+		case args[i] == "--json":
+			jsonOutput = true
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	res, err := diagnostics.RemediateRepo(ctx, diagnostics.RemediateOptions{
+		RepoPath: repoPath,
+		Strategy: diagnostics.NormalizeStrategy(strategy),
+	})
+	if jsonOutput && res != nil {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(res)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Println(res.Message)
 	return nil
 }
 
