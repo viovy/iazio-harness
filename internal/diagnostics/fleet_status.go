@@ -3,6 +3,7 @@ package diagnostics
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,7 +14,14 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/procutil"
+	"github.com/viovy/iazio-harness/internal/repolock"
 )
+
+// InspectOptions configures repository evaluation and inline self-remediation behavior.
+type InspectOptions struct {
+	AutoRemediateTier1 bool `json:"auto_remediate_tier1"`
+	AutoRemediateSafe  bool `json:"auto_remediate_safe"`
+}
 
 // RepoFleetStatusResult contains the complete diagnostic posture of a repository and active agent tooling.
 type RepoFleetStatusResult struct {
@@ -23,6 +31,9 @@ type RepoFleetStatusResult struct {
 	IsClean              bool     `json:"is_clean"`
 	Ahead                int      `json:"ahead"`
 	Behind               int      `json:"behind"`
+	DirtyFilesCount      int      `json:"dirty_files_count"`
+	UntrackedFilesCount  int      `json:"untracked_files_count"`
+	HasActiveGitLock     bool     `json:"has_active_git_lock"`
 	ModifiedFiles        []string `json:"modified_files"`
 	UntrackedFiles       []string `json:"untracked_files"`
 	SubmodulesClean      bool     `json:"submodules_clean"`
@@ -40,13 +51,28 @@ type RepoFleetStatusResult struct {
 	ToolLiveness         string   `json:"tool_liveness"`        // LIVE, TERMINATED, KILLED, NONE
 	ExecutionProvenance  string   `json:"execution_provenance"` // INDEPENDENT_USER_SESSION, COORDINATED_HARNESS, COORDINATED_HARNESS_FAILED, NONE
 	ActiveConversationID string   `json:"active_conversation_id,omitempty"`
+	MetadataYmlRaw       string   `json:"metadata_yml_raw,omitempty"`
+	MetadataYmlSHA       string   `json:"metadata_yml_sha,omitempty"`
+	MetadataYmlModTime   string   `json:"metadata_yml_mod_time,omitempty"`
+	GitVersion           string   `json:"git_version,omitempty"`
+	RemediationApplied   bool     `json:"remediation_applied,omitempty"`
+	RemediationActions   []string `json:"remediation_actions,omitempty"`
 	DiagnosticSummary    string   `json:"diagnostic_summary"`
 	CheckedAt            string   `json:"checked_at"`
 }
 
 // InspectRepoFleetStatus performs deep forensic inspection of a git repo worktree,
-// submodules, ASE lifecycle state, and running agent processes.
+// submodules, ASE lifecycle state, and running agent processes with Tier 1 inline self-remediation enabled.
 func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetStatusResult, error) {
+	return InspectRepoFleetStatusWithOptions(ctx, repoPath, InspectOptions{
+		AutoRemediateTier1: true,
+		AutoRemediateSafe:  false,
+	})
+}
+
+// InspectRepoFleetStatusWithOptions performs deep forensic inspection of a git repo worktree
+// with configurable Tier 1 (inline completed-ASE state cleanup) and Tier 2 (safe idle-main) remediation.
+func InspectRepoFleetStatusWithOptions(ctx context.Context, repoPath string, opts InspectOptions) (*RepoFleetStatusResult, error) {
 	cleanPath := filepath.Clean(repoPath)
 	if r, err := filepath.EvalSymlinks(cleanPath); err == nil {
 		cleanPath = r
@@ -63,8 +89,12 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 		CheckedAt:           time.Now().UTC().Format(time.RFC3339),
 	}
 
+	// 0. Check git lock sentinels (and prune abandoned >5m .lock files)
+	inspectGitLockSentinels(cleanPath, opts.AutoRemediateTier1, res)
+
 	// 1. Git Status Porcelain v2 & Branch
 	cmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "status", "--porcelain=v2", "--branch")
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		parseGitPorcelainV2(string(out), res)
@@ -94,6 +124,9 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 		parseSubmoduleStatus(ctx, cleanPath, string(subOut), res)
 	}
 
+	res.DirtyFilesCount = len(res.ModifiedFiles) + len(res.DirtySubmodules)
+	res.UntrackedFilesCount = len(res.UntrackedFiles)
+
 	// Classify overall cleanliness and worktree state
 	hasModifiedFiles := len(res.ModifiedFiles) > 0
 	hasUntrackedFiles := len(res.UntrackedFiles) > 0
@@ -102,7 +135,7 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 	hasNonMainSubmodules := len(res.NonMainSubmodules) > 0
 	isMainBranch := res.Branch == "main" || res.Branch == "master"
 
-	if hasModifiedFiles || hasDirtySubmodules {
+	if res.HasActiveGitLock || hasModifiedFiles || hasDirtySubmodules {
 		res.WorktreeState = "DIRTY_MODIFIED"
 		res.IsClean = false
 	} else if hasUntrackedFiles {
@@ -123,19 +156,295 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 	}
 	res.SubmodulesClean = (len(res.DirtySubmodules) == 0 && len(res.NonMainSubmodules) == 0)
 
-	// 3. ASE State & Autopilot locks
-	parseASEState(cleanPath, res)
+	// 3. ASE State & Autopilot locks (with Tier 1 completed-ASE artifact cleanup)
+	parseASEStateWithOpts(cleanPath, opts.AutoRemediateTier1, res)
 
 	// 4. Process Discovery & Provenance
 	discoverAgentProcesses(cleanPath, res)
 
-	// 4b. Reconcile ad-hoc ASE session state and provenance
-	reconcileAdhocASEState(cleanPath, res)
+	// 4b. Reconcile ad-hoc ASE session state and provenance (strict evidence gate)
+	reconcileAdhocASEStateWithOpts(cleanPath, opts.AutoRemediateTier1, res)
 
-	// 5. Finalize Diagnostic Summary
+	// 4c. Optional Tier 2 safe remediation when idle on main/master
+	if opts.AutoRemediateSafe && res.ASEState == "IDLE" && isMainBranch && res.LockDetails == "" && !res.HasActiveGitLock {
+		needsSafeRemediation := (!res.IsClean && hasOnlyRemediableMainNoise(res)) || res.Behind > 0 || res.WorktreeState == "CLEAN_SUBMODULE_DRIFT"
+		if needsSafeRemediation {
+			if remRes, remErr := RemediateRepo(ctx, RemediateOptions{
+				RepoPath: cleanPath,
+				Strategy: StrategySafe,
+			}); remErr == nil && remRes != nil && remRes.FleetStatus != nil && !remRes.Skipped {
+				res = remRes.FleetStatus
+			}
+		}
+	}
+
+	// 5. Enrich metadata.yml snapshot and git describe version
+	populateMetadataAndGitVersion(ctx, cleanPath, res)
+
+	// 6. Finalize Diagnostic Summary
 	buildDiagnosticSummary(res)
 
 	return res, nil
+}
+
+func hasOnlyRemediableMainNoise(res *RepoFleetStatusResult) bool {
+	if len(res.NonMainSubmodules) > 0 {
+		return false
+	}
+	for _, m := range res.ModifiedFiles {
+		if !IsEphemeralCachePath(m) {
+			return false
+		}
+	}
+	for _, u := range res.UntrackedFiles {
+		if !IsEphemeralCachePath(u) {
+			return false
+		}
+	}
+	return true
+}
+
+func inspectGitLockSentinels(repoPath string, autoPruneStale bool, res *RepoFleetStatusResult) {
+	gitDir := filepath.Join(repoPath, ".git")
+	fi, err := os.Stat(gitDir)
+	if err != nil {
+		return
+	}
+	if !fi.IsDir() {
+		if b, rErr := os.ReadFile(gitDir); rErr == nil {
+			content := strings.TrimSpace(string(b))
+			if strings.HasPrefix(content, "gitdir:") {
+				target := strings.TrimSpace(strings.TrimPrefix(content, "gitdir:"))
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(repoPath, target)
+				}
+				gitDir = target
+			}
+		}
+	}
+	sentinels := []string{
+		filepath.Join(gitDir, "index.lock"),
+		filepath.Join(gitDir, "HEAD.lock"),
+		filepath.Join(gitDir, "shallow.lock"),
+		filepath.Join(gitDir, "MERGE_HEAD"),
+		filepath.Join(gitDir, "rebase-merge"),
+		filepath.Join(gitDir, "rebase-apply"),
+		filepath.Join(gitDir, "CHERRY_PICK_HEAD"),
+		filepath.Join(gitDir, "REVERT_HEAD"),
+	}
+	for _, s := range sentinels {
+		if sfi, sErr := os.Stat(s); sErr == nil {
+			base := filepath.Base(s)
+			if autoPruneStale && strings.HasSuffix(base, ".lock") && time.Since(sfi.ModTime()) > 5*time.Minute {
+				if os.Remove(s) == nil {
+					res.RemediationApplied = true
+					res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("removed stale git lock %s", base))
+					continue
+				}
+			}
+			res.HasActiveGitLock = true
+			return
+		}
+	}
+}
+
+func populateMetadataAndGitVersion(ctx context.Context, cleanPath string, res *RepoFleetStatusResult) {
+	metaPath := filepath.Join(cleanPath, "metadata.yml")
+	if fi, err := os.Stat(metaPath); err == nil && !fi.IsDir() && fi.Size() < 2<<20 {
+		if metaBytes, err := os.ReadFile(metaPath); err == nil {
+			res.MetadataYmlRaw = string(metaBytes)
+			hash := sha256.Sum256(metaBytes)
+			res.MetadataYmlSHA = fmt.Sprintf("%x", hash)
+			res.MetadataYmlModTime = fi.ModTime().UTC().Format(time.RFC3339)
+		}
+	}
+	verCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	gitVerCmd := procutil.CommandContext(verCtx, "git", "-C", cleanPath, "describe", "--tags", "--always")
+	if out, err := gitVerCmd.Output(); err == nil {
+		res.GitVersion = strings.TrimSpace(string(out))
+	}
+}
+
+// HasExactRepoPathBoundary returns true if candidatePath equals repoPath or is a child path inside repoPath.
+// It strictly prevents "/Users/romeo/work/meta-repo" from matching "/Users/romeo/work/meta-repo-02".
+func HasExactRepoPathBoundary(candidatePath, repoPath string) bool {
+	if strings.TrimSpace(candidatePath) == "" || strings.TrimSpace(repoPath) == "" {
+		return false
+	}
+	cleanCand := filepath.Clean(strings.TrimSpace(candidatePath))
+	cleanRepo := filepath.Clean(strings.TrimSpace(repoPath))
+	if cleanCand == cleanRepo {
+		return true
+	}
+	sep := string(filepath.Separator)
+	if strings.HasPrefix(cleanCand, cleanRepo+sep) {
+		return true
+	}
+	if runtime.GOOS == "windows" {
+		candLower := strings.ToLower(cleanCand)
+		repoLower := strings.ToLower(cleanRepo)
+		if candLower == repoLower || strings.HasPrefix(candLower, repoLower+sep) || strings.HasPrefix(candLower, repoLower+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// LineContainsExactRepoPath returns true if cmdLine contains repoPath with a valid path boundary
+// (end of string, whitespace, '/', '\', '"', '\'', ':', ';') and NOT a sibling suffix like "-02".
+func LineContainsExactRepoPath(cmdLine, repoPath string) bool {
+	cleanRepo := filepath.Clean(strings.TrimSpace(repoPath))
+	if cleanRepo == "" || cleanRepo == "." {
+		return false
+	}
+	search := cmdLine
+	for {
+		idx := strings.Index(search, cleanRepo)
+		if idx < 0 {
+			return false
+		}
+		afterIdx := idx + len(cleanRepo)
+		if afterIdx >= len(search) {
+			return true
+		}
+		nextCh := search[afterIdx]
+		if nextCh == ' ' || nextCh == '\t' || nextCh == '\n' || nextCh == '\r' ||
+			nextCh == '/' || nextCh == '\\' || nextCh == '"' || nextCh == '\'' ||
+			nextCh == ':' || nextCh == ';' {
+			return true
+		}
+		search = search[afterIdx:]
+	}
+}
+
+// IsStoryCompletedOnDisk returns true if storyID is marked DONE in .autopilot/ase-state.json,
+// docs/stories/*.story.md, child family docs/stories/*.story.md, or docs/stories/index.yml.
+func IsStoryCompletedOnDisk(repoPath, storyID string) bool {
+	sid := strings.ToUpper(strings.TrimSpace(storyID))
+	if repoPath == "" || !strings.HasPrefix(sid, "STORY-") {
+		return false
+	}
+
+	// 1. Check .autopilot/ase-state.json
+	if b, err := os.ReadFile(filepath.Join(repoPath, ".autopilot", "ase-state.json")); err == nil {
+		var aseSt struct {
+			StoryID string `json:"story_id"`
+			Status  string `json:"status"`
+			Phase   string `json:"phase"`
+		}
+		if json.Unmarshal(b, &aseSt) == nil && strings.EqualFold(strings.TrimSpace(aseSt.StoryID), sid) {
+			if strings.EqualFold(aseSt.Status, "DONE") || strings.EqualFold(aseSt.Phase, "completed") {
+				return true
+			}
+		}
+	}
+
+	// 2. Check candidate docs/stories directories (root, parent, and category-inferred child hubs)
+	candidateDirs := []string{
+		filepath.Join(repoPath, "docs", "stories"),
+		filepath.Join(filepath.Dir(repoPath), "docs", "stories"),
+	}
+	parts := strings.Split(sid, "-")
+	if len(parts) >= 3 {
+		cat := strings.ToLower(parts[1])
+		switch cat {
+		case "vigo":
+			candidateDirs = append(candidateDirs,
+				filepath.Join(repoPath, "vigo", "docs", "stories"),
+				filepath.Join(repoPath, "vigo-api", "docs", "stories"),
+			)
+		case "iazio":
+			candidateDirs = append(candidateDirs,
+				filepath.Join(repoPath, "iazio-infra", "docs", "stories"),
+				filepath.Join(repoPath, "iazio", "docs", "stories"),
+			)
+		case "gov", "auto", "ap":
+			candidateDirs = append(candidateDirs,
+				filepath.Join(repoPath, "autopilot-umbrella", "docs", "stories"),
+				filepath.Join(repoPath, "iazio-infra", "docs", "stories"),
+			)
+		}
+	}
+
+	idLower := strings.ToLower(sid)
+	shortSlug := strings.TrimPrefix(idLower, "story-")
+
+	for _, dir := range candidateDirs {
+		entries, err := os.ReadDir(dir)
+		if err == nil {
+			for _, e := range entries {
+				if e.IsDir() || !strings.HasSuffix(e.Name(), ".story.md") {
+					continue
+				}
+				nameLower := strings.ToLower(e.Name())
+				if !strings.Contains(nameLower, idLower) && !strings.Contains(nameLower, shortSlug) {
+					continue
+				}
+				data, rErr := os.ReadFile(filepath.Join(dir, e.Name()))
+				if rErr != nil {
+					continue
+				}
+				content := string(data)
+				if strings.Contains(strings.ToUpper(content), sid) &&
+					(strings.Contains(content, "\nstatus: DONE\n") ||
+						strings.Contains(content, "\nstatus: DONE\r\n") ||
+						strings.Contains(content, "\nstatus: \"DONE\"\n") ||
+						strings.Contains(content, "\nstatus: 'DONE'\n")) {
+					return true
+				}
+			}
+		}
+
+		// Also check index.yml in dir
+		if indexBytes, idxErr := os.ReadFile(filepath.Join(dir, "index.yml")); idxErr == nil {
+			lines := strings.Split(string(indexBytes), "\n")
+			for i, l := range lines {
+				if strings.Contains(strings.ToUpper(l), sid) {
+					end := i + 8
+					if end > len(lines) {
+						end = len(lines)
+					}
+					for j := i; j < end; j++ {
+						trimmed := strings.TrimSpace(lines[j])
+						if j > i && strings.HasPrefix(trimmed, "- id:") {
+							break
+						}
+						if strings.HasPrefix(strings.ToLower(trimmed), "status:") {
+							val := strings.Trim(strings.TrimSpace(trimmed[len("status:"):]), "\"'")
+							if strings.EqualFold(val, "DONE") {
+								return true
+							}
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func hasActiveScopedResumeFile(repoPath, storyID string) bool {
+	sid := strings.TrimSpace(storyID)
+	if repoPath == "" || sid == "" {
+		return false
+	}
+	resumePath := filepath.Join(repoPath, "tmp", fmt.Sprintf("ase-resume-%s.json", sid))
+	b, err := os.ReadFile(resumePath)
+	if err != nil {
+		return false
+	}
+	var payload struct {
+		Status string `json:"status"`
+		Phase  string `json:"phase"`
+	}
+	if json.Unmarshal(b, &payload) == nil {
+		if strings.EqualFold(payload.Status, "DONE") || strings.EqualFold(payload.Phase, "completed") {
+			return false
+		}
+	}
+	return true
 }
 
 func parseGitPorcelainV2(out string, res *RepoFleetStatusResult) {
@@ -255,24 +564,11 @@ func parseSubmoduleStatus(ctx context.Context, cleanPath string, out string, res
 }
 
 func parseASEState(repoPath string, res *RepoFleetStatusResult) {
-	stateFile := filepath.Join(repoPath, ".autopilot", "state.json")
-	if b, err := os.ReadFile(stateFile); err == nil {
-		var s struct {
-			State        string `json:"state"`
-			StoryID      string `json:"story_id"`
-			CurrentPhase string `json:"current_phase"`
-			UpdatedAt    string `json:"updated_at"`
-		}
-		if json.Unmarshal(b, &s) == nil {
-			if s.State != "" {
-				res.ASEState = s.State
-			}
-			res.ActiveStoryID = s.StoryID
-			res.CurrentPhase = s.CurrentPhase
-		}
-	}
+	parseASEStateWithOpts(repoPath, true, res)
+}
 
-	// Check locks
+func parseASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFleetStatusResult) {
+	// 1. Check locks first
 	var locks []string
 	if _, err := os.Stat(filepath.Join(repoPath, ".autopilot", "lock")); err == nil {
 		locks = append(locks, ".autopilot/lock")
@@ -284,6 +580,40 @@ func parseASEState(repoPath string, res *RepoFleetStatusResult) {
 		locks = append(locks, ".index.yml.lock")
 	}
 
+	isMainBranch := res.Branch == "" || res.Branch == "main" || res.Branch == "master"
+
+	// 2. Inspect .autopilot/state.json (and auto-remediate stale state when story is DONE or idle on main)
+	stateFile := filepath.Join(repoPath, ".autopilot", "state.json")
+	if b, err := os.ReadFile(stateFile); err == nil {
+		var s struct {
+			State        string `json:"state"`
+			StoryID      string `json:"story_id"`
+			CurrentPhase string `json:"current_phase"`
+			UpdatedAt    string `json:"updated_at"`
+		}
+		if json.Unmarshal(b, &s) == nil {
+			storyDone := s.StoryID != "" && IsStoryCompletedOnDisk(repoPath, s.StoryID)
+			staleIdlePhase := s.StoryID == "" && s.CurrentPhase != "" && (s.State == "" || s.State == "IDLE") && len(locks) == 0 && isMainBranch
+			if autoRemediateTier1 && (storyDone || staleIdlePhase) {
+				resetAutopilotStateFileToIdle(stateFile)
+				res.RemediationApplied = true
+				if storyDone {
+					res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("reset completed story %s in .autopilot/state.json", s.StoryID))
+				} else {
+					res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("cleared stale phase %s in .autopilot/state.json", s.CurrentPhase))
+				}
+			} else if !storyDone {
+				if s.State != "" {
+					res.ASEState = s.State
+				}
+				res.ActiveStoryID = s.StoryID
+				if !staleIdlePhase {
+					res.CurrentPhase = s.CurrentPhase
+				}
+			}
+		}
+	}
+
 	if len(locks) > 0 {
 		res.LockDetails = strings.Join(locks, ", ")
 		if res.ASEState == "IDLE" {
@@ -291,24 +621,48 @@ func parseASEState(repoPath string, res *RepoFleetStatusResult) {
 		}
 	}
 
-	// Check .session_story_id and tmp/ase-resume-*.json for interactive / ad-hoc ASE sessions
-	if b, err := os.ReadFile(filepath.Join(repoPath, ".session_story_id")); err == nil {
-		storyID := strings.TrimSpace(string(b))
-		if strings.HasPrefix(storyID, "STORY-") {
-			if res.ActiveStoryID == "" {
-				res.ActiveStoryID = storyID
-			}
-			nonMainBranch := res.Branch != "" && res.Branch != "main" && res.Branch != "master" && res.Branch != "HEAD"
-			hasResumeFile := false
-			if matches, _ := filepath.Glob(filepath.Join(repoPath, "tmp", "ase-resume-*.json")); len(matches) > 0 {
-				hasResumeFile = true
-			}
-			if nonMainBranch || len(res.NonMainSubmodules) > 0 || hasResumeFile {
-				if res.ASEState == "IDLE" || res.ASEState == "FAILED_DIRTY" {
-					res.ASEState = "RUNNING"
+	// 3. Prune completed tmp/ase-resume-STORY-*.json checkpoints when unlocked
+	if autoRemediateTier1 && len(locks) == 0 {
+		if matches, err := filepath.Glob(filepath.Join(repoPath, "tmp", "ase-resume-STORY-*.json")); err == nil {
+			for _, m := range matches {
+				base := filepath.Base(m)
+				candID := strings.TrimSuffix(strings.TrimPrefix(base, "ase-resume-"), ".json")
+				if IsStoryCompletedOnDisk(repoPath, candID) {
+					if os.Remove(m) == nil {
+						res.RemediationApplied = true
+						res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("removed completed checkpoint tmp/%s", base))
+					}
 				}
-				if res.CurrentPhase == "" {
-					res.CurrentPhase = "ADHOC_ASE"
+			}
+		}
+	}
+
+	// 4. Check .session_story_id and scoped tmp/ase-resume-<storyID>.json for interactive / ad-hoc ASE sessions
+	sessionPath := filepath.Join(repoPath, ".session_story_id")
+	if b, err := os.ReadFile(sessionPath); err == nil {
+		storyID := strings.TrimSpace(string(b))
+		if strings.HasPrefix(strings.ToUpper(storyID), "STORY-") {
+			if IsStoryCompletedOnDisk(repoPath, storyID) {
+				if autoRemediateTier1 {
+					if os.Remove(sessionPath) == nil {
+						res.RemediationApplied = true
+						res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("removed completed .session_story_id (%s)", storyID))
+					}
+					_ = os.Remove(filepath.Join(repoPath, "tmp", fmt.Sprintf("ase-resume-%s.json", storyID)))
+				}
+			} else {
+				if res.ActiveStoryID == "" {
+					res.ActiveStoryID = storyID
+				}
+				nonMainBranch := res.Branch != "" && res.Branch != "main" && res.Branch != "master" && res.Branch != "HEAD"
+				hasResumeFile := hasActiveScopedResumeFile(repoPath, storyID)
+				if nonMainBranch || len(res.NonMainSubmodules) > 0 || hasResumeFile {
+					if res.ASEState == "IDLE" || res.ASEState == "FAILED_DIRTY" {
+						res.ASEState = "RUNNING"
+					}
+					if res.CurrentPhase == "" {
+						res.CurrentPhase = "ADHOC_ASE"
+					}
 				}
 			}
 		}
@@ -319,20 +673,78 @@ func parseASEState(repoPath string, res *RepoFleetStatusResult) {
 	}
 }
 
+func resetAutopilotStateFileToIdle(stateFile string) {
+	b, err := os.ReadFile(stateFile)
+	if err != nil {
+		return
+	}
+	var s map[string]any
+	if json.Unmarshal(b, &s) != nil {
+		return
+	}
+	s["state"] = "IDLE"
+	s["story_id"] = ""
+	s["current_phase"] = ""
+	delete(s, "lock")
+	delete(s, "active_job_id")
+	s["updated_at"] = time.Now().UTC().Format(time.RFC3339)
+	if updated, errM := json.MarshalIndent(s, "", "  "); errM == nil {
+		_ = os.WriteFile(stateFile, append(updated, '\n'), 0o644)
+	}
+}
+
 func isDiagnosticCmdLine(cmdLine string) bool {
 	lower := strings.ToLower(cmdLine)
 	return strings.Contains(lower, "fleet-status") ||
+		strings.Contains(lower, "repo evaluate") ||
+		strings.Contains(lower, "repo remediate") ||
 		strings.Contains(lower, "status --json") ||
 		strings.Contains(lower, "auth status")
 }
 
 func reconcileAdhocASEState(repoPath string, res *RepoFleetStatusResult) {
-	if res.ToolLiveness == "LIVE" && res.ExecutionProvenance == "INDEPENDENT_USER_SESSION" {
+	reconcileAdhocASEStateWithOpts(repoPath, true, res)
+}
+
+func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFleetStatusResult) {
+	nonMainBranch := res.Branch != "" && res.Branch != "main" && res.Branch != "master" && res.Branch != "HEAD"
+	hasScopedResume := res.ActiveStoryID != "" && hasActiveScopedResumeFile(repoPath, res.ActiveStoryID)
+	isAutopilotProcess := strings.HasPrefix(strings.ToLower(res.AgentTool), "autopilot")
+
+	// Strict Ad-Hoc ASE Evidence Gate:
+	// An interactive agent shell (agy/cursor/opencode/claude) sitting on clean main with no bound story,
+	// no locks, and no autopilot* process is an idle shell — NOT an active ad-hoc ASE execution.
+	hasAffirmativeASEEvidence := res.LockDetails != "" ||
+		isAutopilotProcess ||
+		(res.ActiveStoryID != "" && (nonMainBranch || len(res.NonMainSubmodules) > 0 || hasScopedResume || res.ToolLiveness == "LIVE"))
+
+	if res.ToolLiveness == "LIVE" && res.ExecutionProvenance == "INDEPENDENT_USER_SESSION" && hasAffirmativeASEEvidence {
 		if res.ASEState == "IDLE" || res.ASEState == "FAILED_DIRTY" {
 			res.ASEState = "RUNNING"
 		}
+		if res.CurrentPhase == "" {
+			res.CurrentPhase = "ADHOC_ASE"
+		}
 	}
-	if res.ASEState == "RUNNING" && res.ActiveStoryID != "" &&
+
+	// If .session_story_id set ActiveStoryID on main, but there is no non-main branch, no locks,
+	// no scoped resume file, and no live agent tool in this repo, the session story file is stale.
+	if res.ActiveStoryID != "" && res.ASEState != "RUNNING" && !nonMainBranch &&
+		len(res.NonMainSubmodules) == 0 && res.LockDetails == "" && !hasScopedResume && res.ToolLiveness != "LIVE" {
+		if autoRemediateTier1 {
+			sessionPath := filepath.Join(repoPath, ".session_story_id")
+			if os.Remove(sessionPath) == nil {
+				res.RemediationApplied = true
+				res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("removed orphaned idle .session_story_id (%s)", res.ActiveStoryID))
+			}
+		}
+		res.ActiveStoryID = ""
+		if res.CurrentPhase == "ADHOC_ASE" {
+			res.CurrentPhase = ""
+		}
+	}
+
+	if res.ASEState == "RUNNING" &&
 		res.ExecutionProvenance != "COORDINATED_HARNESS" &&
 		res.ExecutionProvenance != "COORDINATED_HARNESS_FAILED" {
 		res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
@@ -387,7 +799,7 @@ func isPIDAlive(pid int) bool {
 
 func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 	if runtime.GOOS != "linux" {
-		// Non-linux fallback using ps if available
+		// Non-linux fallback using ps and lsof CWD inspection
 		discoverAgentProcessesFallback(repoPath, res)
 		return
 	}
@@ -420,8 +832,7 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 			continue
 		}
 
-		cleanTarget := filepath.Clean(targetCwd)
-		if !strings.HasPrefix(cleanTarget, repoPath) {
+		if !HasExactRepoPathBoundary(targetCwd, repoPath) {
 			continue
 		}
 
@@ -464,11 +875,6 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 				strings.Contains(environStr, "IAZIO_HARNESS_JOB_ID") ||
 				strings.Contains(environStr, "IAZIO_AGENT_MANAGED=1") {
 				res.ExecutionProvenance = "COORDINATED_HARNESS"
-			} else if strings.Contains(environStr, "SSH_CLIENT") ||
-				strings.Contains(environStr, "SSH_TTY") ||
-				strings.Contains(environStr, "TMUX") ||
-				strings.Contains(environStr, "TERM_PROGRAM") {
-				res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
 			} else {
 				res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
 			}
@@ -497,7 +903,7 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 		} else if res.WorktreeState == "DIRTY_MODIFIED" && res.ASEState == "IDLE" {
 			res.ASEState = "FAILED_DIRTY"
 			res.ToolLiveness = "TERMINATED"
-		} else if !res.IsClean {
+		} else if !res.IsClean && res.ASEState != "RUNNING" {
 			res.ToolLiveness = "TERMINATED"
 		}
 	}
@@ -513,8 +919,15 @@ func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult)
 			return
 		}
 		lines := strings.Split(string(out), "\n")
+		type candidateProc struct {
+			pid  int
+			tool string
+			line string
+		}
+		var cwdCandidates []candidateProc
+
 		for _, l := range lines {
-			if !strings.Contains(l, repoPath) || isDiagnosticCmdLine(l) {
+			if isDiagnosticCmdLine(l) {
 				continue
 			}
 			fields := strings.Fields(l)
@@ -524,16 +937,59 @@ func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult)
 					pid = p
 				}
 			}
-			if pid == selfPID || pid == parentPID {
+			if pid <= 1 || pid == selfPID || pid == parentPID {
 				continue
 			}
+			matchedTool := ""
 			for _, tool := range knownAgentBinaries {
 				if strings.Contains(l, tool) {
-					res.AgentPID = pid
-					res.AgentTool = tool
-					res.ToolLiveness = "LIVE"
-					res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
-					return
+					matchedTool = tool
+					break
+				}
+			}
+			if matchedTool == "" {
+				continue
+			}
+
+			// 1. Direct command-line path match with strict boundary verification
+			if LineContainsExactRepoPath(l, repoPath) {
+				res.AgentPID = pid
+				res.AgentTool = matchedTool
+				res.ToolLiveness = "LIVE"
+				res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+				return
+			}
+			cwdCandidates = append(cwdCandidates, candidateProc{pid: pid, tool: matchedTool, line: l})
+		}
+
+		// 2. Check working directory of candidate agent processes via lsof -a -d cwd -p <pids> -F pn
+		if len(cwdCandidates) > 0 {
+			pidStrs := make([]string, 0, len(cwdCandidates))
+			pidToTool := make(map[int]string, len(cwdCandidates))
+			for _, c := range cwdCandidates {
+				pidStrs = append(pidStrs, strconv.Itoa(c.pid))
+				pidToTool[c.pid] = c.tool
+			}
+			lsofCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			lsofCmd := procutil.CommandContext(lsofCtx, "lsof", "-a", "-d", "cwd", "-p", strings.Join(pidStrs, ","), "-F", "pn")
+			lsofOut, lsofErr := lsofCmd.Output()
+			cancel()
+			if lsofErr == nil && len(lsofOut) > 0 {
+				currPID := 0
+				for _, line := range strings.Split(string(lsofOut), "\n") {
+					line = strings.TrimSpace(line)
+					if strings.HasPrefix(line, "p") {
+						currPID, _ = strconv.Atoi(strings.TrimPrefix(line, "p"))
+					} else if strings.HasPrefix(line, "n") && currPID > 0 {
+						cwd := strings.TrimPrefix(line, "n")
+						if HasExactRepoPathBoundary(cwd, repoPath) {
+							res.AgentPID = currPID
+							res.AgentTool = pidToTool[currPID]
+							res.ToolLiveness = "LIVE"
+							res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+							return
+						}
+					}
 				}
 			}
 		}
@@ -574,7 +1030,7 @@ func ReapOrphanedProcesses(ctx context.Context, repoPath string) error {
 		if err != nil {
 			continue
 		}
-		if !strings.HasPrefix(filepath.Clean(targetCwd), cleanPath) {
+		if !HasExactRepoPathBoundary(targetCwd, cleanPath) {
 			continue
 		}
 
@@ -605,16 +1061,25 @@ func ReapOrphanedProcesses(ctx context.Context, repoPath string) error {
 	return nil
 }
 
-// ResetASELocks removes stale lock files and resets .autopilot/state.json to IDLE.
+// ResetASELocks removes stale lock files, purges .session_story_id and tmp/ase-resume-*.json,
+// and resets .autopilot/state.json to IDLE.
 func ResetASELocks(repoPath string) error {
 	cleanPath := filepath.Clean(repoPath)
 	locks := []string{
 		filepath.Join(cleanPath, ".autopilot", "lock"),
 		filepath.Join(cleanPath, ".ase", "active.lock"),
 		filepath.Join(cleanPath, ".index.yml.lock"),
+		filepath.Join(cleanPath, ".session_story_id"),
 	}
 	for _, l := range locks {
 		_ = os.Remove(l)
+	}
+	_ = repolock.ForceRelease(cleanPath)
+
+	if matches, err := filepath.Glob(filepath.Join(cleanPath, "tmp", "ase-resume-*.json")); err == nil {
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
 	}
 
 	stateFile := filepath.Join(cleanPath, ".autopilot", "state.json")
@@ -622,6 +1087,8 @@ func ResetASELocks(repoPath string) error {
 		var s map[string]any
 		if json.Unmarshal(b, &s) == nil {
 			s["state"] = "IDLE"
+			s["story_id"] = ""
+			s["current_phase"] = ""
 			s["lock"] = nil
 			s["active_job_id"] = ""
 			s["updated_at"] = time.Now().UTC().Format(time.RFC3339)
@@ -704,6 +1171,9 @@ func buildDiagnosticSummary(res *RepoFleetStatusResult) {
 	sb.WriteString(fmt.Sprintf("Provenance: %s\n", res.ExecutionProvenance))
 	if res.ActiveConversationID != "" {
 		sb.WriteString(fmt.Sprintf("Conversation ID: %s\n", res.ActiveConversationID))
+	}
+	if len(res.RemediationActions) > 0 {
+		sb.WriteString(fmt.Sprintf("Self-Remediation Actions: %s\n", strings.Join(res.RemediationActions, "; ")))
 	}
 
 	res.DiagnosticSummary = sb.String()
