@@ -315,19 +315,19 @@ func TestInspectRepoFleetStatus_AdhocASESessionStoryID(t *testing.T) {
 }
 
 func TestReadGitWorktreeBranch(t *testing.T) {
-	if got := readGitWorktreeBranch(filepath.Join(t.TempDir(), "nonexistent")); got != "" {
+	if got, ok := readGitWorktreeBranch(filepath.Join(t.TempDir(), "nonexistent")); ok || got != "" {
 		t.Fatalf("expected empty branch for nonexistent dir, got %q", got)
 	}
 
 	dir1 := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir1, ".git"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir1, ".git", "HEAD"), []byte("ref: refs/heads/feat/gov-5144\n"), 0o644)
-	if got := readGitWorktreeBranch(dir1); got != "feat/gov-5144" {
+	if got, ok := readGitWorktreeBranch(dir1); !ok || got != "feat/gov-5144" {
 		t.Fatalf("expected feat/gov-5144, got %q", got)
 	}
 
 	_ = os.WriteFile(filepath.Join(dir1, ".git", "HEAD"), []byte("abcdef1234567890\n"), 0o644)
-	if got := readGitWorktreeBranch(dir1); got != "" {
+	if got, ok := readGitWorktreeBranch(dir1); !ok || got != "" {
 		t.Fatalf("expected empty branch for detached HEAD, got %q", got)
 	}
 
@@ -338,7 +338,7 @@ func TestReadGitWorktreeBranch(t *testing.T) {
 	_ = os.MkdirAll(worktreeDir, 0o755)
 	_ = os.WriteFile(filepath.Join(worktreeDir, ".git"), []byte("gitdir: ../modules/sub1\n"), 0o644)
 	_ = os.WriteFile(filepath.Join(gitModulesDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644)
-	if got := readGitWorktreeBranch(worktreeDir); got != "main" {
+	if got, ok := readGitWorktreeBranch(worktreeDir); !ok || got != "main" {
 		t.Fatalf("expected main from gitdir file, got %q", got)
 	}
 }
