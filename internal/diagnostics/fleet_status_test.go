@@ -685,8 +685,14 @@ func TestRemediateRepo_StrategiesAndSkipsAndSubmoduleNoise(t *testing.T) {
 	if !IsStoryCompletedOnDisk(tmpDir, "STORY-IAZIO-0200") {
 		t.Errorf("expected IsStoryCompletedOnDisk via story file in iazio-infra/docs/stories to return true")
 	}
-	if !isDiagnosticCmdLine("iazio-harness fleet-status --repo /tmp --json") || !isDiagnosticCmdLine("iazio-harness repo evaluate") {
+	if !isDiagnosticCmdLine("iazio-harness fleet-status --repo /tmp --json") || !isDiagnosticCmdLine("iazio-harness repo evaluate") || !isDiagnosticCmdLine("/Users/romeo/.local/bin/autopilot-mcp serve") {
 		t.Errorf("expected isDiagnosticCmdLine=true")
+	}
+	if _, ok := isAgentTool("/Users/romeo/.local/bin/autopilot-mcp"); ok {
+		t.Errorf("expected autopilot-mcp to NOT be classified as an active agent tool")
+	}
+	if _, ok := isAuxiliaryTool("/Users/romeo/.local/bin/autopilot-mcp"); !ok {
+		t.Errorf("expected autopilot-mcp to be classified as an auxiliary tool")
 	}
 
 	// Cover buildDiagnosticSummary, readGitWorktreeBranch, parseSubmoduleStatus, reconcileAdhocASEStateWithOpts
