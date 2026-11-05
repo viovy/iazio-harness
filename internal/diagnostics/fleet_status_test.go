@@ -196,6 +196,8 @@ func TestParseSubmoduleStatusAndASE(t *testing.T) {
 	apDir := filepath.Join(tmpDir, ".autopilot")
 	os.MkdirAll(apDir, 0755)
 	os.WriteFile(filepath.Join(apDir, "state.json"), []byte(`{"state":"RUNNING","active_job_id":"job-123","lock":{"pid":99999999}}`), 0644)
+	sessionStoryPath := filepath.Join(tmpDir, ".session_story_id")
+	os.WriteFile(sessionStoryPath, []byte("STORY-GOV-5159\n"), 0644)
 	parseASEState(tmpDir, res)
 	if res.ASEState == "" {
 		t.Errorf("expected non-empty ASEState")
@@ -203,6 +205,9 @@ func TestParseSubmoduleStatusAndASE(t *testing.T) {
 
 	if err := ResetASELocks(tmpDir); err != nil {
 		t.Errorf("ResetASELocks failed: %v", err)
+	}
+	if _, err := os.Stat(sessionStoryPath); !os.IsNotExist(err) {
+		t.Errorf("expected .session_story_id to be removed by ResetASELocks, stat err=%v", err)
 	}
 	parseASEState(tmpDir, res)
 	if res.ASEState != "IDLE" {
