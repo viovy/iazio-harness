@@ -83,9 +83,14 @@ func InspectRepoFleetStatus(ctx context.Context, repoPath string) (*RepoFleetSta
 		}
 	}
 
-	// 2. Git Submodules
-	subCmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "submodule", "status", "--recursive")
-	if subOut, err := subCmd.CombinedOutput(); err == nil {
+	// 2. Git Submodules (use native C builtin submodule--helper status to avoid spawning MSYS2 sh.exe on Windows)
+	subCmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "submodule--helper", "status", "--recursive")
+	subOut, err := subCmd.CombinedOutput()
+	if err != nil {
+		subCmd = procutil.CommandContext(ctx, "git", "-C", cleanPath, "submodule", "status", "--recursive")
+		subOut, err = subCmd.CombinedOutput()
+	}
+	if err == nil {
 		parseSubmoduleStatus(ctx, cleanPath, string(subOut), res)
 	}
 
@@ -205,18 +210,26 @@ func parseSubmoduleStatus(ctx context.Context, cleanPath string, out string, res
 
 			// Deep check: inspect the submodule worktree itself for uncommitted files and current branch
 			if stat, err := os.Stat(fullSubPath); err == nil && stat.IsDir() {
-				subStatusCmd := procutil.CommandContext(ctx, "git", "-C", fullSubPath, "status", "--porcelain")
-				if subOut, err := subStatusCmd.Output(); err == nil && len(strings.TrimSpace(string(subOut))) > 0 {
-					hasUncommitted = true
-				}
-				branchCmd := procutil.CommandContext(ctx, "git", "-C", fullSubPath, "branch", "--show-current")
-				if bOut, err := branchCmd.Output(); err == nil {
-					currBranch := strings.TrimSpace(string(bOut))
-					if currBranch == "" {
-						currBranch = "detached"
+				if res.Branch == "" {
+					subStatusCmd := procutil.CommandContext(ctx, "git", "-C", fullSubPath, "status", "--porcelain")
+					if subOut, err := subStatusCmd.Output(); err == nil && len(strings.TrimSpace(string(subOut))) > 0 {
+						hasUncommitted = true
 					}
+				}
+				if currBranch, ok := readGitWorktreeBranch(fullSubPath); ok {
 					if currBranch != "main" && currBranch != "master" {
 						res.NonMainSubmodules = append(res.NonMainSubmodules, fmt.Sprintf("%s (on %s)", subPath, currBranch))
+					}
+				} else {
+					branchCmd := procutil.CommandContext(ctx, "git", "-C", fullSubPath, "branch", "--show-current")
+					if bOut, err := branchCmd.Output(); err == nil {
+						currBranch := strings.TrimSpace(string(bOut))
+						if currBranch == "" {
+							currBranch = "detached"
+						}
+						if currBranch != "main" && currBranch != "master" {
+							res.NonMainSubmodules = append(res.NonMainSubmodules, fmt.Sprintf("%s (on %s)", subPath, currBranch))
+						}
 					}
 				}
 			}
@@ -694,4 +707,41 @@ func buildDiagnosticSummary(res *RepoFleetStatusResult) {
 	}
 
 	res.DiagnosticSummary = sb.String()
+}
+
+func readGitWorktreeBranch(worktreePath string) (string, bool) {
+	dotGit := filepath.Join(worktreePath, ".git")
+	fi, err := os.Stat(dotGit)
+	if err != nil {
+		return "", false
+	}
+	gitDir := dotGit
+	if !fi.IsDir() {
+		raw, err := os.ReadFile(dotGit)
+		if err != nil {
+			return "", false
+		}
+		line := strings.TrimSpace(string(raw))
+		if !strings.HasPrefix(line, "gitdir:") {
+			return "", false
+		}
+		rel := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+		if filepath.IsAbs(rel) {
+			gitDir = rel
+		} else {
+			gitDir = filepath.Join(worktreePath, rel)
+		}
+	}
+	headRaw, err := os.ReadFile(filepath.Join(gitDir, "HEAD"))
+	if err != nil {
+		return "", false
+	}
+	head := strings.TrimSpace(string(headRaw))
+	if strings.HasPrefix(head, "ref: refs/heads/") {
+		return strings.TrimPrefix(head, "ref: refs/heads/"), true
+	}
+	if head != "" {
+		return "detached", true
+	}
+	return "", false
 }
