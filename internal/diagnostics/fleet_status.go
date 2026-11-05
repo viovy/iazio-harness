@@ -699,7 +699,10 @@ func isDiagnosticCmdLine(cmdLine string) bool {
 		strings.Contains(lower, "repo evaluate") ||
 		strings.Contains(lower, "repo remediate") ||
 		strings.Contains(lower, "status --json") ||
-		strings.Contains(lower, "auth status")
+		strings.Contains(lower, "auth status") ||
+		strings.Contains(lower, "autopilot-mcp") ||
+		strings.Contains(lower, "iazio-mcp") ||
+		strings.Contains(lower, "mcp serve")
 }
 
 func reconcileAdhocASEState(repoPath string, res *RepoFleetStatusResult) {
@@ -762,11 +765,14 @@ var knownAgentBinaries = []string{
 }
 
 var auxiliaryChildBinaries = []string{
-	"iazio-mcp", "node", "gopls", "rust-analyzer", "tsserver", "pyright", "python",
+	"iazio-mcp", "autopilot-mcp", "node", "gopls", "rust-analyzer", "tsserver", "pyright", "python",
 }
 
 func isAgentTool(cmd string) (string, bool) {
 	lower := strings.ToLower(filepath.Base(cmd))
+	if strings.Contains(lower, "-mcp") || strings.Contains(lower, "mcp-") || strings.HasSuffix(lower, "mcp") {
+		return "", false
+	}
 	for _, tool := range knownAgentBinaries {
 		if strings.Contains(lower, tool) {
 			return tool, true
