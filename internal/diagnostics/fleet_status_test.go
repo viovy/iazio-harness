@@ -327,7 +327,7 @@ func TestReadGitWorktreeBranch(t *testing.T) {
 	}
 
 	_ = os.WriteFile(filepath.Join(dir1, ".git", "HEAD"), []byte("abcdef1234567890\n"), 0o644)
-	if got, ok := readGitWorktreeBranch(dir1); !ok || got != "" {
+	if got, ok := readGitWorktreeBranch(dir1); !ok || got != "detached" {
 		t.Fatalf("expected empty branch for detached HEAD, got %q", got)
 	}
 
