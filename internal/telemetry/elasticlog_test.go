@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"io"
+	"log"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -157,3 +158,37 @@ func TestResolveTelemetryDestination(t *testing.T) {
 		t.Fatalf("expected direct ES url, got %q, isGw=%v", u4, isGw4)
 	}
 }
+
+func TestNewSlogHandler_SetDefault_DoesNotDeadlockLogPrintf(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	sink := NewElasticSink(ElasticConfig{
+		URL:         ts.URL,
+		IsGateway:   true,
+		ServiceName: "iazio-harness",
+	})
+	defer sink.Close()
+
+	origDefault := slog.Default()
+	defer slog.SetDefault(origDefault)
+
+	// Passing slog.Default().Handler() (*slog.defaultHandler) into NewSlogHandler and calling slog.SetDefault
+	// previously caused log.Printf to recursively lock log.Default().outMu and deadlock.
+	slog.SetDefault(slog.New(NewSlogHandler(sink, slog.Default().Handler())))
+
+	done := make(chan struct{})
+	go func() {
+		log.Printf("[iazio-harness] Auto-discovered latest conversation test-conv")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("log.Printf deadlocked after slog.SetDefault(slog.New(NewSlogHandler(sink, slog.Default().Handler())))")
+	}
+}
+

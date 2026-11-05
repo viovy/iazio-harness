@@ -519,7 +519,13 @@ type SlogHandler struct {
 }
 
 // NewSlogHandler creates a slog.Handler forwarding events to both next and sink.
+// If next is nil or is Go's internal *slog.defaultHandler (which writes back to
+// log.Default() and deadlocks when slog.SetDefault redirects log.Printf into slog),
+// it falls back to a standard stderr TextHandler.
 func NewSlogHandler(sink *ElasticSink, next slog.Handler) *SlogHandler {
+	if next == nil || fmt.Sprintf("%T", next) == "*slog.defaultHandler" {
+		next = slog.NewTextHandler(os.Stderr, nil)
+	}
 	return &SlogHandler{
 		sink: sink,
 		next: next,

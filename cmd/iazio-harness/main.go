@@ -91,7 +91,7 @@ func main() {
 		})
 		telemetry.SetGlobalSink(sink)
 		defer sink.Close()
-		slog.SetDefault(slog.New(telemetry.NewSlogHandler(sink, slog.Default().Handler())))
+		slog.SetDefault(slog.New(telemetry.NewSlogHandler(sink, slog.NewTextHandler(os.Stderr, nil))))
 	}
 
 	if err := run(os.Args[1:]); err != nil {
@@ -2174,6 +2174,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		return false, nil, ""
 	}
 
+	failedConvResumes := make(map[string]int)
 	for {
 		shouldResume, unmetGatesList, triggerReason := isContinuationTrigger()
 		if !shouldResume || autoResumeCount >= maxAutoResumes {
@@ -2207,6 +2208,16 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		}
 		if resumeTargetID == "" && !isControlPlaneResume {
 			resumeTargetID = resolveConversationFallback(worktree, currentBoundStoryID, engineName)
+		}
+		if execRes.ExitCode != 0 && resumeTargetID != "" {
+			failedConvResumes[resumeTargetID]++
+			if failedConvResumes[resumeTargetID] >= 2 {
+				// Conversation failed repeatedly on resume; fall back to starting a new conversation in-place.
+				resumeTargetID = ""
+				activeConvID = ""
+				confirmedConvID = ""
+				resumeConvID = ""
+			}
 		}
 
 		activeConvID = resumeTargetID

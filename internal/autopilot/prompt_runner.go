@@ -234,8 +234,13 @@ func discoverLogFileConversation(logPath string) string {
 }
 
 func discoverStoryFromASEState(workingDir string, after time.Time) (storyID, storyTitle, storyPath string) {
+	sid, stitle, spath, _ := discoverStoryFromASEStateWithSource(workingDir, after, true)
+	return sid, stitle, spath
+}
+
+func discoverStoryFromASEStateWithSource(workingDir string, after time.Time, allowDoneFallback bool) (storyID, storyTitle, storyPath string, fromSessionFile bool) {
 	if strings.TrimSpace(workingDir) == "" {
-		return "", "", ""
+		return "", "", "", false
 	}
 	checkSessionFile := func(p string) string {
 		fi, err := os.Stat(p)
@@ -270,6 +275,7 @@ func discoverStoryFromASEState(workingDir string, after time.Time) (storyID, sto
 				continue
 			}
 			storyID = sid
+			fromSessionFile = true
 			break
 		}
 	}
@@ -279,6 +285,11 @@ func discoverStoryFromASEState(workingDir string, after time.Time) (storyID, sto
 		filepath.Join(workingDir, "*", "docs", "stories", "*.story.md"),
 	}
 	var fallbackPointerTitle, fallbackPointerPath string
+	var bestActiveSID, bestActiveTitle, bestActivePath string
+	var bestActiveMod time.Time
+	var bestDoneSID, bestDoneTitle, bestDonePath string
+	var bestDoneMod time.Time
+
 	for _, pattern := range storyGlobs {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
@@ -294,7 +305,7 @@ func discoverStoryFromASEState(workingDir string, after time.Time) (storyID, sto
 				continue
 			}
 			content := string(b)
-			var fileSID, fileTitle string
+			var fileSID, fileTitle, fileStatus string
 			for _, line := range strings.Split(content, "\n") {
 				trimmed := strings.TrimSpace(line)
 				if strings.HasPrefix(trimmed, "id:") && fileSID == "" {
@@ -303,6 +314,8 @@ func discoverStoryFromASEState(workingDir string, after time.Time) (storyID, sto
 					}
 				} else if strings.HasPrefix(trimmed, "title:") && fileTitle == "" {
 					fileTitle = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "title:")), `"'`)
+				} else if strings.HasPrefix(trimmed, "status:") && fileStatus == "" {
+					fileStatus = strings.ToUpper(strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "status:")), `"'`))
 				}
 			}
 			if fileSID == "" {
@@ -324,24 +337,53 @@ func discoverStoryFromASEState(workingDir string, after time.Time) (storyID, sto
 				}
 				continue
 			}
-			if storyID == "" || fileSID == storyID {
-				if storyID == "" {
-					storyID = fileSID
+			if storyID != "" {
+				if fileSID == storyID {
+					if fileTitle != "" {
+						storyTitle = fileTitle
+					}
+					storyPath = relPath
+					break
 				}
-				if fileTitle != "" {
-					storyTitle = fileTitle
+				continue
+			}
+			isDone := fileStatus == "DONE" || fileStatus == "COMPLETED"
+			if isDone {
+				if !allowDoneFallback {
+					continue
 				}
-				storyPath = relPath
-				break
+				if bestDoneSID == "" || fi.ModTime().After(bestDoneMod) || (fi.ModTime().Equal(bestDoneMod) && relPath > bestDonePath) {
+					bestDoneSID = fileSID
+					bestDoneTitle = fileTitle
+					bestDonePath = relPath
+					bestDoneMod = fi.ModTime()
+				}
+			} else {
+				if bestActiveSID == "" || fi.ModTime().After(bestActiveMod) || (fi.ModTime().Equal(bestActiveMod) && relPath > bestActivePath) {
+					bestActiveSID = fileSID
+					bestActiveTitle = fileTitle
+					bestActivePath = relPath
+					bestActiveMod = fi.ModTime()
+				}
 			}
 		}
 	}
-	if storyID == "" && fallbackPointerID != "" {
-		storyID = fallbackPointerID
-		storyTitle = fallbackPointerTitle
-		storyPath = fallbackPointerPath
+	if storyID == "" {
+		if bestActiveSID != "" {
+			storyID = bestActiveSID
+			storyTitle = bestActiveTitle
+			storyPath = bestActivePath
+		} else if bestDoneSID != "" {
+			storyID = bestDoneSID
+			storyTitle = bestDoneTitle
+			storyPath = bestDonePath
+		} else if fallbackPointerID != "" {
+			storyID = fallbackPointerID
+			storyTitle = fallbackPointerTitle
+			storyPath = fallbackPointerPath
+		}
 	}
-	return storyID, storyTitle, storyPath
+	return storyID, storyTitle, storyPath, fromSessionFile
 }
 
 func resolveBrainDir() string {
@@ -1351,14 +1393,17 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			streamMu.Lock()
 			alreadyPostedStory := postedStoryID
 			streamMu.Unlock()
-			if curBoundStory == "" || alreadyPostedStory == "" || isPointerStoryID(curBoundStory) {
-				sid, stitle, spath := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second))
+			if curBoundStory == "" || alreadyPostedStory == "" || isPointerStoryID(curBoundStory) || strings.TrimSpace(opts.StoryID) == "" {
+				sid, stitle, spath, fromSession := discoverStoryFromASEStateWithSource(opts.WorkingDir, startTime.Add(-2*time.Second), false)
 				if sid == "" || (curBoundStory != "" && !isPointerStoryID(curBoundStory) && isPointerStoryID(sid)) {
 					sid = curBoundStory
 				}
 				if sid != "" {
 					streamMu.Lock()
-					if boundStoryID == "" || (isPointerStoryID(boundStoryID) && !isPointerStoryID(sid)) {
+					canOverride := boundStoryID == "" ||
+						(isPointerStoryID(boundStoryID) && !isPointerStoryID(sid)) ||
+						(strings.TrimSpace(opts.StoryID) == "" && fromSession && !isPointerStoryID(sid) && sid != boundStoryID)
+					if canOverride {
 						boundStoryID = sid
 						if stitle != "" {
 							storyTitle = stitle
@@ -1368,7 +1413,9 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 						}
 					}
 					curBoundStory = boundStoryID
-					shouldPost := postedStoryID == "" || (isPointerStoryID(postedStoryID) && !isPointerStoryID(curBoundStory))
+					shouldPost := postedStoryID == "" ||
+						(isPointerStoryID(postedStoryID) && !isPointerStoryID(curBoundStory)) ||
+						(strings.TrimSpace(opts.StoryID) == "" && fromSession && !isPointerStoryID(curBoundStory) && curBoundStory != postedStoryID)
 					if shouldPost {
 						postedStoryID = curBoundStory
 					}
@@ -1685,8 +1732,9 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 
 	isASEFlow := strings.Contains(opts.Prompt, "/autonomous-story-execution") || strings.TrimSpace(opts.StoryID) != "" || boundStoryID != ""
 
-	// Check if in-place auto-resume should be triggered when conversation ID is resolved
+	// Check if in-place auto-resume should be triggered when conversation ID is resolved or when agy crashes during an ASE flow
 	if (isMockAgy || isDirectAgy) && ctx.Err() == nil {
+		failedConvAttempts := make(map[string]int)
 		for resumeAttempts < maxAutoResumes {
 			streamMu.Lock()
 			curConv := detectedConvID
@@ -1723,8 +1771,17 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			hasDirtyWorktree := len(nonEphemeralModified) > 0
 			storyIncomplete := isStoryIncompleteInWorktree(opts.WorkingDir, curStory)
 			aseDirtyIncomplete := isASEFlow && hasDirtyWorktree
-			needsResume := curConv != "" && !hasHeadlessPermissionDenial(rawCombined) &&
-				(bgDrainReaped || printTimedOut || aseDirtyIncomplete || (storyIncomplete && (execStatus != "completed" || hasDirtyWorktree || bgDrainIdleRegex.MatchString(rawCombined))))
+
+			lowerCombined := strings.ToLower(rawCombined)
+			isFatalQuota := strings.Contains(lowerCombined, "resourceexhausted") || strings.Contains(lowerCombined, "429 you have exhausted")
+			isCorruptedSession := strings.Contains(lowerCombined, "conversation session corrupted") || strings.Contains(lowerCombined, "database disk image is malformed")
+			if (execStatus != "completed" || exitCode != 0) && curConv != "" {
+				failedConvAttempts[curConv]++
+			}
+			aseCrashOrIncomplete := isASEFlow && (execStatus != "completed" || exitCode != 0) && !isFatalQuota
+			needsResume := !hasHeadlessPermissionDenial(rawCombined) && !isFatalQuota &&
+				((curConv != "" && (bgDrainReaped || printTimedOut || aseDirtyIncomplete || (storyIncomplete && (execStatus != "completed" || hasDirtyWorktree || bgDrainIdleRegex.MatchString(rawCombined))))) ||
+					aseCrashOrIncomplete)
 
 			if !needsResume {
 				break
@@ -1735,17 +1792,37 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			if storyTarget == "" {
 				storyTarget = "active story"
 			}
-			resumeNote := fmt.Sprintf(
-				"[%s] [ASE-SUPERVISOR] [auto_resume.triggered] Auto-resuming conversation %s (attempt %d/%d, Story=%s, dirty_files=%d) to complete job after background drain / partial turn...\n",
-				time.Now().UTC().Format(time.RFC3339), curConv, resumeAttempts, maxAutoResumes, storyTarget, len(nonEphemeralModified),
-			)
-			emitSupervisorNote(resumeNote)
 
-			resumePrompt := fmt.Sprintf(
-				"Resume and complete /autonomous-story-execution for %s on conversation %s: finish remaining tasks, commit all worktree changes cleanly, mark story status: DONE, and complete all verification gates.",
-				storyTarget, curConv,
-			)
-			execStatus, exitCode, waitErr, bgDrainReaped, printTimedOut = runSingleTurn(resumePrompt, curConv, true)
+			fallbackToNewConv := curConv == "" || isCorruptedSession || (curConv != "" && failedConvAttempts[curConv] >= 2)
+			if fallbackToNewConv {
+				prevConv := curConv
+				curConv = ""
+				streamMu.Lock()
+				detectedConvID = ""
+				streamMu.Unlock()
+				resumeNote := fmt.Sprintf(
+					"[%s] [ASE-SUPERVISOR] [auto_resume.new_conversation_fallback] Previous conversation %q failed or was unresumable; starting new conversation (attempt %d/%d, Story=%s, dirty_files=%d) to complete ASE flow...\n",
+					time.Now().UTC().Format(time.RFC3339), prevConv, resumeAttempts, maxAutoResumes, storyTarget, len(nonEphemeralModified),
+				)
+				emitSupervisorNote(resumeNote)
+				resumePrompt := fmt.Sprintf(
+					"Resume and complete /autonomous-story-execution for %s in a new conversation: inspect existing worktree state, finish remaining tasks, commit all changes cleanly, mark story status: DONE, and complete all verification and git-flow gates.",
+					storyTarget,
+				)
+				execStatus, exitCode, waitErr, bgDrainReaped, printTimedOut = runSingleTurn(resumePrompt, "", false)
+			} else {
+				resumeNote := fmt.Sprintf(
+					"[%s] [ASE-SUPERVISOR] [auto_resume.triggered] Auto-resuming conversation %s (attempt %d/%d, Story=%s, dirty_files=%d) to complete job after background drain / partial turn...\n",
+					time.Now().UTC().Format(time.RFC3339), curConv, resumeAttempts, maxAutoResumes, storyTarget, len(nonEphemeralModified),
+				)
+				emitSupervisorNote(resumeNote)
+
+				resumePrompt := fmt.Sprintf(
+					"Resume and complete /autonomous-story-execution for %s on conversation %s: finish remaining tasks, commit all worktree changes cleanly, mark story status: DONE, and complete all verification gates.",
+					storyTarget, curConv,
+				)
+				execStatus, exitCode, waitErr, bgDrainReaped, printTimedOut = runSingleTurn(resumePrompt, curConv, true)
+			}
 		}
 	}
 
@@ -1802,8 +1879,10 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	detectedStoryPath := curBoundPath
 	detectedStoryTitle := curBoundTitle
 
-	if aseSID, aseTitle, asePath := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second)); aseSID != "" {
-		if detectedStoryID == "" || (isPointerStoryID(detectedStoryID) && !isPointerStoryID(aseSID)) {
+	if aseSID, aseTitle, asePath, fromSession := discoverStoryFromASEStateWithSource(opts.WorkingDir, startTime.Add(-2*time.Second), true); aseSID != "" {
+		if detectedStoryID == "" ||
+			(isPointerStoryID(detectedStoryID) && !isPointerStoryID(aseSID)) ||
+			(strings.TrimSpace(opts.StoryID) == "" && fromSession && !isPointerStoryID(aseSID) && aseSID != detectedStoryID) {
 			detectedStoryID = aseSID
 			if aseTitle != "" {
 				detectedStoryTitle = aseTitle
