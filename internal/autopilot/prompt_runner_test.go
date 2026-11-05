@@ -1200,7 +1200,7 @@ func TestJobCbbb1363993215f9_PulledDoneStoryNeverShadowsNewlyAllocatedSessionSto
 	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Tester").Run()
 
 	mockAgyBin := filepath.Join(t.TempDir(), "mock-agy")
-	buildCmd := exec.Command("go", "build", "-o", mockAgyBin, "../../cmd/mock-agy")
+	buildCmd := exec.Command("go", "build", "-buildvcs=false", "-o", mockAgyBin, "../../cmd/mock-agy")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("build mock-agy failed: %v (%s)", err, string(out))
 	}
@@ -1269,7 +1269,7 @@ func TestJob38eeeb536a5a7130_AgyCrashAutoResumeAndNewConversationFallback(t *tes
 	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Tester").Run()
 
 	mockAgyBin := filepath.Join(t.TempDir(), "mock-agy")
-	buildCmd := exec.Command("go", "build", "-o", mockAgyBin, "../../cmd/mock-agy")
+	buildCmd := exec.Command("go", "build", "-buildvcs=false", "-o", mockAgyBin, "../../cmd/mock-agy")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("build mock-agy failed: %v (%s)", err, string(out))
 	}
