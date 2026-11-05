@@ -11,6 +11,10 @@ import (
 
 func TestMockAgy_ScenariosUnit(t *testing.T) {
 	t.Setenv("MOCK_AGY_FAST", "1")
+	suiteTmp := t.TempDir()
+	origSuiteWd, _ := os.Getwd()
+	_ = os.Chdir(suiteTmp)
+	defer func() { _ = os.Chdir(origSuiteWd) }()
 
 	t.Run("Scenario1_OrdinaryPromptWithMCPDaemons", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
@@ -415,6 +419,29 @@ func TestMockAgy_ScenariosUnit(t *testing.T) {
 		logBytes, _ := os.ReadFile(logFile)
 		if !strings.Contains(string(logBytes), "WaitForConversationFullyIdle") {
 			t.Fatalf("expected WaitForConversationFullyIdle in log file: %s", string(logBytes))
+		}
+	})
+
+	t.Run("Scenario19_JobCbbb1363993215f9_Wave4PulledDoneStoryOverride", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		origWd, _ := os.Getwd()
+		_ = os.Chdir(tmpDir)
+		defer func() { _ = os.Chdir(origWd) }()
+
+		t.Setenv("HOME", tmpDir)
+		t.Setenv("MOCK_AGY_UNIT", "1")
+
+		_ = exec.Command("git", "init").Run()
+		_ = exec.Command("git", "config", "user.email", "test@test.local").Run()
+		_ = exec.Command("git", "config", "user.name", "Tester").Run()
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"--print=/autonomous-story-execution Wave 4 canonical AI hygiene"}, "job_cbbb1363993215f9_wave4_pulled_done_story_override", &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("expected exit 0, got %d: %s", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "STORY-GOV-5154") {
+			t.Fatalf("expected STORY-GOV-5154 in stdout: %s", stdout.String())
 		}
 	})
 }

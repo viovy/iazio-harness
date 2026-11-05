@@ -711,6 +711,98 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		time.Sleep(drainSleep)
 		return 0
 
+	case "job_cbbb1363993215f9_wave4_pulled_done_story_override":
+		// Scenario (job_cbbb1363993215f9 / Wave 4 story.create_and_execute):
+		// 1. At turn start, git pull updates an older DONE story file docs/stories/2026-11-04-gov-5144-resilient-user-services.story.md
+		//    before .session_story_id is written.
+		// 2. After a brief pause (allowing syncTurnTelemetry to poll), the agent allocates STORY-GOV-5154,
+		//    writes STORY-GOV-5154 to .session_story_id, creates docs/stories/2026-11-05-gov-5154-canonical-ai-hygiene-and-skills.story.md,
+		//    marks it DONE, and commits cleanly.
+		cid := conversationID
+		if cid == "" {
+			cid = "884ed49e-4331-4f9a-919d-28bd2ffde6a1"
+		}
+		if logFileWriter != nil {
+			fmt.Fprintf(logFileWriter, "Created conversation %s\n", cid)
+		} else {
+			fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+		}
+		_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
+		pulledDoneStory := filepath.Join("docs", "stories", "2026-11-04-gov-5144-resilient-user-services.story.md")
+		_ = os.WriteFile(pulledDoneStory, []byte("---\nid: STORY-GOV-5144\ntitle: Resilient User Services\nstatus: DONE\n---\n"), 0644)
+		_ = procutil.Command("git", "add", "docs").Run()
+		_ = procutil.Command("git", "commit", "-m", "chore: simulate git pull of STORY-GOV-5144").Run()
+
+		// Pause briefly so syncTurnTelemetry observes the pulled DONE story before .session_story_id exists
+		pause := 150 * time.Millisecond
+		if os.Getenv("MOCK_AGY_UNIT") == "1" {
+			pause = 25 * time.Millisecond
+		}
+		time.Sleep(pause)
+
+		// Now allocate STORY-GOV-5154 in .session_story_id and docs/stories/
+		_ = os.WriteFile(".session_story_id", []byte("STORY-GOV-5154\n"), 0644)
+		newStory := filepath.Join("docs", "stories", "2026-11-05-gov-5154-canonical-ai-hygiene-and-skills.story.md")
+		_ = os.WriteFile(newStory, []byte("---\nid: STORY-GOV-5154\ntitle: Wave 4 Canonical AI Hygiene and Skills\nstatus: IN_PROGRESS\n---\n"), 0644)
+		time.Sleep(pause)
+
+		// Mark STORY-GOV-5154 DONE and commit cleanly
+		_ = os.WriteFile(newStory, []byte("---\nid: STORY-GOV-5154\ntitle: Wave 4 Canonical AI Hygiene and Skills\nstatus: DONE\n---\n"), 0644)
+		_ = procutil.Command("git", "add", "docs").Run()
+		_ = procutil.Command("git", "commit", "-m", "feat(ai): complete Wave 4 canonical AI hygiene [STORY-GOV-5154]").Run()
+		fmt.Fprintf(stdout, "Completed Wave 4 story STORY-GOV-5154 cleanly.\n")
+		return 0
+
+	case "job_38eeeb536a5a7130_crash_resume_and_new_conv_fallback":
+		// Scenario (job_38eeeb536a5a7130 mutual supervision & crash resilience):
+		// Turn 1: Starts conversation 1aee4b3a-fedd-4c71-a7b5-4b816e7664a5, binds STORY-IAZIO-0185, and crashes (exit 1).
+		// Turn 2: Resumes conversation 1aee4b3a-fedd-4c71-a7b5-4b816e7664a5, and crashes again with a corrupted session error (exit 1).
+		// Turn 3: iazio-harness falls back to a NEW conversation (empty conversationID), completes STORY-IAZIO-0185 (status: DONE), and commits cleanly (exit 0).
+		stateMarker := filepath.Join(os.TempDir(), "mock_agy_38eeeb53_turn.tmp")
+		if customMarker := os.Getenv("MOCK_AGY_STATE_MARKER"); customMarker != "" {
+			stateMarker = customMarker
+		}
+		rawTurn, _ := os.ReadFile(stateMarker)
+		turnState := strings.TrimSpace(string(rawTurn))
+		initialConv := "1aee4b3a-fedd-4c71-a7b5-4b816e7664a5"
+		fallbackConv := "2bff5c4b-a111-4c71-a7b5-999988887777"
+		storyFile := filepath.Join("docs", "stories", "2026-11-05-iazio-0185-telemetry-and-harvester.story.md")
+
+		if turnState == "" {
+			_ = os.WriteFile(stateMarker, []byte("turn1_crashed"), 0644)
+			if logFileWriter != nil {
+				fmt.Fprintf(logFileWriter, "Created conversation %s\n", initialConv)
+			} else {
+				fmt.Fprintf(stdout, "Created conversation %s\n", initialConv)
+			}
+			_ = os.WriteFile(".session_story_id", []byte("STORY-IAZIO-0185\n"), 0644)
+			_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
+			_ = os.WriteFile(storyFile, []byte("---\nid: STORY-IAZIO-0185\ntitle: Telemetry and Harvester Fixes\nstatus: IN_PROGRESS\n---\n"), 0644)
+			fmt.Fprintln(stderr, "[mock-agy] Turn 1 unexpected crash while executing STORY-IAZIO-0185.")
+			return 1
+		}
+		if turnState == "turn1_crashed" {
+			_ = os.WriteFile(stateMarker, []byte("turn2_corrupted"), 0644)
+			fmt.Fprintf(stderr, "Error: database disk image is malformed: conversation session corrupted for %s\n", conversationID)
+			return 1
+		}
+		_ = os.Remove(stateMarker)
+		if conversationID != "" {
+			fmt.Fprintf(stderr, "Error: expected new conversation fallback (empty conversationID), got %q\n", conversationID)
+			return 1
+		}
+		if logFileWriter != nil {
+			fmt.Fprintf(logFileWriter, "Created conversation %s\n", fallbackConv)
+		} else {
+			fmt.Fprintf(stdout, "Created conversation %s\n", fallbackConv)
+		}
+		_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
+		_ = os.WriteFile(storyFile, []byte("---\nid: STORY-IAZIO-0185\ntitle: Telemetry and Harvester Fixes\nstatus: DONE\n---\n"), 0644)
+		_ = procutil.Command("git", "add", "docs").Run()
+		_ = procutil.Command("git", "commit", "-m", "feat(iazio-0185): complete STORY-IAZIO-0185 in new conversation fallback [STORY-IAZIO-0185]").Run()
+		fmt.Fprintf(stdout, "[mock-agy] Completed STORY-IAZIO-0185 in new conversation %s.\n", fallbackConv)
+		return 0
+
 	default:
 		// Default simple execution
 		if conversationID != "" {

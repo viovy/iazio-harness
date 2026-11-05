@@ -1184,6 +1184,122 @@ fi
 		t.Fatalf("expected conversation liveness record at %s: %v", filepath.Join(liveDir, pinnedConv+".json"), err)
 	}
 	if _, err := os.Stat(wdFile); err != nil {
-		t.Fatalf("expected local watchdog state file at %s: %v", wdFile, err)
+		t.Fatalf("expected local watchdog state file at %s: %s", wdFile, err)
 	}
 }
+
+func TestJobCbbb1363993215f9_PulledDoneStoryNeverShadowsNewlyAllocatedSessionStory(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("MOCK_AGY_SCENARIO", "job_cbbb1363993215f9_wave4_pulled_done_story_override")
+	t.Setenv("MOCK_AGY_UNIT", "1")
+
+	repoDir := t.TempDir()
+	_ = exec.Command("git", "-C", repoDir, "init").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Tester").Run()
+
+	mockAgyBin := filepath.Join(t.TempDir(), "mock-agy")
+	buildCmd := exec.Command("go", "build", "-o", mockAgyBin, "../../cmd/mock-agy")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("build mock-agy failed: %v (%s)", err, string(out))
+	}
+
+	var mu sync.Mutex
+	var boundStoryIDs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/story-binding") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if sid, ok := body["story_id"].(string); ok {
+				mu.Lock()
+				boundStoryIDs = append(boundStoryIDs, sid)
+				mu.Unlock()
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	runner := NewPromptRunner("autopilot")
+	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:     "prompt_job_cbbb1363993215f9",
+		JobID:        "job_cbbb1363993215f9",
+		APIURL:       srv.URL,
+		Token:        "tok-cbbb1363",
+		FencingToken: 1,
+		Repo:         "meta-repo",
+		StoryID:      "", // story.create_and_execute has empty initial StoryID
+		Prompt:       "/autonomous-story-execution Wave 4 canonical AI hygiene",
+		TargetAgent:  mockAgyBin,
+		WorkingDir:   repoDir,
+		Timeout:      10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("expected RunPrompt to succeed, got err=%v", err)
+	}
+	if res.StoryID != "STORY-GOV-5154" {
+		t.Fatalf("expected res.StoryID='STORY-GOV-5154' (NOT pulled DONE STORY-GOV-5144), got %q", res.StoryID)
+	}
+	if res.StoryTitle != "Wave 4 Canonical AI Hygiene and Skills" {
+		t.Fatalf("expected res.StoryTitle='Wave 4 Canonical AI Hygiene and Skills', got %q", res.StoryTitle)
+	}
+	mu.Lock()
+	bindings := append([]string(nil), boundStoryIDs...)
+	mu.Unlock()
+	for _, b := range bindings {
+		if b == "STORY-GOV-5144" {
+			t.Fatalf("expected live polling to ignore pulled DONE story STORY-GOV-5144, got bindings=%v", bindings)
+		}
+	}
+	if len(bindings) == 0 || bindings[len(bindings)-1] != "STORY-GOV-5154" {
+		t.Fatalf("expected final story binding to be STORY-GOV-5154, got %v", bindings)
+	}
+}
+
+func TestJob38eeeb536a5a7130_AgyCrashAutoResumeAndNewConversationFallback(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("MOCK_AGY_SCENARIO", "job_38eeeb536a5a7130_crash_resume_and_new_conv_fallback")
+	t.Setenv("MOCK_AGY_STATE_MARKER", filepath.Join(homeDir, "mock_agy_38eeeb53_turn.tmp"))
+
+	repoDir := t.TempDir()
+	_ = exec.Command("git", "-C", repoDir, "init").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Tester").Run()
+
+	mockAgyBin := filepath.Join(t.TempDir(), "mock-agy")
+	buildCmd := exec.Command("go", "build", "-o", mockAgyBin, "../../cmd/mock-agy")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("build mock-agy failed: %v (%s)", err, string(out))
+	}
+
+	runner := NewPromptRunner("autopilot")
+	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:     "prompt_job_38eeeb536a5a7130",
+		JobID:        "job_38eeeb536a5a7130",
+		Repo:         "meta-repo",
+		StoryID:      "STORY-IAZIO-0185",
+		Prompt:       "/autonomous-story-execution STORY-IAZIO-0185",
+		TargetAgent:  mockAgyBin,
+		WorkingDir:   repoDir,
+		Timeout:      15 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("expected RunPrompt to recover from agy crash and corrupted conversation via new conversation fallback, got err=%v", err)
+	}
+	if res.Status != "completed" || res.ExitCode != 0 {
+		t.Fatalf("expected status=completed exit=0, got status=%s exit=%d", res.Status, res.ExitCode)
+	}
+	if res.StoryID != "STORY-IAZIO-0185" {
+		t.Fatalf("expected StoryID=STORY-IAZIO-0185, got %q", res.StoryID)
+	}
+	if res.ActiveConversationID != "2bff5c4b-a111-4c71-a7b5-999988887777" {
+		t.Fatalf("expected ActiveConversationID to switch to fallback conversation 2bff5c4b-a111-4c71-a7b5-999988887777, got %q", res.ActiveConversationID)
+	}
+	if !strings.Contains(res.Summary, "auto_resume.new_conversation_fallback") {
+		t.Fatalf("expected supervisor log to record auto_resume.new_conversation_fallback, got:\n%s", res.Summary)
+	}
+}
+
+
