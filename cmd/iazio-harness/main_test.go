@@ -2798,3 +2798,35 @@ func TestExecuteJob_MissingStoryValidation_NoGitPollution(t *testing.T) {
 		t.Fatalf("git context polluted with dirty files: %s", string(out))
 	}
 }
+
+func TestRunRepo_EvaluateAndRemediate(t *testing.T) {
+	tmpDir := t.TempDir()
+	exec.Command("git", "init", "-b", "main", tmpDir).Run()
+	exec.Command("git", "-C", tmpDir, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", tmpDir, "config", "user.name", "Test User").Run()
+	_ = os.WriteFile(filepath.Join(tmpDir, "README.md"), []byte("hello\n"), 0o644)
+	exec.Command("git", "-C", tmpDir, "add", "README.md").Run()
+	exec.Command("git", "-C", tmpDir, "commit", "-m", "init").Run()
+
+	if err := run([]string{"repo", "evaluate", "--repo", tmpDir, "--auto-remediate", "--json"}); err != nil {
+		t.Fatalf("run repo evaluate failed: %v", err)
+	}
+	if err := run([]string{"repo", "--repo=" + tmpDir, "--auto-remediate=true", "--json"}); err != nil {
+		t.Fatalf("run repo default evaluate failed: %v", err)
+	}
+	if err := run([]string{"repo", "status", "--worktree-path=" + tmpDir}); err != nil {
+		t.Fatalf("run repo status text failed: %v", err)
+	}
+	if err := run([]string{"repo", "remediate", "--repo", tmpDir, "--strategy", "tier1", "--json"}); err != nil {
+		t.Fatalf("run repo remediate tier1 failed: %v", err)
+	}
+	if err := run([]string{"repo", "remediate", "--repo=" + tmpDir, "--strategy=safe"}); err != nil {
+		t.Fatalf("run repo remediate safe text failed: %v", err)
+	}
+	if err := run([]string{"repo", "heal", "--worktree-path=" + tmpDir, "--tier=tier1", "--json"}); err != nil {
+		t.Fatalf("run repo heal tier1 failed: %v", err)
+	}
+	if err := run([]string{"remediate", "--worktree-path", tmpDir, "--force", "--json"}); err != nil {
+		t.Fatalf("run remediate force-clean failed: %v", err)
+	}
+}

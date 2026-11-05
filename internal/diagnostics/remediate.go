@@ -281,8 +281,8 @@ func cleanSubmoduleEphemeralNoise(ctx context.Context, subFullPath string) bool 
 	if err != nil {
 		return false
 	}
-	raw := strings.TrimSpace(string(out))
-	if raw == "" {
+	raw := strings.TrimRight(string(out), "\r\n")
+	if strings.TrimSpace(raw) == "" {
 		return false
 	}
 	lines := strings.Split(raw, "\n")
