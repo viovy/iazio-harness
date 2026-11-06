@@ -308,3 +308,33 @@ func TestSweepDeadProcesses_PrefersHarnessPIDOverDeadToolPID(t *testing.T) {
 		t.Fatalf("expected 0 reaped jobs while HarnessPID is alive, got %v", reaped)
 	}
 }
+
+func TestSyntheticTestTrackedJobAndDefaultStateLoad(t *testing.T) {
+	if !isSyntheticTestTrackedJob(nil) {
+		t.Errorf("expected nil job to be synthetic")
+	}
+	if !isSyntheticTestTrackedJob(&TrackedJob{JobID: "job-cp-fallback"}) {
+		t.Errorf("expected job-cp-fallback to be synthetic")
+	}
+	if !isSyntheticTestTrackedJob(&TrackedJob{JobID: "job-reap-1"}) {
+		t.Errorf("expected job-reap-1 to be synthetic")
+	}
+	if !isSyntheticTestTrackedJob(&TrackedJob{JobID: "job-1", WorktreePath: "/tmp/TestExecuteJob_123"}) {
+		t.Errorf("expected TestExecuteJob_ worktree path to be synthetic")
+	}
+	if isSyntheticTestTrackedJob(&TrackedJob{JobID: "job_real_123", WorktreePath: "/work/sample-repo"}) {
+		t.Errorf("expected real job not to be synthetic")
+	}
+
+	tempDir := t.TempDir()
+	sf := filepath.Join(tempDir, "preloaded.json")
+	_ = os.WriteFile(sf, []byte(`[{"job_id":"job_real_123","pid":1234,"status":"RUNNING","worktree_path":"/work/sample-repo"}]`), 0o644)
+	wLoaded := New(Options{StateFile: sf})
+	if _, ok := wLoaded.GetJob("job_real_123"); !ok {
+		t.Errorf("expected loadState to load job_real_123 from disk")
+	}
+	wDefault := New(Options{})
+	if wDefault == nil {
+		t.Errorf("expected default Watchdog instance")
+	}
+}

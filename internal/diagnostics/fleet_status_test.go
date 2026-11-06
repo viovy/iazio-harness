@@ -813,6 +813,8 @@ func TestInspectAndRemediate_TrackedSessionStoryIDAndStrategyGitUpdate(t *testin
 
 	// Now dirty README.md as if a completed ASE job left residual modifications, and run StrategyGitUpdate
 	_ = os.WriteFile(filepath.Join(tmpDir, "README.md"), []byte("v2-dirty-after-ase\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(tmpDir, ".DS_Store"), []byte("noise\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(tmpDir, ".gitmodules"), []byte(""), 0o644)
 	if NormalizeStrategy("git-update") != StrategyGitUpdate {
 		t.Fatalf("expected NormalizeStrategy(git-update) == StrategyGitUpdate")
 	}
@@ -826,4 +828,32 @@ func TestInspectAndRemediate_TrackedSessionStoryIDAndStrategyGitUpdate(t *testin
 	if remRes.FleetStatus == nil || !remRes.FleetStatus.IsClean || remRes.FleetStatus.ASEState != "IDLE" {
 		t.Errorf("expected StrategyGitUpdate to leave repo CLEAN and IDLE, got %+v", remRes.FleetStatus)
 	}
+
+	// Also exercise executePostASEGitUpdateRemediation with dirty submodule and untracked root files
+	subDir := filepath.Join(tmpDir, "sub1")
+	_ = os.MkdirAll(subDir, 0o755)
+	exec.Command("git", "init", "-b", "main", subDir).Run()
+	exec.Command("git", "-C", subDir, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", subDir, "config", "user.name", "Test User").Run()
+	_ = os.WriteFile(filepath.Join(subDir, "sub.txt"), []byte("v1\n"), 0o644)
+	exec.Command("git", "-C", subDir, "add", ".").Run()
+	exec.Command("git", "-C", subDir, "commit", "-m", "sub init").Run()
+	_ = os.WriteFile(filepath.Join(subDir, "sub.txt"), []byte("v2-dirty\n"), 0o644)
+
+	stWithSub := &RepoFleetStatusResult{
+		RepoPath:          tmpDir,
+		Branch:            "feat/old",
+		IsClean:           false,
+		SubmodulesClean:   false,
+		ModifiedFiles:     []string{".DS_Store"},
+		UntrackedFiles:    []string{".DS_Store"},
+		DirtySubmodules:   []string{"sub1 (uncommitted changes)"},
+		NonMainSubmodules: []string{"sub1 (on feat/sub)"},
+	}
+	_, _ = executePostASEGitUpdateRemediation(context.Background(), time.Now(), tmpDir, stWithSub, &RemediateResult{
+		RepoPath: tmpDir,
+		Strategy: StrategyGitUpdate,
+		Success:  true,
+	})
+	_ = resolveAutopilotBinary()
 }
