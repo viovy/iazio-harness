@@ -177,16 +177,17 @@ type PromptResult struct {
 }
 
 type chunkStreamingWriter struct {
-	mu           *sync.Mutex
-	buf          *bytes.Buffer
-	lastOutAt    *time.Time
-	streamedAny  *bool
-	convDetected *string
-	ctx          context.Context
-	apiURL       string
-	token        string
-	jobID        string
-	stream       string
+	mu             *sync.Mutex
+	buf            *bytes.Buffer
+	lastOutAt      *time.Time
+	streamedAny    *bool
+	convDetected   *string
+	onConvDetected func(string)
+	ctx            context.Context
+	apiURL         string
+	token          string
+	jobID          string
+	stream         string
 }
 
 func (w *chunkStreamingWriter) Write(p []byte) (int, error) {
@@ -208,15 +209,50 @@ func (w *chunkStreamingWriter) Write(p []byte) (int, error) {
 	if canPost {
 		*w.streamedAny = true
 	}
+	onConv := w.onConvDetected
 	w.mu.Unlock()
 
-	if newConv != "" && w.jobID != "" && w.apiURL != "" {
-		_ = controlplane.PostConversation(w.ctx, w.apiURL, w.token, w.jobID, newConv)
+	if newConv != "" {
+		_, _ = fmt.Fprintf(os.Stderr, "CONVERSATION_ID: %s\nACTIVE_CONVERSATION_ID: %s\n", newConv, newConv)
+		if onConv != nil {
+			onConv(newConv)
+		}
+		if w.jobID != "" && w.apiURL != "" {
+			_ = controlplane.PostConversation(w.ctx, w.apiURL, w.token, w.jobID, newConv)
+		}
 	}
 	if canPost {
 		_ = controlplane.PostChunk(w.ctx, w.apiURL, w.token, w.jobID, w.stream, text)
 	}
 	return len(p), nil
+}
+
+func discoverRepoLockConversation(workingDir string, after time.Time) string {
+	if strings.TrimSpace(workingDir) == "" {
+		return ""
+	}
+	lockPath := filepath.Join(workingDir, ".iazio", "repo.lock")
+	fi, err := os.Stat(lockPath)
+	if err != nil || fi.IsDir() || fi.ModTime().Before(after) {
+		return ""
+	}
+	b, err := os.ReadFile(lockPath)
+	if err != nil || len(b) == 0 {
+		return ""
+	}
+	var payload struct {
+		ConversationID string `json:"conversation_id"`
+	}
+	if err := json.Unmarshal(b, &payload); err == nil {
+		cid := strings.TrimSpace(payload.ConversationID)
+		if sessionstore.IsValidConversationID(cid) {
+			return cid
+		}
+	}
+	if m := convIDRegex.FindStringSubmatch(string(b)); len(m) > 1 && sessionstore.IsValidConversationID(m[1]) {
+		return m[1]
+	}
+	return ""
 }
 
 func discoverLogFileConversation(logPath string) string {
@@ -1097,23 +1133,25 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	lastOutAt := startTime
 	streamedAny := false
 	detectedConvID := initialResumeConv
+	if detectedConvID == "" {
+		if envConv := strings.TrimSpace(os.Getenv("IAZIO_CONVERSATION_ID")); sessionstore.IsValidConversationID(envConv) {
+			detectedConvID = envConv
+		}
+	}
 	boundStoryID := storyID
 	var storyTitle, storyPath string
 	postedStoryID := ""
 	seenTranscriptSteps := make(map[int]bool)
 
-	var stdoutW io.Writer = &stdoutBuf
-	var stderrW io.Writer = &stderrBuf
-	if jobID != "" && apiURL != "" {
-		stdoutW = &chunkStreamingWriter{
-			mu: &streamMu, buf: &stdoutBuf, lastOutAt: &lastOutAt, streamedAny: &streamedAny,
-			convDetected: &detectedConvID, ctx: ctx, apiURL: apiURL, token: token, jobID: jobID, stream: "stdout",
-		}
-		stderrW = &chunkStreamingWriter{
-			mu: &streamMu, buf: &stderrBuf, lastOutAt: &lastOutAt, streamedAny: &streamedAny,
-			convDetected: &detectedConvID, ctx: ctx, apiURL: apiURL, token: token, jobID: jobID, stream: "stderr",
-		}
+	if detectedConvID != "" {
+		_, _ = fmt.Fprintf(os.Stderr, "CONVERSATION_ID: %s\nACTIVE_CONVERSATION_ID: %s\n", detectedConvID, detectedConvID)
 	}
+	if boundStoryID != "" {
+		_, _ = fmt.Fprintf(os.Stderr, "ALLOCATED_STORY_ID: %s\n", boundStoryID)
+	}
+
+	var stdoutW io.Writer
+	var stderrW io.Writer
 
 	emitSupervisorNote := func(msg string) {
 		streamMu.Lock()
@@ -1239,6 +1277,23 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	var failureCategory string
 	var failureStage string
 
+	onStreamConvDetected := func(newConv string) {
+		streamMu.Lock()
+		curStory := boundStoryID
+		streamMu.Unlock()
+		emitJobHeartbeat(lastToolPID, newConv, curStory)
+	}
+	stdoutW = &chunkStreamingWriter{
+		mu: &streamMu, buf: &stdoutBuf, lastOutAt: &lastOutAt, streamedAny: &streamedAny,
+		convDetected: &detectedConvID, onConvDetected: onStreamConvDetected,
+		ctx: ctx, apiURL: apiURL, token: token, jobID: jobID, stream: "stdout",
+	}
+	stderrW = &chunkStreamingWriter{
+		mu: &streamMu, buf: &stderrBuf, lastOutAt: &lastOutAt, streamedAny: &streamedAny,
+		convDetected: &detectedConvID, onConvDetected: onStreamConvDetected,
+		ctx: ctx, apiURL: apiURL, token: token, jobID: jobID, stream: "stderr",
+	}
+
 	runSingleTurn := func(turnPrompt string, resumeConvID string, isResumeTurn bool) (turnStatus string, turnExit int, turnErr error, turnBgDrainReaped bool, turnPrintTimeout bool) {
 		streamMu.Lock()
 		turnStartOutLen := stdoutBuf.Len()
@@ -1324,6 +1379,9 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				tsStr, jobID, os.Getpid(), toolPID, effectiveAgent, storyLabel, opts.WorkingDir, tsStr, redact.Egress(promptPreview),
 			)
 			tok := resolveToken()
+			if activeConv != "" {
+				_ = controlplane.PostConversation(ctx, apiURL, tok, jobID, activeConv)
+			}
 			_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", banner)
 			_ = controlplane.PostTick(ctx, apiURL, tok, jobID, 0, os.Getpid(), toolPID, int(time.Since(startTime).Seconds()))
 			emitJobHeartbeat(toolPID, activeConv, boundStoryID)
@@ -1368,6 +1426,9 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			if curConv == "" {
 				cid := discoverLogFileConversation(tmpLogPath)
 				if cid == "" {
+					cid = discoverRepoLockConversation(opts.WorkingDir, startTime.Add(-2*time.Second))
+				}
+				if cid == "" {
 					cid = discoverNewBrainConversation(startTime.Add(-2*time.Second), preExistingConvs)
 				}
 				if cid != "" {
@@ -1378,14 +1439,15 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					curConv = detectedConvID
 					lastOutAt = time.Now()
 					streamMu.Unlock()
+					_, _ = fmt.Fprintf(os.Stderr, "CONVERSATION_ID: %s\nACTIVE_CONVERSATION_ID: %s\n", cid, cid)
+					emitJobHeartbeat(toolPID, cid, curBoundStory)
+					lastJobHeartbeatAt = time.Now()
 					if jobID != "" && apiURL != "" {
 						tok := resolveToken()
 						_ = controlplane.PostConversation(ctx, apiURL, tok, jobID, cid)
 						convMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Attached Antigravity conversation: %s\n", time.Now().UTC().Format(time.RFC3339), cid)
 						_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", convMsg)
-						emitJobHeartbeat(toolPID, cid, curBoundStory)
 						lastHeartbeatChunkAt = time.Now()
-						lastJobHeartbeatAt = time.Now()
 					}
 				}
 			}
@@ -1424,14 +1486,17 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					if stitle == "" {
 						stitle = opts.Title
 					}
-					if shouldPost && jobID != "" && apiURL != "" {
-						tok := resolveToken()
-						_ = controlplane.PostStoryBinding(ctx, apiURL, tok, jobID, curBoundStory, stitle, spath, fencingToken)
-						storyMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Bound governing story: %s (%s)\n", time.Now().UTC().Format(time.RFC3339), curBoundStory, stitle)
-						_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", storyMsg)
+					if shouldPost {
+						_, _ = fmt.Fprintf(os.Stderr, "ALLOCATED_STORY_ID: %s\n", curBoundStory)
 						emitJobHeartbeat(toolPID, curConv, curBoundStory)
-						lastHeartbeatChunkAt = time.Now()
 						lastJobHeartbeatAt = time.Now()
+						if jobID != "" && apiURL != "" {
+							tok := resolveToken()
+							_ = controlplane.PostStoryBinding(ctx, apiURL, tok, jobID, curBoundStory, stitle, spath, fencingToken)
+							storyMsg := fmt.Sprintf("[%s] [ASE-SUPERVISOR] Bound governing story: %s (%s)\n", time.Now().UTC().Format(time.RFC3339), curBoundStory, stitle)
+							_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", storyMsg)
+							lastHeartbeatChunkAt = time.Now()
+						}
 					}
 				}
 			}
@@ -1650,6 +1715,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		if curConvFinal == "" {
 			if cid := discoverLogFileConversation(tmpLogPath); cid != "" {
 				curConvFinal = cid
+			} else if cid := discoverRepoLockConversation(opts.WorkingDir, startTime.Add(-2*time.Second)); cid != "" {
+				curConvFinal = cid
 			} else if m := convIDRegex.FindStringSubmatch(outFinal + "\n" + errFinal); len(m) > 1 && sessionstore.IsValidConversationID(m[1]) {
 				curConvFinal = m[1]
 			} else if cid := discoverNewBrainConversation(startTime.Add(-2*time.Second), preExistingConvs); cid != "" {
@@ -1659,9 +1726,10 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				streamMu.Lock()
 				detectedConvID = curConvFinal
 				streamMu.Unlock()
+				_, _ = fmt.Fprintf(os.Stderr, "CONVERSATION_ID: %s\nACTIVE_CONVERSATION_ID: %s\n", curConvFinal, curConvFinal)
+				emitJobHeartbeat(toolPID, curConvFinal, boundStoryID)
 				if jobID != "" && apiURL != "" {
 					_ = controlplane.PostConversation(ctx, apiURL, resolveToken(), jobID, curConvFinal)
-					emitJobHeartbeat(toolPID, curConvFinal, boundStoryID)
 				}
 			}
 		}

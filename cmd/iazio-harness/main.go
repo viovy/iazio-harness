@@ -1741,6 +1741,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 			confirmedConvID = cid
 			activeConvID = cid
 
+			_, _ = fmt.Fprintf(os.Stdout, "CONVERSATION_ID: %s\nACTIVE_CONVERSATION_ID: %s\n", cid, cid)
+			_, _ = fmt.Fprintf(os.Stderr, "CONVERSATION_ID: %s\nACTIVE_CONVERSATION_ID: %s\n", cid, cid)
+
 			span.AddAnnotation(fmt.Sprintf("conversation_detected:%s:fallback=%v:role=%s", cid, isFallback, role))
 			_ = lockHandle.Update(repolock.LockInfo{
 				JobID:          job.ID,
