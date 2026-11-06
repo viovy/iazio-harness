@@ -166,8 +166,8 @@ func InspectRepoFleetStatusWithOptions(ctx context.Context, repoPath string, opt
 	reconcileAdhocASEStateWithOpts(cleanPath, opts.AutoRemediateTier1, res)
 
 	// 4c. Optional Tier 2 safe remediation when idle on main/master
-	if opts.AutoRemediateSafe && res.ASEState == "IDLE" && isMainBranch && res.LockDetails == "" && !res.HasActiveGitLock {
-		needsSafeRemediation := (!res.IsClean && hasOnlyRemediableMainNoise(res)) || res.Behind > 0 || res.WorktreeState == "CLEAN_SUBMODULE_DRIFT"
+	if opts.AutoRemediateSafe && (res.ASEState == "IDLE" || res.ASEState == "FAILED_DIRTY") && isMainBranch && res.LockDetails == "" && !res.HasActiveGitLock {
+		needsSafeRemediation := (!res.IsClean && hasOnlyRemediableMainNoise(res)) || (res.IsClean && res.Behind > 0) || res.WorktreeState == "CLEAN_SUBMODULE_DRIFT"
 		if needsSafeRemediation {
 			if remRes, remErr := RemediateRepo(ctx, RemediateOptions{
 				RepoPath: cleanPath,
@@ -639,14 +639,24 @@ func parseASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFl
 
 	// 4. Check .session_story_id and scoped tmp/ase-resume-<storyID>.json for interactive / ad-hoc ASE sessions
 	sessionPath := filepath.Join(repoPath, ".session_story_id")
+	if autoRemediateTier1 && len(locks) == 0 && isMainBranch {
+		if _, statErr := os.Stat(sessionPath); os.IsNotExist(statErr) && isGitTrackedFile(repoPath, ".session_story_id") {
+			if procutil.Command("git", "-C", repoPath, "checkout", "HEAD", "--", ".session_story_id").Run() == nil {
+				res.RemediationApplied = true
+				res.RemediationActions = append(res.RemediationActions, "restored deleted tracked .session_story_id to HEAD")
+				removeModifiedFileFromStatus(res, ".session_story_id")
+			}
+		}
+	}
 	if b, err := os.ReadFile(sessionPath); err == nil {
 		storyID := strings.TrimSpace(string(b))
 		if strings.HasPrefix(strings.ToUpper(storyID), "STORY-") {
 			if IsStoryCompletedOnDisk(repoPath, storyID) {
 				if autoRemediateTier1 {
-					if os.Remove(sessionPath) == nil {
+					if changed, action := cleanOrRestoreSessionStoryFile(repoPath, storyID); changed {
 						res.RemediationApplied = true
-						res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("removed completed .session_story_id (%s)", storyID))
+						res.RemediationActions = append(res.RemediationActions, action)
+						removeModifiedFileFromStatus(res, ".session_story_id")
 					}
 					_ = os.Remove(filepath.Join(repoPath, "tmp", fmt.Sprintf("ase-resume-%s.json", storyID)))
 				}
@@ -670,6 +680,73 @@ func parseASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFl
 
 	if len(locks) == 0 && res.WorktreeState == "DIRTY_MODIFIED" && res.ASEState == "IDLE" {
 		res.ASEState = "FAILED_DIRTY"
+	}
+}
+
+func isGitTrackedFile(repoPath, relFile string) bool {
+	if strings.TrimSpace(repoPath) == "" || strings.TrimSpace(relFile) == "" {
+		return false
+	}
+	cmd := procutil.Command("git", "-C", repoPath, "ls-files", "--error-unmatch", relFile)
+	return cmd.Run() == nil
+}
+
+func cleanOrRestoreSessionStoryFile(repoPath, storyID string) (bool, string) {
+	sessionPath := filepath.Join(repoPath, ".session_story_id")
+	if isGitTrackedFile(repoPath, ".session_story_id") {
+		out, err := procutil.Command("git", "-C", repoPath, "status", "--porcelain", "--", ".session_story_id").Output()
+		if err == nil && strings.TrimSpace(string(out)) != "" {
+			if procutil.Command("git", "-C", repoPath, "checkout", "HEAD", "--", ".session_story_id").Run() == nil {
+				return true, fmt.Sprintf("restored tracked .session_story_id (%s) to HEAD", storyID)
+			}
+		}
+		return false, ""
+	}
+	if os.Remove(sessionPath) == nil {
+		return true, fmt.Sprintf("removed completed .session_story_id (%s)", storyID)
+	}
+	return false, ""
+}
+
+func removeModifiedFileFromStatus(res *RepoFleetStatusResult, relFile string) {
+	if res == nil {
+		return
+	}
+	filtered := make([]string, 0, len(res.ModifiedFiles))
+	for _, f := range res.ModifiedFiles {
+		if f != relFile {
+			filtered = append(filtered, f)
+		}
+	}
+	if len(filtered) == len(res.ModifiedFiles) {
+		return
+	}
+	res.ModifiedFiles = filtered
+	res.DirtyFilesCount = len(res.ModifiedFiles) + len(res.DirtySubmodules)
+	hasModifiedFiles := len(res.ModifiedFiles) > 0
+	hasUntrackedFiles := len(res.UntrackedFiles) > 0
+	hasDirtySubmodules := len(res.DirtySubmodules) > 0
+	hasSubmoduleDrift := len(res.SubmoduleDrift) > 0
+	hasNonMainSubmodules := len(res.NonMainSubmodules) > 0
+	isMainBranch := res.Branch == "main" || res.Branch == "master"
+	if res.HasActiveGitLock || hasModifiedFiles || hasDirtySubmodules {
+		res.WorktreeState = "DIRTY_MODIFIED"
+		res.IsClean = false
+	} else if hasUntrackedFiles {
+		res.WorktreeState = "DIRTY_UNTRACKED_ONLY"
+		res.IsClean = false
+	} else if !isMainBranch {
+		res.WorktreeState = "BRANCH_NOT_MAIN"
+		res.IsClean = false
+	} else if hasNonMainSubmodules {
+		res.WorktreeState = "SUBMODULES_NOT_MAIN"
+		res.IsClean = false
+	} else if hasSubmoduleDrift {
+		res.WorktreeState = "CLEAN_SUBMODULE_DRIFT"
+		res.IsClean = true
+	} else {
+		res.WorktreeState = "CLEAN"
+		res.IsClean = true
 	}
 }
 
@@ -702,7 +779,10 @@ func isDiagnosticCmdLine(cmdLine string) bool {
 		strings.Contains(lower, "auth status") ||
 		strings.Contains(lower, "autopilot-mcp") ||
 		strings.Contains(lower, "iazio-mcp") ||
-		strings.Contains(lower, "mcp serve")
+		strings.Contains(lower, "mcp serve") ||
+		strings.Contains(lower, "git-update") ||
+		strings.Contains(lower, " --hub") ||
+		strings.HasSuffix(strings.TrimSpace(lower), "--hub")
 }
 
 func reconcileAdhocASEState(repoPath string, res *RepoFleetStatusResult) {
@@ -730,15 +810,21 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 		}
 	}
 
+	// If no affirmative ad-hoc ASE evidence exists and ASE is not RUNNING/IN_PROGRESS,
+	// clear INDEPENDENT_USER_SESSION provenance so idle shells on clean/dirty repos do not pause queues.
+	if !hasAffirmativeASEEvidence && res.ASEState != "RUNNING" && res.ASEState != "IN_PROGRESS" && res.ExecutionProvenance == "INDEPENDENT_USER_SESSION" {
+		res.ExecutionProvenance = "NONE"
+	}
+
 	// If .session_story_id set ActiveStoryID on main, but there is no non-main branch, no locks,
 	// no scoped resume file, and no live agent tool in this repo, the session story file is stale.
 	if res.ActiveStoryID != "" && res.ASEState != "RUNNING" && !nonMainBranch &&
 		len(res.NonMainSubmodules) == 0 && res.LockDetails == "" && !hasScopedResume && res.ToolLiveness != "LIVE" {
 		if autoRemediateTier1 {
-			sessionPath := filepath.Join(repoPath, ".session_story_id")
-			if os.Remove(sessionPath) == nil {
+			if changed, action := cleanOrRestoreSessionStoryFile(repoPath, res.ActiveStoryID); changed {
 				res.RemediationApplied = true
-				res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("removed orphaned idle .session_story_id (%s)", res.ActiveStoryID))
+				res.RemediationActions = append(res.RemediationActions, action)
+				removeModifiedFileFromStatus(res, ".session_story_id")
 			}
 		}
 		res.ActiveStoryID = ""
@@ -1067,19 +1153,19 @@ func ReapOrphanedProcesses(ctx context.Context, repoPath string) error {
 	return nil
 }
 
-// ResetASELocks removes stale lock files, purges .session_story_id and tmp/ase-resume-*.json,
-// and resets .autopilot/state.json to IDLE.
+// ResetASELocks removes stale lock files, purges untracked .session_story_id (or restores tracked .session_story_id to HEAD)
+// and tmp/ase-resume-*.json, and resets .autopilot/state.json to IDLE.
 func ResetASELocks(repoPath string) error {
 	cleanPath := filepath.Clean(repoPath)
 	locks := []string{
 		filepath.Join(cleanPath, ".autopilot", "lock"),
 		filepath.Join(cleanPath, ".ase", "active.lock"),
 		filepath.Join(cleanPath, ".index.yml.lock"),
-		filepath.Join(cleanPath, ".session_story_id"),
 	}
 	for _, l := range locks {
 		_ = os.Remove(l)
 	}
+	_, _ = cleanOrRestoreSessionStoryFile(cleanPath, "reset")
 	_ = repolock.ForceRelease(cleanPath)
 
 	if matches, err := filepath.Glob(filepath.Join(cleanPath, "tmp", "ase-resume-*.json")); err == nil {

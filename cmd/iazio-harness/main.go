@@ -1157,6 +1157,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	if err != nil {
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: checkout lock on %s: %v\n", targetDir, err))
 		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
+		wd.Fail(job.ID, 1, err.Error())
 		return fmt.Errorf("checkout lock: %w", err)
 	}
 	defer lock.Release()
@@ -1187,6 +1188,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	if err != nil {
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: open spool for job %s: %v\n", jobID, err))
 		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
+		wd.Fail(job.ID, 1, err.Error())
 		return fmt.Errorf("open spool: %w", err)
 	}
 	defer sp.Close()
@@ -1261,6 +1263,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	if err != nil {
 		_ = controlplane.PostChunk(context.Background(), api, token, jobID, "stderr", fmt.Sprintf("[iazio-harness] Pre-execution failure: prepare prompt for job %s: %v\n", jobID, err))
 		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
+		wd.Fail(job.ID, 1, err.Error())
 		return fmt.Errorf("prepare prompt: %w", err)
 	}
 
@@ -1319,6 +1322,7 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	if lockErr != nil {
 		_ = sp.AppendRaw("stderr", []byte(fmt.Sprintf("[iazio-harness] Repository lock failure: %v\n", lockErr)))
 		_ = controlplane.PostExit(context.Background(), api, token, jobID, 1)
+		wd.Fail(job.ID, 1, lockErr.Error())
 		return fmt.Errorf("repolock: %w", lockErr)
 	}
 	defer lockHandle.Release()

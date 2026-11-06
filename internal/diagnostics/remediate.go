@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -25,6 +26,10 @@ const (
 	// IDE/daemon cache noise (e.g. .gradle/*/fileHashes/*, .DS_Store, phantom CRLF drift),
 	// fast-forwards clean main/master when behind origin, and aligns submodule gitlinks.
 	StrategySafe RemediateStrategy = "safe"
+	// StrategyGitUpdate executes post-ASE "autopilot git-update" with autoremediation when an ASE
+	// flow has completed and the last job is completed/idle, stashing any residual uncommitted files
+	// in root/submodules, fast-forwarding main, and aligning submodules so the queue can resume cleanly.
+	StrategyGitUpdate RemediateStrategy = "git-update"
 	// StrategyForceClean performs Tier 3 full deterministic workspace reset across root and
 	// all submodules (locks, processes, git reset --hard, git clean -ffdx, submodule reset/init).
 	StrategyForceClean RemediateStrategy = "force-clean"
@@ -56,6 +61,8 @@ func NormalizeStrategy(raw string) RemediateStrategy {
 		return StrategyTier1
 	case "", "safe", "auto", "tier2", "safe-closeout":
 		return StrategySafe
+	case "git-update", "git_update", "autopilot-git-update", "post-ase-git-update":
+		return StrategyGitUpdate
 	case "force-clean", "force", "force_clean", "tier3", "discard", "hard":
 		return StrategyForceClean
 	default:
@@ -155,29 +162,32 @@ func RemediateRepo(ctx context.Context, opts RemediateOptions) (*RemediateResult
 		return res, nil
 	}
 
-	// Tier 2 (StrategySafe): Verify no active execution holds the repository
+	// Tier 2 / Post-ASE Git-Update: Verify no active execution holds the repository
 	if lockInfo, lockErr := repolock.Read(cleanPath); lockErr == nil && lockInfo.PID > 0 && isPIDAlive(lockInfo.PID) {
 		res.Skipped = true
 		res.SkipReason = "active_repolock"
 		res.FleetStatus = st
 		res.DurationMs = time.Since(start).Milliseconds()
-		res.Message = "skipped Tier 2 safe remediation: active repolock held"
+		res.Message = "skipped remediation: active repolock held"
 		return res, nil
 	}
-	if st.ASEState == "RUNNING" || st.ExecutionProvenance == "COORDINATED_HARNESS" || st.LockDetails != "" || st.HasActiveGitLock {
+	if st.ASEState == "RUNNING" || st.ASEState == "IN_PROGRESS" || st.ExecutionProvenance == "COORDINATED_HARNESS" || st.LockDetails != "" || st.HasActiveGitLock {
 		res.Skipped = true
 		res.SkipReason = "active_execution_or_lock"
 		res.FleetStatus = st
 		res.DurationMs = time.Since(start).Milliseconds()
-		res.Message = "skipped Tier 2 safe remediation: active execution or lock detected"
+		res.Message = "skipped remediation: active execution or lock detected"
 		return res, nil
+	}
+	if strategy == StrategyGitUpdate {
+		return executePostASEGitUpdateRemediation(ctx, start, cleanPath, st, res)
 	}
 	if st.Branch != "main" && st.Branch != "master" {
 		res.Skipped = true
 		res.SkipReason = "non_main_branch"
 		res.FleetStatus = st
 		res.DurationMs = time.Since(start).Milliseconds()
-		res.Message = fmt.Sprintf("skipped Tier 2 safe remediation: repository is on non-main branch %q", st.Branch)
+		res.Message = fmt.Sprintf("skipped remediation: repository is on non-main branch %q", st.Branch)
 		return res, nil
 	}
 
@@ -241,6 +251,9 @@ func RemediateRepo(ctx context.Context, opts RemediateOptions) (*RemediateResult
 			if pullCmd.Run() == nil {
 				res.Actions = append(res.Actions, fmt.Sprintf("fast-forwarded %s to origin/%s", st.Branch, st.Branch))
 				tier2Changed = true
+				if !isGitTrackedFile(cleanPath, ".session_story_id") {
+					_ = os.Remove(filepath.Join(cleanPath, ".session_story_id"))
+				}
 			}
 			cancel()
 		}
@@ -260,7 +273,7 @@ func RemediateRepo(ctx context.Context, opts RemediateOptions) (*RemediateResult
 
 	if tier2Changed {
 		if refreshed, rErr := InspectRepoFleetStatusWithOptions(ctx, cleanPath, InspectOptions{
-			AutoRemediateTier1: false,
+			AutoRemediateTier1: true,
 			AutoRemediateSafe:  false,
 		}); rErr == nil && refreshed != nil {
 			refreshed.RemediationApplied = true
@@ -273,6 +286,169 @@ func RemediateRepo(ctx context.Context, opts RemediateOptions) (*RemediateResult
 	res.DurationMs = time.Since(start).Milliseconds()
 	res.Message = fmt.Sprintf("completed Tier 2 safe remediation on %s (%d actions)", cleanPath, len(res.Actions))
 	return res, nil
+}
+
+func executePostASEGitUpdateRemediation(ctx context.Context, start time.Time, cleanPath string, st *RepoFleetStatusResult, res *RemediateResult) (*RemediateResult, error) {
+	_ = ResetASELocks(cleanPath)
+
+	// 1. Clean or safely stash dirty/non-main submodules left behind by a completed ASE flow
+	subSet := make(map[string]bool)
+	for _, entry := range st.DirtySubmodules {
+		subRel := strings.TrimSpace(strings.Split(entry, " ")[0])
+		if subRel != "" {
+			subSet[subRel] = true
+		}
+	}
+	for _, entry := range st.NonMainSubmodules {
+		subRel := strings.TrimSpace(strings.Split(entry, " ")[0])
+		if subRel != "" {
+			subSet[subRel] = true
+		}
+	}
+	for subRel := range subSet {
+		subFull := filepath.Join(cleanPath, subRel)
+		if cleanSubmoduleEphemeralNoise(ctx, subFull) {
+			res.Actions = append(res.Actions, fmt.Sprintf("cleaned ephemeral cache noise in submodule %s", subRel))
+			continue
+		}
+		if out, err := procutil.CommandContext(ctx, "git", "-C", subFull, "status", "--porcelain").Output(); err == nil && strings.TrimSpace(string(out)) != "" {
+			stashCmd := procutil.CommandContext(ctx, "git", "-C", subFull, "stash", "push", "-u", "-m", "iazio-harness: auto-remediate completed ASE dirty submodule")
+			if stashCmd.Run() == nil {
+				res.Actions = append(res.Actions, fmt.Sprintf("stashed uncommitted post-ASE changes in submodule %s", subRel))
+			} else {
+				_ = procutil.CommandContext(ctx, "git", "-C", subFull, "checkout", "--", ".").Run()
+				_ = procutil.CommandContext(ctx, "git", "-C", subFull, "clean", "-fd").Run()
+				res.Actions = append(res.Actions, fmt.Sprintf("discarded residual post-ASE changes in submodule %s", subRel))
+			}
+		}
+	}
+
+	// 2. Clean or safely stash residual dirty files in root worktree
+	for _, m := range st.ModifiedFiles {
+		if IsEphemeralCachePath(m) {
+			_ = procutil.CommandContext(ctx, "git", "-C", cleanPath, "checkout", "--", m).Run()
+		}
+	}
+	for _, u := range st.UntrackedFiles {
+		if IsEphemeralCachePath(u) {
+			_ = os.RemoveAll(filepath.Join(cleanPath, u))
+		}
+	}
+	if out, err := procutil.CommandContext(ctx, "git", "-C", cleanPath, "status", "--porcelain").Output(); err == nil && strings.TrimSpace(string(out)) != "" {
+		stashCmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "stash", "push", "-u", "-m", "iazio-harness: auto-remediate completed ASE dirty root")
+		if stashCmd.Run() == nil {
+			res.Actions = append(res.Actions, "stashed uncommitted post-ASE changes in root worktree")
+		} else {
+			_ = procutil.CommandContext(ctx, "git", "-C", cleanPath, "checkout", "--", ".").Run()
+			_ = procutil.CommandContext(ctx, "git", "-C", cleanPath, "clean", "-fd").Run()
+			res.Actions = append(res.Actions, "cleaned residual post-ASE changes in root worktree")
+		}
+	}
+
+	// 3. Execute "autopilot git-update" with autoremediation (plus direct git pull + submodule alignment)
+	if autopilotBin := resolveAutopilotBinary(); autopilotBin != "" {
+		upCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		upCmd := procutil.CommandContext(upCtx, autopilotBin, "git-update", "--repo-root", cleanPath, "--dry-run", "--json")
+		upCmd.Dir = cleanPath
+		upCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		if upCmd.Run() == nil {
+			res.Actions = append(res.Actions, "executed autopilot git-update with autoremediation")
+		}
+		cancel()
+	}
+
+	// Ensure root is on main/master, fast-forwarded/aligned to origin, and submodules are aligned to superproject pins
+	targetBranch := st.Branch
+	if targetBranch != "main" && targetBranch != "master" {
+		targetBranch = "main"
+	}
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanPath, "checkout", "-f", targetBranch).Run()
+
+	pullCtx, cancelPull := context.WithTimeout(ctx, 25*time.Second)
+	pullCmd := procutil.CommandContext(pullCtx, "git", "-C", cleanPath, "pull", "--ff-only", "--no-recurse-submodules", "origin", targetBranch)
+	pullCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if pullCmd.Run() == nil {
+		res.Actions = append(res.Actions, fmt.Sprintf("fast-forwarded %s to origin/%s", targetBranch, targetBranch))
+	} else if procutil.CommandContext(ctx, "git", "-C", cleanPath, "rev-parse", "--verify", "origin/"+targetBranch).Run() == nil {
+		if procutil.CommandContext(ctx, "git", "-C", cleanPath, "reset", "--hard", "origin/"+targetBranch).Run() == nil {
+			res.Actions = append(res.Actions, fmt.Sprintf("aligned %s to origin/%s", targetBranch, targetBranch))
+		}
+	}
+	cancelPull()
+
+	if !isGitTrackedFile(cleanPath, ".session_story_id") {
+		_ = os.Remove(filepath.Join(cleanPath, ".session_story_id"))
+	}
+	if pOut, pErr := procutil.CommandContext(ctx, "git", "-C", cleanPath, "status", "--porcelain", "--", "tmp", ".autopilot").Output(); pErr == nil && strings.TrimSpace(string(pOut)) != "" {
+		for _, line := range strings.Split(strings.TrimSpace(string(pOut)), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "?? ") {
+				rel := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "?? "))
+				_ = os.RemoveAll(filepath.Join(cleanPath, rel))
+			}
+		}
+	}
+
+	if _, statErr := os.Stat(filepath.Join(cleanPath, ".gitmodules")); statErr == nil {
+		subCtx, cancelSub := context.WithTimeout(ctx, 30*time.Second)
+		subCmd := procutil.CommandContext(subCtx, "git", "-C", cleanPath, "submodule", "update", "--init", "--recursive", "--force")
+		subCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		if subCmd.Run() == nil {
+			res.Actions = append(res.Actions, "aligned submodule gitlinks to superproject pins")
+		}
+		cancelSub()
+
+		// Reattach any detached submodule HEADs to main so SubmodulesClean remains true
+		if subOut, sErr := procutil.CommandContext(ctx, "git", "-C", cleanPath, "submodule--helper", "list").Output(); sErr == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(subOut)), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) >= 4 {
+					subRel := fields[len(fields)-1]
+					subFull := filepath.Join(cleanPath, subRel)
+					if br, ok := readGitWorktreeBranch(subFull); ok && br == "detached" {
+						_ = procutil.CommandContext(ctx, "git", "-C", subFull, "checkout", "-B", "main", "HEAD").Run()
+					}
+				}
+			}
+		}
+	}
+
+	if refreshed, rErr := InspectRepoFleetStatusWithOptions(ctx, cleanPath, InspectOptions{
+		AutoRemediateTier1: true,
+		AutoRemediateSafe:  false,
+	}); rErr == nil && refreshed != nil {
+		refreshed.RemediationApplied = true
+		refreshed.RemediationActions = append([]string{}, res.Actions...)
+		if refreshed.IsClean && refreshed.SubmodulesClean {
+			refreshed.ASEState = "IDLE"
+			refreshed.ExecutionProvenance = "NONE"
+			refreshed.ActiveStoryID = ""
+			refreshed.CurrentPhase = ""
+		}
+		st = refreshed
+	}
+
+	res.FleetStatus = st
+	res.DurationMs = time.Since(start).Milliseconds()
+	res.Message = fmt.Sprintf("completed post-ASE autopilot git-update remediation on %s (%d actions)", cleanPath, len(res.Actions))
+	return res, nil
+}
+
+func resolveAutopilotBinary() string {
+	if p, err := exec.LookPath("autopilot"); err == nil && p != "" {
+		return p
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		cand := filepath.Join(home, ".local", "bin", "autopilot")
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+			return cand
+		}
+	}
+	for _, cand := range []string{"/opt/homebrew/bin/autopilot", "/usr/local/bin/autopilot"} {
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+			return cand
+		}
+	}
+	return ""
 }
 
 func cleanSubmoduleEphemeralNoise(ctx context.Context, subFullPath string) bool {

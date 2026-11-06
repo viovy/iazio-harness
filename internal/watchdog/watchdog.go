@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -74,19 +75,42 @@ type Watchdog struct {
 	startedAt  time.Time
 }
 
+func isRunningUnderGoTest() bool {
+	if flag.Lookup("test.v") != nil {
+		return true
+	}
+	arg0 := strings.ToLower(os.Args[0])
+	return strings.HasSuffix(arg0, ".test") || strings.HasSuffix(arg0, ".test.exe")
+}
+
+func isSyntheticTestTrackedJob(j *TrackedJob) bool {
+	if j == nil {
+		return true
+	}
+	id := strings.TrimSpace(j.JobID)
+	if id == "job-cp-fallback" || strings.HasPrefix(id, "job-reap-") || strings.HasPrefix(id, "job-missing-") {
+		return true
+	}
+	wt := j.WorktreePath
+	return strings.Contains(wt, "TestExecuteJob_") || strings.Contains(wt, "/T/Test") || strings.Contains(wt, `\Temp\Test`)
+}
+
 // New creates a Watchdog.
 func New(opts Options) *Watchdog {
+	inTest := isRunningUnderGoTest()
 	if opts.StateFile == "" {
-		home, _ := os.UserHomeDir()
-		if home != "" {
+		if inTest {
+			opts.StateFile = filepath.Join(os.TempDir(), fmt.Sprintf("harness-test-active-jobs-%d.json", os.Getpid()))
+		} else if home, _ := os.UserHomeDir(); home != "" {
 			opts.StateFile = filepath.Join(home, ".iazio", "harness-active-jobs.json")
 		} else {
 			opts.StateFile = filepath.Join(os.TempDir(), "harness-active-jobs.json")
 		}
 	}
 	if opts.StatusFile == "" {
-		home, _ := os.UserHomeDir()
-		if home != "" {
+		if inTest {
+			opts.StatusFile = filepath.Join(os.TempDir(), fmt.Sprintf("harness-test-daemon-%d.status", os.Getpid()))
+		} else if home, _ := os.UserHomeDir(); home != "" {
 			opts.StatusFile = filepath.Join(home, ".iazio", "harness-daemon.status")
 		} else {
 			opts.StatusFile = filepath.Join(os.TempDir(), "harness-daemon.status")
@@ -125,12 +149,21 @@ func (w *Watchdog) loadState() {
 		return
 	}
 	var list []*TrackedJob
+	pruned := false
+	inTest := isRunningUnderGoTest()
 	if err := json.Unmarshal(data, &list); err == nil {
 		for _, j := range list {
 			if j != nil && j.JobID != "" {
+				if !inTest && isSyntheticTestTrackedJob(j) {
+					pruned = true
+					continue
+				}
 				w.jobs[j.JobID] = j
 			}
 		}
+	}
+	if pruned {
+		w.persistStateLocked()
 	}
 }
 
