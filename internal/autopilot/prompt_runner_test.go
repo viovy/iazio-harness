@@ -1302,4 +1302,93 @@ func TestJob38eeeb536a5a7130_AgyCrashAutoResumeAndNewConversationFallback(t *tes
 	}
 }
 
+func TestStory0190_RealTimeConversationDiscoveryAndHeartbeat(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("MOCK_AGY_FAST", "1")
+
+	repoDir := t.TempDir()
+	_ = exec.Command("git", "-C", repoDir, "init").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Tester").Run()
+
+	convID := "aff9bb70-6c84-4121-ba1e-68745328700a"
+	mockAgyBin := filepath.Join(t.TempDir(), "mock-agy-rt")
+	script := fmt.Sprintf(`#!/usr/bin/env bash
+set -e
+mkdir -p .iazio
+printf '{"conversation_id":"%s","story_id":"STORY-IAZIO-0190"}\n' > .iazio/repo.lock
+echo "CONVERSATION_ID: %s"
+echo "ALLOCATED_STORY_ID: STORY-IAZIO-0190"
+sleep 0.2
+rm -rf .iazio
+mkdir -p docs/stories
+printf -- "---\nid: STORY-IAZIO-0190\nstatus: DONE\n---\n# Story\n" > docs/stories/2026-11-06-iazio-0190.story.md
+git add docs/stories/2026-11-06-iazio-0190.story.md >/dev/null 2>&1 || true
+git commit -m "feat(STORY-IAZIO-0190): complete story" >/dev/null 2>&1 || true
+echo "Autonomous story execution is complete for STORY-IAZIO-0190"
+exit 0
+`, convID, convID)
+	if err := os.WriteFile(mockAgyBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock-agy-rt: %v", err)
+	}
+
+	var mu sync.Mutex
+	var heartbeatConvs []string
+	var postedConvs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		if strings.HasSuffix(r.URL.Path, "/heartbeat") {
+			if c, ok := body["active_conversation_id"].(string); ok && c != "" {
+				heartbeatConvs = append(heartbeatConvs, c)
+			}
+		} else if c, ok := body["conversation_id"].(string); ok && c != "" {
+			postedConvs = append(postedConvs, c)
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	runner := NewPromptRunner("autopilot")
+	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_story_0190",
+		JobID:       "job_story_0190",
+		APIURL:      srv.URL,
+		Token:       "tok-0190",
+		Repo:        "iazio-mcp",
+		Prompt:      "/autonomous-story-execution implement STORY-IAZIO-0190",
+		TargetAgent: mockAgyBin,
+		WorkingDir:  repoDir,
+		Timeout:     5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunPrompt failed: %v", err)
+	}
+	if res.ConversationID != convID || res.ActiveConversationID != convID {
+		t.Fatalf("expected ConversationID=%s, got conv=%q active=%q", convID, res.ConversationID, res.ActiveConversationID)
+	}
+	mu.Lock()
+	hbList := append([]string(nil), heartbeatConvs...)
+	postList := append([]string(nil), postedConvs...)
+	mu.Unlock()
+	if len(hbList) == 0 || hbList[0] != convID {
+		t.Fatalf("expected real-time heartbeat with active_conversation_id=%s while job is running, got %v", convID, hbList)
+	}
+	if len(postList) == 0 || postList[0] != convID {
+		t.Fatalf("expected real-time PostConversation with conversation_id=%s, got %v", convID, postList)
+	}
+
+	// Verify discoverRepoLockConversation helper directly
+	lockDir := filepath.Join(repoDir, ".iazio")
+	_ = os.MkdirAll(lockDir, 0o755)
+	_ = os.WriteFile(filepath.Join(lockDir, "repo.lock"), []byte(fmt.Sprintf(`{"conversation_id":%q}`, convID)), 0o644)
+	if got := discoverRepoLockConversation(repoDir, time.Now().Add(-5*time.Second)); got != convID {
+		t.Fatalf("expected discoverRepoLockConversation=%s, got %q", convID, got)
+	}
+}
+
+
 
