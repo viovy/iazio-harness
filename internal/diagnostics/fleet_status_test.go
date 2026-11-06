@@ -447,6 +447,12 @@ func TestReconcileAdhocASEState_IdleInteractiveShellDoesNotPauseQueue(t *testing
 	if res.ASEState != "IDLE" {
 		t.Errorf("expected idle interactive agy shell on clean main with no story/lock to remain ASEState=IDLE, got %s", res.ASEState)
 	}
+	if res.ExecutionProvenance != "NONE" {
+		t.Errorf("expected idle interactive agy shell with no ASE evidence to reset ExecutionProvenance=NONE, got %s", res.ExecutionProvenance)
+	}
+	if !isDiagnosticCmdLine("/Users/romeo/.local/bin/agy --hub") {
+		t.Errorf("expected agy --hub daemon to be classified as diagnostic/non-session")
+	}
 
 	// Simulate an active autopilot-ase tool or bound IN_PROGRESS story with live agy tool -> must become RUNNING
 	resActive := &RepoFleetStatusResult{
@@ -769,5 +775,55 @@ func TestRemediateRepo_StrategiesAndSkipsAndSubmoduleNoise(t *testing.T) {
 	reconcileAdhocASEStateWithOpts(tmpDir, true, adhocRes)
 	if adhocRes.ASEState != "RUNNING" || adhocRes.CurrentPhase != "ADHOC_ASE" {
 		t.Errorf("expected reconcileAdhocASEStateWithOpts to transition to RUNNING/ADHOC_ASE on lock evidence, got %+v", adhocRes)
+	}
+}
+
+func TestInspectAndRemediate_TrackedSessionStoryIDAndStrategyGitUpdate(t *testing.T) {
+	tmpDir := t.TempDir()
+	cmd := exec.Command("git", "init", "-b", "main")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	exec.Command("git", "-C", tmpDir, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", tmpDir, "config", "user.name", "Test User").Run()
+
+	// Create DONE story and a TRACKED .session_story_id (reproducing meta-repo-03 behind origin/main)
+	storiesDir := filepath.Join(tmpDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0o755)
+	_ = os.WriteFile(filepath.Join(storiesDir, "index.yml"), []byte("stories:\n  - id: STORY-GOV-5135\n    status: DONE\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(tmpDir, ".session_story_id"), []byte("STORY-GOV-5135\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(tmpDir, "README.md"), []byte("v1\n"), 0o644)
+	exec.Command("git", "-C", tmpDir, "add", ".").Run()
+	exec.Command("git", "-C", tmpDir, "commit", "-m", "chore: tracked session story id").Run()
+
+	// Simulate prior bug where os.Remove deleted tracked .session_story_id causing D .session_story_id
+	_ = os.Remove(filepath.Join(tmpDir, ".session_story_id"))
+
+	res, err := InspectRepoFleetStatus(context.Background(), tmpDir)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus: %v", err)
+	}
+	if !res.IsClean || res.WorktreeState != "CLEAN" {
+		t.Errorf("expected tracked .session_story_id deletion to be restored to HEAD leaving repo CLEAN, got IsClean=%v state=%s modified=%v", res.IsClean, res.WorktreeState, res.ModifiedFiles)
+	}
+	if res.ASEState != "IDLE" {
+		t.Errorf("expected ASEState=IDLE after restoring tracked completed .session_story_id, got %s", res.ASEState)
+	}
+
+	// Now dirty README.md as if a completed ASE job left residual modifications, and run StrategyGitUpdate
+	_ = os.WriteFile(filepath.Join(tmpDir, "README.md"), []byte("v2-dirty-after-ase\n"), 0o644)
+	if NormalizeStrategy("git-update") != StrategyGitUpdate {
+		t.Fatalf("expected NormalizeStrategy(git-update) == StrategyGitUpdate")
+	}
+	remRes, remErr := RemediateRepo(context.Background(), RemediateOptions{
+		RepoPath: tmpDir,
+		Strategy: StrategyGitUpdate,
+	})
+	if remErr != nil || remRes == nil || !remRes.Success {
+		t.Fatalf("RemediateRepo(StrategyGitUpdate) failed: %v (%+v)", remErr, remRes)
+	}
+	if remRes.FleetStatus == nil || !remRes.FleetStatus.IsClean || remRes.FleetStatus.ASEState != "IDLE" {
+		t.Errorf("expected StrategyGitUpdate to leave repo CLEAN and IDLE, got %+v", remRes.FleetStatus)
 	}
 }
