@@ -450,7 +450,7 @@ func TestReconcileAdhocASEState_IdleInteractiveShellDoesNotPauseQueue(t *testing
 	if res.ExecutionProvenance != "NONE" {
 		t.Errorf("expected idle interactive agy shell with no ASE evidence to reset ExecutionProvenance=NONE, got %s", res.ExecutionProvenance)
 	}
-	if !isDiagnosticCmdLine("/Users/romeo/.local/bin/agy --hub") {
+	if !isDiagnosticCmdLine("/usr/local/bin/agy --hub") {
 		t.Errorf("expected agy --hub daemon to be classified as diagnostic/non-session")
 	}
 
@@ -788,7 +788,7 @@ func TestInspectAndRemediate_TrackedSessionStoryIDAndStrategyGitUpdate(t *testin
 	exec.Command("git", "-C", tmpDir, "config", "user.email", "test@example.com").Run()
 	exec.Command("git", "-C", tmpDir, "config", "user.name", "Test User").Run()
 
-	// Create DONE story and a TRACKED .session_story_id (reproducing meta-repo-03 behind origin/main)
+	// Create DONE story and a TRACKED .session_story_id (reproducing workspace behind origin/main)
 	storiesDir := filepath.Join(tmpDir, "docs", "stories")
 	_ = os.MkdirAll(storiesDir, 0o755)
 	_ = os.WriteFile(filepath.Join(storiesDir, "index.yml"), []byte("stories:\n  - id: STORY-GOV-5135\n    status: DONE\n"), 0o644)
