@@ -4,17 +4,28 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 type mockStream struct {
+	mu     sync.Mutex
 	chunks []string
 }
 
 func (m *mockStream) AppendRaw(stream string, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.chunks = append(m.chunks, string(data))
 	return nil
+}
+
+func (m *mockStream) Snapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.chunks...)
 }
 
 func TestTaskSupervisor_DetectsRootAgentIdleAndReaps(t *testing.T) {
@@ -29,11 +40,11 @@ func TestTaskSupervisor_DetectsRootAgentIdleAndReaps(t *testing.T) {
 	}()
 
 	stream := &mockStream{}
-	var callbackCalled bool
+	var callbackCalled atomic.Bool
 	sup := NewTaskSupervisor(dummyParent.Process.Pid, stream, 100*time.Millisecond)
 	sup.MaxWaitDuration = 200 * time.Millisecond
 	sup.OnTasksReaped = func(tasks []BackgroundTaskInfo) {
-		callbackCalled = true
+		callbackCalled.Store(true)
 	}
 	defer sup.Stop()
 
@@ -48,7 +59,7 @@ func TestTaskSupervisor_DetectsRootAgentIdleAndReaps(t *testing.T) {
 	}
 
 	reaped := sup.ReapedTasks()
-	t.Logf("Reaped tasks count: %d, callbackCalled: %v", len(reaped), callbackCalled)
+	t.Logf("Reaped tasks count: %d, callbackCalled: %v", len(reaped), callbackCalled.Load())
 }
 
 func TestTaskSupervisor_EnvironmentConfig(t *testing.T) {
@@ -167,14 +178,15 @@ func TestTaskSupervisor_TypeB_IdleDaemonReap(t *testing.T) {
 	}
 
 	foundDrainedMsg := false
-	for _, chunk := range stream.chunks {
+	chunks := stream.Snapshot()
+	for _, chunk := range chunks {
 		if len(chunk) > 0 && (strings.Contains(chunk, "background_task.drained_on_root_idle") || strings.Contains(chunk, "releasing workspace slot")) {
 			foundDrainedMsg = true
 			break
 		}
 	}
 	if !foundDrainedMsg {
-		t.Errorf("expected drained_on_root_idle stream event, got: %v", stream.chunks)
+		t.Errorf("expected drained_on_root_idle stream event, got: %v", chunks)
 	}
 }
 
