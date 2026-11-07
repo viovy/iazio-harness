@@ -12,10 +12,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,7 +35,7 @@ import (
 
 var (
 	storyIDRegex       = regexp.MustCompile(`\b(STORY-[A-Za-z0-9_-]+)\b`)
-	convIDRegex        = regexp.MustCompile(`(?i)(?:created|resumed|resuming|loaded|active|using|streaming)\s+conversation\s+([A-Za-z0-9_-]{12,64})`)
+	convIDRegex        = regexp.MustCompile(`(?im)(?:(?:created|resumed|resuming|loaded|active|using|streaming)\s+conversation\s+|^[ \t]*(?:active_)?conversation_id\s*[:=]\s*)([A-Za-z0-9_-]{12,64})`)
 	bgDrainIdleRegex   = regexp.MustCompile(`(?i)root agent idle;\s*waiting up to\s*[0-9hms.]+\s*for\s*(\d+)\s*background task`)
 	printTimeoutRegex  = regexp.MustCompile(`(?i)print timeout after\s*[0-9hms.]+\s*with turn in progress`)
 	aseCompletionRegex = regexp.MustCompile(`(?i)(?:autonomous story execution is complete|\[story_completed\]|story[_\s-]+completed\s+successfully|all acceptance criteria[^\n]*(?:met|verified|complete)|"ase_complete"\s*:\s*true)`)
@@ -592,6 +595,134 @@ func tailBrainTranscriptSteps(convID string, seenSteps map[int]bool) string {
 	return sb.String()
 }
 
+func isBenignIdleLogNoise(line string) bool {
+	if line == "" || strings.Contains(line, "[ASE-SUPERVISOR]") {
+		return true
+	}
+	if strings.Contains(line, "fetchAvailableModels") ||
+		strings.Contains(line, "loadCodeAssist") ||
+		strings.Contains(line, "http_helpers.go:") ||
+		strings.Contains(line, "token refreshed") {
+		return true
+	}
+	return false
+}
+
+func isTranscriptAtTerminalPlannerResponse(convID string) bool {
+	return isTranscriptAtTerminalCompletedResponse(convID, 0)
+}
+
+func isTranscriptAtTerminalCompletedResponse(convID string, minStepIndex int) bool {
+	if strings.TrimSpace(convID) == "" || !sessionstore.IsValidConversationID(convID) {
+		return false
+	}
+	brainDir := resolveBrainDir()
+	if brainDir == "" {
+		return false
+	}
+	transcriptPath := filepath.Join(brainDir, convID, ".system_generated", "logs", "transcript.jsonl")
+	f, err := os.Open(transcriptPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	const tailReadWindowBytes = 256 * 1024
+	if fi, errS := f.Stat(); errS == nil && fi.Size() > tailReadWindowBytes {
+		_, _ = f.Seek(fi.Size()-tailReadWindowBytes, io.SeekStart)
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	var lastStep transcriptStep
+	var hasStep bool
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var step transcriptStep
+		if err := json.Unmarshal([]byte(line), &step); err != nil {
+			continue
+		}
+		if step.StepIndex <= 0 {
+			continue
+		}
+		lastStep = step
+		hasStep = true
+	}
+	if !hasStep || lastStep.StepIndex <= minStepIndex {
+		return false
+	}
+	return lastStep.Type == "PLANNER_RESPONSE" &&
+		(lastStep.Status == "" || strings.EqualFold(lastStep.Status, "DONE")) &&
+		len(lastStep.ToolCalls) == 0 &&
+		strings.TrimSpace(lastStep.Content) != ""
+}
+
+func isLoopbackControlPlaneURL(rawURL string) bool {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return false
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+func resolveControlPlaneEnv(opts RunPromptOptions) (jobID, apiURL, leaseToken, initialResumeConv, envConvID string, fencingToken int64) {
+	envAPI := strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_URL"))
+	allowAmbientEnv := !isPromptRunnerTestBinary() || os.Getenv("IAZIO_TEST_ALLOW_AMBIENT_ENV") == "1"
+	isolatedTestRun := !allowAmbientEnv || (isPromptRunnerTestBinary() && !isLoopbackControlPlaneURL(envAPI))
+
+	jobID = strings.TrimSpace(opts.JobID)
+	if jobID == "" && !isolatedTestRun {
+		jobID = strings.TrimSpace(os.Getenv("IAZIO_JOB_ID"))
+	}
+	apiURL = strings.TrimSpace(opts.APIURL)
+	if apiURL == "" && !isolatedTestRun {
+		apiURL = envAPI
+	}
+	fencingToken = opts.FencingToken
+	if fencingToken == 0 && !isolatedTestRun {
+		if rawFT := strings.TrimSpace(os.Getenv("IAZIO_FENCING_TOKEN")); rawFT != "" {
+			if parsedFT, errFT := strconv.ParseInt(rawFT, 10, 64); errFT == nil {
+				fencingToken = parsedFT
+			}
+		}
+	}
+	leaseToken = strings.TrimSpace(opts.LeaseToken)
+	if leaseToken == "" && !isolatedTestRun {
+		leaseToken = strings.TrimSpace(os.Getenv("IAZIO_LEASE_TOKEN"))
+	}
+	initialResumeConv = strings.TrimSpace(opts.ResumeConversationID)
+	if initialResumeConv == "" && !isolatedTestRun {
+		initialResumeConv = strings.TrimSpace(os.Getenv("IAZIO_RESUME_CONVERSATION_ID"))
+	}
+	if !isolatedTestRun {
+		if c := strings.TrimSpace(os.Getenv("IAZIO_CONVERSATION_ID")); sessionstore.IsValidConversationID(c) {
+			envConvID = c
+		}
+	}
+	return jobID, apiURL, leaseToken, initialResumeConv, envConvID, fencingToken
+}
+
 func hasBackgroundDrainLog(logPath, stdoutText, stderrText string) (bool, int) {
 	check := func(s string) (bool, int) {
 		trimmed := strings.TrimSpace(s)
@@ -601,7 +732,7 @@ func hasBackgroundDrainLog(logPath, stdoutText, stderrText string) (bool, int) {
 		lines := strings.Split(trimmed, "\n")
 		for i := len(lines) - 1; i >= 0; i-- {
 			line := strings.TrimSpace(lines[i])
-			if line == "" || strings.Contains(line, "[ASE-SUPERVISOR]") {
+			if isBenignIdleLogNoise(line) {
 				continue
 			}
 			if m := bgDrainIdleRegex.FindStringSubmatch(line); len(m) > 0 {
@@ -665,6 +796,8 @@ func storyFrontmatterStatus(workingDir, storyID string) (found bool, status stri
 		if err != nil {
 			continue
 		}
+		sort.Sort(sort.Reverse(sort.StringSlice(matches)))
+		var matchedStatuses []string
 		for _, mPath := range matches {
 			b, errR := os.ReadFile(mPath)
 			if errR != nil {
@@ -696,7 +829,26 @@ func storyFrontmatterStatus(workingDir, storyID string) (found bool, status stri
 			if !idMatched {
 				continue
 			}
-			return true, fmStatus
+			matchedStatuses = append(matchedStatuses, fmStatus)
+		}
+		if len(matchedStatuses) > 0 {
+			hasDone := false
+			hasIncomplete := false
+			for _, st := range matchedStatuses {
+				if st == "DONE" || st == "COMPLETED" || st == "COMPLETE" {
+					hasDone = true
+				} else if st == "IN_PROGRESS" || st == "READY" || st == "TODO" || st == "BLOCKED" {
+					hasIncomplete = true
+				}
+			}
+			if hasDone && hasIncomplete {
+				log.Printf("[prompt_runner] warning: conflicting duplicate story files for %s (%v); failing closed as IN_PROGRESS", targetSID, matchedStatuses)
+				return true, "IN_PROGRESS"
+			}
+			if hasDone {
+				return true, "DONE"
+			}
+			return true, matchedStatuses[0]
 		}
 	}
 	return false, ""
@@ -760,10 +912,17 @@ func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gi
 			candidateStories = append(candidateStories, clean)
 		}
 	}
+	cleanPrimary := strings.ToUpper(strings.TrimSpace(primaryStoryID))
+	primaryFoundInWorktree := false
+	if cleanPrimary != "" && !isPointerStoryID(cleanPrimary) {
+		primaryFoundInWorktree, _ = storyFrontmatterStatus(workingDir, cleanPrimary)
+	}
 	addStory(primaryStoryID)
-	for _, m := range storyIDRegex.FindAllStringSubmatch(combinedOutput, -1) {
-		if len(m) > 1 {
-			addStory(m[1])
+	if !primaryFoundInWorktree {
+		for _, m := range storyIDRegex.FindAllStringSubmatch(combinedOutput, -1) {
+			if len(m) > 1 {
+				addStory(m[1])
+			}
 		}
 	}
 
@@ -1075,34 +1234,11 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	isMockAgy := strings.HasPrefix(baseEffectiveAgent, "mock-agy")
 	isDirectAgy := r.AutopilotBinary == "autopilot" && (baseEffectiveAgent == "agy" || baseEffectiveAgent == "agy.exe")
 
-	jobID := strings.TrimSpace(opts.JobID)
-	if jobID == "" {
-		jobID = strings.TrimSpace(os.Getenv("IAZIO_JOB_ID"))
-	}
-	apiURL := strings.TrimSpace(opts.APIURL)
-	if apiURL == "" {
-		apiURL = strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_URL"))
-	}
+	jobID, apiURL, leaseToken, initialResumeConv, envConvID, fencingToken := resolveControlPlaneEnv(opts)
 	resolveToken := func() string {
 		return resolvePromptAuthToken(ctx, opts.Token)
 	}
 	token := resolveToken()
-	fencingToken := opts.FencingToken
-	if fencingToken == 0 {
-		if rawFT := strings.TrimSpace(os.Getenv("IAZIO_FENCING_TOKEN")); rawFT != "" {
-			if parsedFT, errFT := strconv.ParseInt(rawFT, 10, 64); errFT == nil {
-				fencingToken = parsedFT
-			}
-		}
-	}
-	leaseToken := strings.TrimSpace(opts.LeaseToken)
-	if leaseToken == "" {
-		leaseToken = strings.TrimSpace(os.Getenv("IAZIO_LEASE_TOKEN"))
-	}
-	initialResumeConv := strings.TrimSpace(opts.ResumeConversationID)
-	if initialResumeConv == "" {
-		initialResumeConv = strings.TrimSpace(os.Getenv("IAZIO_RESUME_CONVERSATION_ID"))
-	}
 	targetBranch := strings.TrimSpace(opts.Branch)
 	traceID := opts.TraceID
 	if traceID == "" {
@@ -1133,10 +1269,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	lastOutAt := startTime
 	streamedAny := false
 	detectedConvID := initialResumeConv
-	if detectedConvID == "" {
-		if envConv := strings.TrimSpace(os.Getenv("IAZIO_CONVERSATION_ID")); sessionstore.IsValidConversationID(envConv) {
-			detectedConvID = envConv
-		}
+	if detectedConvID == "" && envConvID != "" {
+		detectedConvID = envConvID
 	}
 	boundStoryID := storyID
 	var storyTitle, storyPath string
@@ -1156,7 +1290,6 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	emitSupervisorNote := func(msg string) {
 		streamMu.Lock()
 		_, _ = stdoutBuf.WriteString(msg)
-		lastOutAt = time.Now()
 		if jobID != "" && apiURL != "" {
 			streamedAny = true
 		}
@@ -1298,6 +1431,13 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		streamMu.Lock()
 		turnStartOutLen := stdoutBuf.Len()
 		turnStartErrLen := stderrBuf.Len()
+		lastOutAt = time.Now()
+		turnMinTranscriptStep := 0
+		for stepIdx := range seenTranscriptSteps {
+			if stepIdx > turnMinTranscriptStep {
+				turnMinTranscriptStep = stepIdx
+			}
+		}
 		streamMu.Unlock()
 
 		var tmpLogPath string
@@ -1437,7 +1577,6 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 						detectedConvID = cid
 					}
 					curConv = detectedConvID
-					lastOutAt = time.Now()
 					streamMu.Unlock()
 					_, _ = fmt.Fprintf(os.Stderr, "CONVERSATION_ID: %s\nACTIVE_CONVERSATION_ID: %s\n", cid, cid)
 					emitJobHeartbeat(toolPID, cid, curBoundStory)
@@ -1481,7 +1620,6 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					if shouldPost {
 						postedStoryID = curBoundStory
 					}
-					lastOutAt = time.Now()
 					streamMu.Unlock()
 					if stitle == "" {
 						stitle = opts.Title
@@ -1625,6 +1763,32 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					continue
 				} else {
 					bgDrainSince = time.Time{}
+					postTurnIdleGrace := 8 * time.Second
+					if bgDrainGrace > 0 && bgDrainGrace < postTurnIdleGrace {
+						postTurnIdleGrace = bgDrainGrace
+					}
+					if curConv != "" && time.Since(lastActivity) >= postTurnIdleGrace && isTranscriptAtTerminalCompletedResponse(curConv, turnMinTranscriptStep) {
+						if sdlcActive, _ := hasActiveSDLCChildProcess(toolPID); !sdlcActive {
+							if isASEFlowCompletedInWorktree(opts.WorkingDir, curBoundStory, fullOut+"\n"+fullTranscript+"\n"+fullErr, gitBin) {
+								turnCompletedDuringDrain = true
+								turnBgDrainReaped = false
+								compNote := fmt.Sprintf(
+									"[%s] [ASE-SUPERVISOR] [ase_completion.detected_during_bg_drain] [ase_completion.detected_post_turn_idle] ASE flow and story %s verified DONE in worktree after terminal agent response (ToolPID=%d, Conv=%s); settling turn as completed.\n",
+									time.Now().UTC().Format(time.RFC3339), curBoundStory, toolPID, curConv,
+								)
+								emitSupervisorNote(compNote)
+								engines.StopProcessGroup(cmd)
+								select {
+								case <-waitDone:
+								case <-time.After(gracePeriod):
+									engines.KillProcessGroup(cmd)
+									<-waitDone
+								}
+								turnErr = nil
+								break turnLoop
+							}
+						}
+					}
 				}
 
 				if time.Now().After(deadline) {
@@ -1682,10 +1846,6 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 						)
 						_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", hbMsg)
 						lastHeartbeatChunkAt = time.Now()
-						streamMu.Lock()
-						lastOutAt = time.Now()
-						silentMs = 0
-						streamMu.Unlock()
 					}
 					_ = controlplane.PostTick(ctx, apiURL, tok, jobID, silentMs, os.Getpid(), toolPID, elapsedSec)
 					if toolAlive && time.Since(lastJobHeartbeatAt) >= 10*time.Second {
