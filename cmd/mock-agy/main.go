@@ -803,16 +803,18 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "[mock-agy] Completed STORY-IAZIO-0185 in new conversation %s.\n", fallbackConv)
 		return 0
 
-	case "job_bbd74e1ad21fbc40_terminal_planner_response_no_bg_drain_marker":
+	case "job_bbd74e1ad21fbc40_terminal_planner_response_no_bg_drain_marker",
+		"job_bbd74e1ad21fbc40_terminal_planner_with_mcp_child":
 		// Scenario (job_bbd74e1ad21fbc40 / STORY-GOV-5177):
 		// Reproduces job_bbd74e1ad21fbc40 where:
 		// 1. Primary story STORY-GOV-5176 is marked status: DONE in docs/stories/ and committed cleanly, while
 		//    conversation output also mentions an older historical story ID (STORY-GOV-5175).
 		// 2. Brain transcript step #135 is a terminal PLANNER_RESPONSE (status: "DONE", tool_calls: []) containing
 		//    the final "## CRAFT Closeout" and "## Fleet Git Status Summary".
-		// 3. agy --print NEVER emits "WaitForConversationFullyIdle" (inBgDrain == false) and hangs after step #135.
+		// 3. agy --print NEVER emits "WaitForConversationFullyIdle" (inBgDrain == false) and hangs after step #135
+		//    (optionally with a long-lived "autopilot-mcp serve" child process running under agy).
 		// 4. CLIPromptRunner must detect terminal PLANNER_RESPONSE + ASE worktree completion after bgDrainGrace,
-		//    reap the hung agy process group, and return Status="completed", ExitCode=0, StoryID="STORY-GOV-5176".
+		//    ignore MCP server child processes, reap the hung agy process group, and return Status="completed", ExitCode=0, StoryID="STORY-GOV-5176".
 		cid := conversationID
 		if cid == "" {
 			cid = "0092d1cb-cc35-41ce-9143-a480dca5e283"
@@ -840,6 +842,17 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			step1 := `{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"Follow up after STORY-GOV-5175 and execute STORY-GOV-5176"}` + "\n"
 			step135 := `{"step_index":135,"type":"PLANNER_RESPONSE","status":"DONE","content":"All 10 findings for STORY-GOV-5176 have been remediated and verified.\n\n## CRAFT Closeout\n\n## Fleet Git Status Summary\n"}` + "\n"
 			_ = os.WriteFile(transcriptPath, []byte(step1+step135), 0644)
+		}
+
+		if scenario == "job_bbd74e1ad21fbc40_terminal_planner_with_mcp_child" {
+			// Spawn a long-lived child process whose command line contains "autopilot-mcp serve"
+			mcpChild := procutil.Command("sh", "-c", "sleep 30 # /Users/romeo/.local/bin/autopilot-mcp serve")
+			_ = mcpChild.Start()
+			defer func() {
+				if mcpChild != nil && mcpChild.Process != nil {
+					_ = mcpChild.Process.Kill()
+				}
+			}()
 		}
 
 		// Hang WITHOUT printing WaitForConversationFullyIdle

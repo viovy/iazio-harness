@@ -1652,6 +1652,46 @@ func TestTurnLoop_TerminalPlannerResponseWithInProgressStoryDoesNotPrematurelySe
 	}
 }
 
+func TestHasActiveSDLCChildProcess_IgnoresMCPServerDescendants(t *testing.T) {
+	origFind := findChildProcessesFunc
+	t.Cleanup(func() { findChildProcessesFunc = origFind })
+
+	// 1. MCP-server descendants of agy must be ignored by hasActiveSDLCChildProcess and hasActiveConversationActivity
+	findChildProcessesFunc = func(rootPID int) []engines.BackgroundTaskInfo {
+		return []engines.BackgroundTaskInfo{
+			{PID: 101, Command: "/Users/romeo/.local/bin/autopilot-mcp serve"},
+			{PID: 102, Command: "npm exec chrome-devtools-mcp@latest"},
+			{PID: 103, Command: "dart mcp-server"},
+		}
+	}
+	if active, cmd := hasActiveSDLCChildProcess(100); active {
+		t.Fatalf("expected MCP server descendants to be ignored, got active=true cmd=%q", cmd)
+	}
+	_, activeChildren := hasActiveConversationActivity("", 100, time.Time{}, 30*time.Second)
+	if activeChildren != 0 {
+		t.Fatalf("expected MCP server descendants to be excluded from activeChildren count, got %d", activeChildren)
+	}
+
+	// 2. Real SDLC commands ('autopilot git-flow finish', 'go test ./...', 'make validate-local') must be detected
+	for _, sdlcCmd := range []string{
+		"autopilot git-flow finish",
+		"go test ./...",
+		"make validate-local",
+	} {
+		findChildProcessesFunc = func(rootPID int) []engines.BackgroundTaskInfo {
+			return []engines.BackgroundTaskInfo{
+				{PID: 101, Command: "/Users/romeo/.local/bin/autopilot-mcp serve"},
+				{PID: 201, Command: sdlcCmd},
+			}
+		}
+		active, matched := hasActiveSDLCChildProcess(100)
+		if !active || matched != sdlcCmd {
+			t.Fatalf("expected SDLC command %q to be detected, got active=%v matched=%q", sdlcCmd, active, matched)
+		}
+	}
+}
+
+
 
 
 

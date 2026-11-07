@@ -916,20 +916,54 @@ var sdlcChildTokens = []string{
 	"dotnet",
 }
 
+var findChildProcessesFunc = engines.FindChildProcesses
+
+func isMCPOrDaemonChildProcess(cmdline string) bool {
+	lower := strings.ToLower(strings.TrimSpace(cmdline))
+	if lower == "" {
+		return true
+	}
+	if strings.Contains(lower, "mcp") ||
+		strings.Contains(lower, "language-server") ||
+		strings.Contains(lower, "gopls") ||
+		strings.Contains(lower, "lsp") {
+		return true
+	}
+	if extra := strings.TrimSpace(os.Getenv("IAZIO_IGNORE_CHILD_PATTERNS")); extra != "" {
+		for _, pat := range strings.Split(extra, ",") {
+			p := strings.ToLower(strings.TrimSpace(pat))
+			if p != "" && strings.Contains(lower, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isSDLCChildCommandLine(cmdline string) bool {
+	cmdLower := strings.ToLower(strings.TrimSpace(cmdline))
+	if cmdLower == "" || strings.HasPrefix(cmdLower, "sleep ") || cmdLower == "sleep" {
+		return false
+	}
+	if isMCPOrDaemonChildProcess(cmdLower) {
+		return false
+	}
+	for _, tok := range sdlcChildTokens {
+		if strings.Contains(cmdLower, tok) {
+			return true
+		}
+	}
+	return false
+}
+
 func hasActiveSDLCChildProcess(toolPID int) (bool, string) {
 	if toolPID <= 0 {
 		return false, ""
 	}
-	children := engines.FindChildProcesses(toolPID)
+	children := findChildProcessesFunc(toolPID)
 	for _, ch := range children {
-		cmdLower := strings.ToLower(strings.TrimSpace(ch.Command))
-		if cmdLower == "" || strings.HasPrefix(cmdLower, "sleep ") || cmdLower == "sleep" {
-			continue
-		}
-		for _, tok := range sdlcChildTokens {
-			if strings.Contains(cmdLower, tok) {
-				return true, ch.Command
-			}
+		if isSDLCChildCommandLine(ch.Command) {
+			return true, ch.Command
 		}
 	}
 	return false, ""
@@ -1005,8 +1039,13 @@ func hasActiveConversationActivity(convID string, toolPID int, lastTranscriptOrO
 		}
 	}
 	if toolPID > 0 {
-		children := engines.FindChildProcesses(toolPID)
-		activeChildren = len(children)
+		children := findChildProcessesFunc(toolPID)
+		for _, ch := range children {
+			cmdLower := strings.ToLower(strings.TrimSpace(ch.Command))
+			if !isMCPOrDaemonChildProcess(cmdLower) && !strings.HasPrefix(cmdLower, "sleep") {
+				activeChildren++
+			}
+		}
 	}
 	return chatty, activeChildren
 }
@@ -1169,7 +1208,9 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	isMockAgy := strings.HasPrefix(baseEffectiveAgent, "mock-agy")
 	isDirectAgy := r.AutopilotBinary == "autopilot" && (baseEffectiveAgent == "agy" || baseEffectiveAgent == "agy.exe")
 
-	allowAmbientEnv := !isPromptRunnerTestBinary() || os.Getenv("IAZIO_TEST_ALLOW_AMBIENT_ENV") == "1"
+	parentHarnessPID := strings.TrimSpace(os.Getenv("IAZIO_PARENT_HARNESS_PID"))
+	isNestedHarnessChild := parentHarnessPID != "" && parentHarnessPID != strconv.Itoa(os.Getpid())
+	allowAmbientEnv := (!isPromptRunnerTestBinary() && !isNestedHarnessChild) || os.Getenv("IAZIO_TEST_ALLOW_AMBIENT_ENV") == "1"
 	jobID := strings.TrimSpace(opts.JobID)
 	if jobID == "" && allowAmbientEnv {
 		jobID = strings.TrimSpace(os.Getenv("IAZIO_JOB_ID"))
@@ -1426,7 +1467,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 
 		cmd := procutil.Command(cmdBin, args...)
 		cmd.Dir = opts.WorkingDir
-		cmd.Env = os.Environ()
+		cmd.Env = append(os.Environ(), fmt.Sprintf("IAZIO_PARENT_HARNESS_PID=%d", os.Getpid()))
 		if targetBranch != "" {
 			cmd.Env = append(cmd.Env, "AUTOPILOT_TARGET_BRANCH="+targetBranch)
 		}
@@ -1669,9 +1710,15 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					if !sdlcActiveNow && isASEFlowCompletedInWorktree(opts.WorkingDir, curBoundStory, fullOut+"\n"+fullTranscript+"\n"+fullErr, gitBin) {
 						turnCompletedDuringDrain = true
 						turnBgDrainReaped = false
+						drainStateDesc := "while root agent entered background drain"
+						eventTag := "[ase_completion.detected_during_bg_drain]"
+						if !inBgDrain && terminalPlannerTurn {
+							drainStateDesc = "at terminal PLANNER_RESPONSE"
+							eventTag = "[ase_completion.detected_at_terminal_turn] [ase_completion.detected_during_bg_drain]"
+						}
 						compNote := fmt.Sprintf(
-							"[%s] [ASE-SUPERVISOR] [ase_completion.detected_during_bg_drain] ASE flow and story %s verified DONE in worktree while root agent entered background drain (ToolPID=%d, Conv=%s, Tasks=%d); settling turn as completed.\n",
-							time.Now().UTC().Format(time.RFC3339), curBoundStory, toolPID, curConv, bgTasks,
+							"[%s] [ASE-SUPERVISOR] %s ASE flow and story %s verified DONE in worktree %s (ToolPID=%d, Conv=%s, Tasks=%d); settling turn as completed.\n",
+							time.Now().UTC().Format(time.RFC3339), eventTag, curBoundStory, drainStateDesc, toolPID, curConv, bgTasks,
 						)
 						emitSupervisorNote(compNote)
 						engines.StopProcessGroup(cmd)
