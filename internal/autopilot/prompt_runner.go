@@ -592,6 +592,20 @@ func tailBrainTranscriptSteps(convID string, seenSteps map[int]bool) string {
 	return sb.String()
 }
 
+// SupervisorHeartbeatPrefix is the shared prefix for periodic supervisor liveness chunks.
+const SupervisorHeartbeatPrefix = "[ASE-SUPERVISOR] Execution active ("
+
+var supervisorHeartbeatInterval = 20 * time.Second
+
+var (
+	transcriptTerminalCacheMu sync.Mutex
+	transcriptTerminalCache   = make(map[string]struct {
+		size     int64
+		mtimeNS  int64
+		terminal bool
+	})
+)
+
 func isTranscriptAtTerminalPlannerResponse(convID string) bool {
 	if strings.TrimSpace(convID) == "" || !sessionstore.IsValidConversationID(convID) {
 		return false
@@ -601,32 +615,69 @@ func isTranscriptAtTerminalPlannerResponse(convID string) bool {
 		return false
 	}
 	transcriptPath := filepath.Join(brainDir, convID, ".system_generated", "logs", "transcript.jsonl")
+	fi, err := os.Stat(transcriptPath)
+	if err != nil || fi.Size() == 0 {
+		return false
+	}
+	size := fi.Size()
+	mtimeNS := fi.ModTime().UnixNano()
+
+	transcriptTerminalCacheMu.Lock()
+	if cached, ok := transcriptTerminalCache[transcriptPath]; ok && cached.size == size && cached.mtimeNS == mtimeNS {
+		res := cached.terminal
+		transcriptTerminalCacheMu.Unlock()
+		return res
+	}
+	transcriptTerminalCacheMu.Unlock()
+
 	f, err := os.Open(transcriptPath)
 	if err != nil {
 		return false
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	var lastStep transcriptStep
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var step transcriptStep
-		if err := json.Unmarshal([]byte(line), &step); err != nil {
-			continue
-		}
-		if step.StepIndex > 0 {
-			lastStep = step
+	const tailWindow = 256 * 1024
+	discardFirstLine := false
+	if size > tailWindow {
+		if _, sErr := f.Seek(size-tailWindow, io.SeekStart); sErr == nil {
+			discardFirstLine = true
 		}
 	}
-	return lastStep.StepIndex > 0 &&
+
+	reader := bufio.NewReaderSize(f, 64*1024)
+	if discardFirstLine {
+		_, _ = reader.ReadString('\n')
+	}
+	var lastStep transcriptStep
+	for {
+		line, readErr := reader.ReadString('\n')
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			var step transcriptStep
+			if err := json.Unmarshal([]byte(trimmed), &step); err == nil && step.StepIndex > 0 {
+				lastStep = step
+			}
+		}
+		if readErr != nil {
+			if readErr != io.EOF {
+				return false
+			}
+			break
+		}
+	}
+	terminal := lastStep.StepIndex > 0 &&
 		lastStep.Type == "PLANNER_RESPONSE" &&
 		strings.EqualFold(lastStep.Status, "DONE") &&
 		len(lastStep.ToolCalls) == 0
+
+	transcriptTerminalCacheMu.Lock()
+	transcriptTerminalCache[transcriptPath] = struct {
+		size     int64
+		mtimeNS  int64
+		terminal bool
+	}{size: size, mtimeNS: mtimeNS, terminal: terminal}
+	transcriptTerminalCacheMu.Unlock()
+	return terminal
 }
 
 func hasBackgroundDrainLog(logPath, stdoutText, stderrText string) (bool, int) {
@@ -1631,9 +1682,11 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 						turnErr = nil
 						break turnLoop
 					}
+				}
+				if inBgDrain {
 					if bgDrainSince.IsZero() {
 						bgDrainSince = time.Now()
-					} else if time.Since(bgDrainSince) >= bgDrainGrace && (inBgDrain || time.Since(lastActivity) >= bgDrainGrace) {
+					} else if time.Since(bgDrainSince) >= bgDrainGrace {
 						if sdlcActive, sdlcCmd := hasActiveSDLCChildProcess(toolPID); sdlcActive && bgDrainDeferrals < maxBgDrainDeferrals {
 							bgDrainDeferrals++
 							bgDrainSince = time.Now()
@@ -1713,7 +1766,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					elapsedSec := int(time.Since(startTime).Seconds())
 					tok := resolveToken()
 
-					if time.Since(lastHeartbeatChunkAt) >= 20*time.Second {
+					if time.Since(lastHeartbeatChunkAt) >= supervisorHeartbeatInterval {
 						hbStory := curBoundStory
 						if hbStory == "" {
 							hbStory = "pending"
@@ -1723,8 +1776,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 							hbConv = "pending"
 						}
 						hbMsg := fmt.Sprintf(
-							"[%s] [ASE-SUPERVISOR] Execution active (elapsed: %ds, HarnessPID=%d, ToolPID=%d, Story=%s, Conv=%s)\n",
-							time.Now().UTC().Format(time.RFC3339), elapsedSec, os.Getpid(), toolPID, hbStory, hbConv,
+							"[%s] %s%ds, HarnessPID=%d, ToolPID=%d, Story=%s, Conv=%s)\n",
+							time.Now().UTC().Format(time.RFC3339), SupervisorHeartbeatPrefix, elapsedSec, os.Getpid(), toolPID, hbStory, hbConv,
 						)
 						_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", hbMsg)
 						lastHeartbeatChunkAt = time.Now()

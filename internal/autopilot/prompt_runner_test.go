@@ -1507,6 +1507,121 @@ exit 0
 	}
 }
 
+func TestTurnLoop_SupervisorHeartbeatDoesNotResetSilentMs(t *testing.T) {
+	origInterval := supervisorHeartbeatInterval
+	supervisorHeartbeatInterval = 150 * time.Millisecond
+	t.Cleanup(func() { supervisorHeartbeatInterval = origInterval })
+
+	var (
+		mu              sync.Mutex
+		heartbeatChunks int
+		tickSilentMs    []int64
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/chunks") {
+			var body struct {
+				Type        string `json:"type"`
+				Text        string `json:"text"`
+				SilentForMs int64  `json:"silent_for_ms"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			if body.Type == "OUTPUT_CHUNK" && strings.Contains(body.Text, SupervisorHeartbeatPrefix) {
+				heartbeatChunks++
+			}
+			if body.Type == "OUTPUT_TICK" {
+				tickSilentMs = append(tickSilentMs, body.SilentForMs)
+			}
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	binDir := t.TempDir()
+	mockSilent := filepath.Join(binDir, "mock-silent")
+	script := "#!/bin/sh\necho 'initial output'\nsleep 5\nexit 0\n"
+	if err := os.WriteFile(mockSilent, []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock-silent: %v", err)
+	}
+
+	runner := NewPromptRunner("autopilot")
+	runner.GracePeriod = 50 * time.Millisecond
+	_, _ = runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "test_silent_ms",
+		JobID:       "job_silent_ms",
+		APIURL:      srv.URL,
+		Token:       "tok",
+		Prompt:      "non-ase prompt",
+		TargetAgent: mockSilent,
+		WorkingDir:  t.TempDir(),
+		Timeout:     4500 * time.Millisecond,
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if heartbeatChunks < 2 {
+		t.Fatalf("expected >= 2 supervisor heartbeat chunks, got %d", heartbeatChunks)
+	}
+	if len(tickSilentMs) < 2 {
+		t.Fatalf("expected >= 2 OUTPUT_TICK payloads, got %v", tickSilentMs)
+	}
+	if tickSilentMs[len(tickSilentMs)-1] <= tickSilentMs[0] || tickSilentMs[len(tickSilentMs)-1] < 2000 {
+		t.Fatalf("expected silent_ms to increase monotonically across supervisor heartbeats without resetting to 0, got %v", tickSilentMs)
+	}
+}
+
+func TestTurnLoop_TerminalPlannerResponseWithInProgressStoryDoesNotPrematurelySettle(t *testing.T) {
+	brainDir := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainDir)
+
+	convID := "1192d1cb-cc35-41ce-9143-a480dca5e283"
+	logDir := filepath.Join(brainDir, convID, ".system_generated", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	transcriptPath := filepath.Join(logDir, "transcript.jsonl")
+	content := `{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"Execute story STORY-GOV-5199"}` + "\n" +
+		`{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting for subagent...","tool_calls":[]}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	if !isTranscriptAtTerminalPlannerResponse(convID) {
+		t.Fatalf("expected isTranscriptAtTerminalPlannerResponse=true")
+	}
+
+	repoDir := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test User"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, string(out))
+		}
+	}
+	storiesDir := filepath.Join(repoDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0o755)
+	_ = os.WriteFile(filepath.Join(storiesDir, "2026-11-07-gov-5199-in-progress.story.md"), []byte("---\nid: STORY-GOV-5199\ntitle: In Progress Story\nstatus: IN_PROGRESS\n---\n"), 0o600)
+	for _, args := range [][]string{
+		{"add", "docs"},
+		{"commit", "-m", "chore: add IN_PROGRESS story"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, string(out))
+		}
+	}
+
+	if isASEFlowCompletedInWorktree(repoDir, "STORY-GOV-5199", "Waiting for subagent...", "git") {
+		t.Fatalf("expected isASEFlowCompletedInWorktree=false while STORY-GOV-5199 is IN_PROGRESS")
+	}
+}
+
 
 
 
