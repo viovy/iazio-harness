@@ -918,16 +918,100 @@ var sdlcChildTokens = []string{
 
 var findChildProcessesFunc = engines.FindChildProcesses
 
+func commandExecutionFields(cmdLower string) []string {
+	fields := strings.Fields(strings.TrimSpace(cmdLower))
+	for len(fields) > 0 {
+		tok := strings.Trim(fields[0], "\"'")
+		if strings.Contains(tok, "=") && !strings.HasPrefix(tok, "/") && !strings.HasPrefix(tok, ".") {
+			fields = fields[1:]
+			continue
+		}
+		break
+	}
+	return fields
+}
+
+func commandBinaryBasename(execFields []string) string {
+	if len(execFields) == 0 {
+		return ""
+	}
+	rawBin := strings.Trim(execFields[0], "\"'")
+	base := filepath.Base(strings.ReplaceAll(rawBin, "\\", "/"))
+	return strings.TrimSuffix(base, ".exe")
+}
+
+func isStrongSDLCCommandLine(cmdLower string) bool {
+	execFields := commandExecutionFields(cmdLower)
+	if len(execFields) == 0 {
+		return false
+	}
+	bin := commandBinaryBasename(execFields)
+	if bin == "" {
+		return false
+	}
+	if strings.HasSuffix(bin, ".test") {
+		return true
+	}
+	switch bin {
+	case "make", "gmake", "git", "gh", "git-flow", "pytest", "cargo", "dotnet", "playwright", "flutter":
+		return true
+	case "autopilot":
+		return len(execFields) >= 2
+	case "go":
+		for _, arg := range execFields[1:] {
+			switch arg {
+			case "test", "build", "vet", "run", "generate", "install", "mod", "tool":
+				return true
+			}
+		}
+	case "dart":
+		if len(execFields) >= 2 && execFields[1] != "mcp-server" && execFields[1] != "language-server" {
+			return true
+		}
+	case "npm", "npx", "pnpm", "yarn":
+		if len(execFields) >= 2 {
+			switch execFields[1] {
+			case "test", "build", "lint", "check", "ci":
+				return true
+			case "run":
+				if len(execFields) >= 3 && !strings.Contains(execFields[2], "mcp") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func isMCPOrDaemonChildProcess(cmdline string) bool {
 	lower := strings.ToLower(strings.TrimSpace(cmdline))
 	if lower == "" {
 		return true
 	}
-	if strings.Contains(lower, "mcp") ||
-		strings.Contains(lower, "language-server") ||
-		strings.Contains(lower, "gopls") ||
-		strings.Contains(lower, "lsp") {
+	if isStrongSDLCCommandLine(lower) {
+		return false
+	}
+	execFields := commandExecutionFields(lower)
+	bin := commandBinaryBasename(execFields)
+	if bin == "gopls" ||
+		bin == "mcp-server" ||
+		bin == "mcp_server" ||
+		strings.HasSuffix(bin, "-mcp") ||
+		strings.HasPrefix(bin, "mcp-") ||
+		strings.Contains(bin, "language-server") ||
+		strings.HasSuffix(bin, "-lsp") ||
+		bin == "lsp-server" {
 		return true
+	}
+	if bin == "dart" && len(execFields) >= 2 && (execFields[1] == "mcp-server" || execFields[1] == "language-server") {
+		return true
+	}
+	if bin == "npm" || bin == "npx" || bin == "pnpm" || bin == "node" || bin == "python" || bin == "python3" || bin == "uv" || bin == "uvx" {
+		for _, arg := range execFields[1:] {
+			if strings.Contains(arg, "mcp") || strings.Contains(arg, "language-server") {
+				return true
+			}
+		}
 	}
 	if extra := strings.TrimSpace(os.Getenv("IAZIO_IGNORE_CHILD_PATTERNS")); extra != "" {
 		for _, pat := range strings.Split(extra, ",") {
@@ -945,10 +1029,21 @@ func isSDLCChildCommandLine(cmdline string) bool {
 	if cmdLower == "" || strings.HasPrefix(cmdLower, "sleep ") || cmdLower == "sleep" {
 		return false
 	}
+	if isStrongSDLCCommandLine(cmdLower) {
+		return true
+	}
 	if isMCPOrDaemonChildProcess(cmdLower) {
 		return false
 	}
+	execFields := commandExecutionFields(cmdLower)
+	bin := commandBinaryBasename(execFields)
 	for _, tok := range sdlcChildTokens {
+		if tok == "autopilot" {
+			if bin == "autopilot" {
+				return true
+			}
+			continue
+		}
 		if strings.Contains(cmdLower, tok) {
 			return true
 		}
@@ -1210,7 +1305,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 
 	parentHarnessPID := strings.TrimSpace(os.Getenv("IAZIO_PARENT_HARNESS_PID"))
 	isNestedHarnessChild := parentHarnessPID != "" && parentHarnessPID != strconv.Itoa(os.Getpid())
-	allowAmbientEnv := (!isPromptRunnerTestBinary() && !isNestedHarnessChild) || os.Getenv("IAZIO_TEST_ALLOW_AMBIENT_ENV") == "1"
+	allowAmbientEnv := (!isPromptRunnerTestBinary() || os.Getenv("IAZIO_TEST_ALLOW_AMBIENT_ENV") == "1") && !isNestedHarnessChild
 	jobID := strings.TrimSpace(opts.JobID)
 	if jobID == "" && allowAmbientEnv {
 		jobID = strings.TrimSpace(os.Getenv("IAZIO_JOB_ID"))
@@ -1714,7 +1809,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 						eventTag := "[ase_completion.detected_during_bg_drain]"
 						if !inBgDrain && terminalPlannerTurn {
 							drainStateDesc = "at terminal PLANNER_RESPONSE"
-							eventTag = "[ase_completion.detected_at_terminal_turn] [ase_completion.detected_during_bg_drain]"
+							eventTag = "[ase_completion.detected_at_terminal_turn]"
 						}
 						compNote := fmt.Sprintf(
 							"[%s] [ASE-SUPERVISOR] %s ASE flow and story %s verified DONE in worktree %s (ToolPID=%d, Conv=%s, Tasks=%d); settling turn as completed.\n",

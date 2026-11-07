@@ -12,6 +12,11 @@ import (
 )
 
 func main() {
+	base := strings.TrimSuffix(strings.ToLower(filepath.Base(os.Args[0])), ".exe")
+	if strings.HasSuffix(base, "-mcp") || (len(os.Args) > 1 && os.Args[1] == "serve") {
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	}
 	os.Exit(run(os.Args[1:], strings.TrimSpace(os.Getenv("MOCK_AGY_SCENARIO")), os.Stdout, os.Stderr))
 }
 
@@ -845,14 +850,29 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		}
 
 		if scenario == "job_bbd74e1ad21fbc40_terminal_planner_with_mcp_child" {
-			// Spawn a long-lived child process whose command line contains "autopilot-mcp serve"
-			mcpChild := procutil.Command("sh", "-c", "sleep 30 # /Users/romeo/.local/bin/autopilot-mcp serve")
-			_ = mcpChild.Start()
-			defer func() {
-				if mcpChild != nil && mcpChild.Process != nil {
-					_ = mcpChild.Process.Kill()
+			// Spawn a genuine non-exec'd child binary named "autopilot-mcp" with arg "serve"
+			if selfExe, err := os.Executable(); err == nil && selfExe != "" {
+				if mcpDir, err := os.MkdirTemp("", "mock-mcp-bin-*"); err == nil {
+					defer os.RemoveAll(mcpDir)
+					mcpBinName := "autopilot-mcp"
+					if strings.HasSuffix(strings.ToLower(selfExe), ".exe") {
+						mcpBinName += ".exe"
+					}
+					mcpBinPath := filepath.Join(mcpDir, mcpBinName)
+					if err := os.Symlink(selfExe, mcpBinPath); err != nil {
+						if b, rErr := os.ReadFile(selfExe); rErr == nil {
+							_ = os.WriteFile(mcpBinPath, b, 0o755)
+						}
+					}
+					mcpChild := procutil.Command(mcpBinPath, "serve")
+					_ = mcpChild.Start()
+					defer func() {
+						if mcpChild != nil && mcpChild.Process != nil {
+							_ = mcpChild.Process.Kill()
+						}
+					}()
 				}
-			}()
+			}
 		}
 
 		// Hang WITHOUT printing WaitForConversationFullyIdle

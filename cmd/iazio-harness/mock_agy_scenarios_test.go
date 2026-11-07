@@ -1846,7 +1846,7 @@ func TestMockAgy_Scenario19_JobBbd74e1ad21fbc40_TerminalPlannerResponseHangAndAm
 	for _, expected := range []string{
 		"[ASE-SUPERVISOR] Attached Antigravity conversation: 0092d1cb-cc35-41ce-9143-a480dca5e283",
 		"[agy step #135] output: All 10 findings for STORY-GOV-5176 have been remediated",
-		"[ase_completion.detected_during_bg_drain]",
+		"[ase_completion.detected_at_terminal_turn]",
 	} {
 		if !strings.Contains(allChunks, expected) {
 			t.Fatalf("expected streamed chunks to contain %q, got:\n%s", expected, allChunks)

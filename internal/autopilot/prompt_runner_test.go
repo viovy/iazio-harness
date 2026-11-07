@@ -1691,7 +1691,91 @@ func TestHasActiveSDLCChildProcess_IgnoresMCPServerDescendants(t *testing.T) {
 	}
 }
 
+func TestIsSDLCChildCommandLine_DetectsSDLCInMCPNamedPaths(t *testing.T) {
+	origFind := findChildProcessesFunc
+	t.Cleanup(func() { findChildProcessesFunc = origFind })
 
+	// 1. Real SDLC commands in MCP-named repos/packages must be detected as SDLC and NOT classified as daemons
+	sdlcInMCPPaths := []string{
+		"go test -race ./pkg/mcp/...",
+		"/tmp/go-build123/b001/mcp.test -test.v",
+		"go build ./cmd/autopilot-mcp",
+		"make -C iazio-mcp test",
+		`git commit -m "fix(mcp): harden ticket lock"`,
+	}
+	for _, cmd := range sdlcInMCPPaths {
+		if !isSDLCChildCommandLine(cmd) {
+			t.Fatalf("expected %q to be detected as SDLC child command line", cmd)
+		}
+		if isMCPOrDaemonChildProcess(cmd) {
+			t.Fatalf("expected %q NOT to be classified as MCP/daemon child process", cmd)
+		}
+		findChildProcessesFunc = func(rootPID int) []engines.BackgroundTaskInfo {
+			return []engines.BackgroundTaskInfo{{PID: 301, Command: cmd}}
+		}
+		if active, matched := hasActiveSDLCChildProcess(100); !active || matched != cmd {
+			t.Fatalf("expected hasActiveSDLCChildProcess to detect %q, got active=%v matched=%q", cmd, active, matched)
+		}
+		_, activeChildren := hasActiveConversationActivity("", 100, time.Time{}, 30*time.Second)
+		if activeChildren != 1 {
+			t.Fatalf("expected hasActiveConversationActivity to count %q in activeChildren, got %d", cmd, activeChildren)
+		}
+	}
 
+	// 2. Genuine MCP/LSP daemons must NOT be detected as SDLC and MUST be classified as daemons
+	mcpDaemons := []string{
+		"/Users/romeo/.local/bin/autopilot-mcp serve",
+		"npm exec chrome-devtools-mcp@latest",
+		"dart mcp-server",
+		"gopls serve",
+	}
+	for _, daemonCmd := range mcpDaemons {
+		if isSDLCChildCommandLine(daemonCmd) {
+			t.Fatalf("expected MCP/LSP daemon %q NOT to be detected as SDLC child command line", daemonCmd)
+		}
+		if !isMCPOrDaemonChildProcess(daemonCmd) {
+			t.Fatalf("expected MCP/LSP daemon %q to be classified as MCP/daemon child process", daemonCmd)
+		}
+		findChildProcessesFunc = func(rootPID int) []engines.BackgroundTaskInfo {
+			return []engines.BackgroundTaskInfo{{PID: 401, Command: daemonCmd}}
+		}
+		if active, matched := hasActiveSDLCChildProcess(100); active {
+			t.Fatalf("expected hasActiveSDLCChildProcess to ignore %q, got active=true matched=%q", daemonCmd, matched)
+		}
+		_, activeChildren := hasActiveConversationActivity("", 100, time.Time{}, 30*time.Second)
+		if activeChildren != 0 {
+			t.Fatalf("expected hasActiveConversationActivity to exclude %q from activeChildren, got %d", daemonCmd, activeChildren)
+		}
+	}
 
+	// 3. Verify IAZIO_PARENT_HARNESS_PID nested-harness ambient-env gate (R2-05)
+	var parentHarnessHit int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parentHarnessHit++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	t.Setenv("IAZIO_TEST_ALLOW_AMBIENT_ENV", "1")
+	t.Setenv("IAZIO_PARENT_HARNESS_PID", "999999")
+	t.Setenv("IAZIO_JOB_ID", "job_nested_child_leak")
+	t.Setenv("IAZIO_HARNESS_API_URL", srv.URL)
+
+	fakeBin := makeFakeAutopilot(t)
+	repoDir := initTestGitRepo(t)
+	_, err := NewPromptRunner(fakeBin).RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:   "test_nested_parent_pid",
+		StoryID:    "STORY-NESTED-999",
+		Repo:       "test-submodule",
+		Prompt:     "Execute task",
+		WorkingDir: repoDir,
+		Timeout:    5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("unexpected RunPrompt error under IAZIO_PARENT_HARNESS_PID: %v", err)
+	}
+	if parentHarnessHit != 0 {
+		t.Fatalf("expected nested harness child (IAZIO_PARENT_HARNESS_PID=999999) to suppress ambient IAZIO_JOB_ID/IAZIO_HARNESS_API_URL, got %d hits", parentHarnessHit)
+	}
+}
 
