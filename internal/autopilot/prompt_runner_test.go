@@ -1390,5 +1390,123 @@ exit 0
 	}
 }
 
+func TestJobBbd74e1ad21fbc40_TerminalTranscriptCompletionAndAmbientEnvIsolation(t *testing.T) {
+	brainDir := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainDir)
+
+	// 1. Verify isTranscriptAtTerminalPlannerResponse
+	convID := "0092d1cb-cc35-41ce-9143-a480dca5e283"
+	tpDir := filepath.Join(brainDir, convID, ".system_generated", "logs")
+	if err := os.MkdirAll(tpDir, 0o755); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	tpFile := filepath.Join(tpDir, "transcript.jsonl")
+	_ = os.WriteFile(tpFile, []byte(`{"step_index":368,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command"}]}`+"\n"), 0o600)
+	if isTranscriptAtTerminalPlannerResponse(convID) {
+		t.Fatalf("expected false when last PLANNER_RESPONSE has tool_calls")
+	}
+	_ = os.WriteFile(tpFile, []byte(
+		`{"step_index":368,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command"}]}`+"\n"+
+			`{"step_index":477,"type":"PLANNER_RESPONSE","status":"DONE","content":"## CRAFT Closeout\nAll 10 findings remediated for STORY-GOV-5176.","tool_calls":[]}`+"\n",
+	), 0o600)
+	if !isTranscriptAtTerminalPlannerResponse(convID) {
+		t.Fatalf("expected true when last step is terminal PLANNER_RESPONSE with status=DONE and empty tool_calls")
+	}
+
+	// 2. Verify isASEFlowCompletedInWorktree ignores unrelated historical IN_PROGRESS stories when primaryStoryID is found and DONE
+	repoDir := initTestGitRepo(t)
+	storiesDir := filepath.Join(repoDir, "docs", "stories")
+	if err := os.MkdirAll(storiesDir, 0o755); err != nil {
+		t.Fatalf("mkdir stories: %v", err)
+	}
+	primaryPath := filepath.Join(storiesDir, "2026-11-07-gov-5176-canonical-ai-autopilot-iazio-deep-review-remediation.story.md")
+	unrelatedOldPath := filepath.Join(storiesDir, "2026-10-01-gov-1001-old-in-progress.story.md")
+	_ = os.WriteFile(primaryPath, []byte("---\nid: STORY-GOV-5176\ntitle: Remediate All 10 Findings\nstatus: DONE\n---\n"), 0o600)
+	_ = os.WriteFile(unrelatedOldPath, []byte("---\nid: STORY-GOV-1001\ntitle: Historical Unrelated Story\nstatus: IN_PROGRESS\n---\n"), 0o600)
+	for _, args := range [][]string{
+		{"add", "docs"},
+		{"commit", "-m", "feat(STORY-GOV-5176): complete story"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, string(out))
+		}
+	}
+
+	combinedWithUnrelatedMention := "Completed STORY-GOV-5176 (see historical note STORY-GOV-1001).\n## CRAFT Closeout"
+	if !isASEFlowCompletedInWorktree(repoDir, "STORY-GOV-5176", combinedWithUnrelatedMention, "git") {
+		t.Fatalf("expected isASEFlowCompletedInWorktree=true for DONE primaryStoryID STORY-GOV-5176 even when combinedOutput mentions unrelated STORY-GOV-1001")
+	}
+
+	// 3. Verify ambient IAZIO_JOB_ID / IAZIO_HARNESS_API_URL are ignored inside test binaries when opts.JobID == ""
+	var ambientCalls int
+	var mu sync.Mutex
+	ambientSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ambientCalls++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ambientSrv.Close()
+
+	t.Setenv("IAZIO_JOB_ID", "job_bbd74e1ad21fbc40")
+	t.Setenv("IAZIO_HARNESS_API_URL", ambientSrv.URL)
+
+	binDir := t.TempDir()
+	mockEcho := filepath.Join(binDir, "mock-echo")
+	_ = os.WriteFile(mockEcho, []byte("#!/bin/sh\necho 'done STORY-EXPLICIT-111'\nexit 0\n"), 0o755)
+
+	runner := NewPromptRunner(mockEcho)
+	if _, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:   "unit_test_isolation",
+		StoryID:    "STORY-EXPLICIT-111",
+		Prompt:     "Execute story STORY-EXPLICIT-111",
+		WorkingDir: repoDir,
+	}); err != nil {
+		t.Fatalf("RunPrompt isolated test failed: %v", err)
+	}
+	mu.Lock()
+	gotAmbientCalls := ambientCalls
+	mu.Unlock()
+	if gotAmbientCalls != 0 {
+		t.Fatalf("expected 0 control-plane calls to ambient IAZIO_HARNESS_API_URL when opts.JobID/APIURL are empty in test binary, got %d", gotAmbientCalls)
+	}
+
+	// 4. Verify end-to-end RunPrompt settles when transcript reaches terminal PLANNER_RESPONSE and primary story is DONE even if agy --print hangs without WaitForConversationFullyIdle log
+	mockAgyHang := filepath.Join(binDir, "mock-agy-hang")
+	hangScript := fmt.Sprintf(`#!/bin/sh
+echo "CONVERSATION_ID: %s"
+echo "ALLOCATED_STORY_ID: STORY-GOV-5176"
+sleep 5
+exit 0
+`, convID)
+	if err := os.WriteFile(mockAgyHang, []byte(hangScript), 0o755); err != nil {
+		t.Fatalf("write mock-agy-hang: %v", err)
+	}
+
+	runner2 := NewPromptRunner("autopilot")
+	runner2.GracePeriod = 50 * time.Millisecond
+	res, err := runner2.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:                   "prompt_job_bbd74e1ad21fbc40",
+		JobID:                      "job_bbd74e1ad21fbc40",
+		APIURL:                     ambientSrv.URL,
+		Token:                      "tok",
+		StoryID:                    "STORY-GOV-5176",
+		Prompt:                     "/autonomous-story-execution STORY-GOV-5176",
+		TargetAgent:                mockAgyHang,
+		WorkingDir:                 repoDir,
+		Timeout:                    2 * time.Second,
+		BackgroundDrainGracePeriod: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("expected hung agy after terminal PLANNER_RESPONSE + DONE story to settle cleanly, got err=%v", err)
+	}
+	if res.Status != "completed" || res.ExitCode != 0 {
+		t.Fatalf("expected completed ExitCode=0, got Status=%q ExitCode=%d", res.Status, res.ExitCode)
+	}
+}
+
+
 
 

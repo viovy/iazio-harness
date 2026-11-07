@@ -187,38 +187,28 @@ func buildReport(path string, cfg *File) Report {
 }
 
 // Status reads the local file only. It does not call the network and does not return token bytes.
+// Per ADR-2026-11-07 strict per-tool ticket segregation, it reads only ConfigPath() (~/.iazio/harness.json)
+// and never falls back to another tool's config file (such as ~/.iazio/agent.json).
 func Status() (Report, error) {
 	path := ConfigPath()
 	cfg, err := load(path)
 	if err == nil {
-		if strings.TrimSpace(cfg.RefreshToken) == "" {
-			agentPath := AgentConfigPath()
-			if aCfg, aErr := load(agentPath); aErr == nil && strings.TrimSpace(aCfg.RefreshToken) != "" {
-				return buildReport(agentPath, aCfg), nil
-			}
-		}
 		return buildReport(path, cfg), nil
 	}
 	if errors.Is(err, os.ErrNotExist) {
-		agentPath := AgentConfigPath()
-		if aCfg, aErr := load(agentPath); aErr == nil {
-			return buildReport(agentPath, aCfg), nil
-		}
 		return buildReport(path, nil), nil
 	}
 	return Report{}, err
 }
 
-// LoadOptional returns the active client configuration, falling back to iazio-agent configuration.
+// LoadOptional returns the active harness client configuration from ConfigPath() only (no cross-tool fallback).
 func LoadOptional() (*File, error) {
 	return loadOptional()
 }
 
-// Logout clears tokens from both harness and agent configuration.
+// Logout clears tokens from the segregated harness configuration file only.
 func Logout() error {
-	_ = clearTokensInFile(ConfigPath())
-	_ = clearTokensInFile(AgentConfigPath())
-	return nil
+	return clearTokensInFile(ConfigPath())
 }
 
 func clearTokensInFile(path string) error {
@@ -273,7 +263,7 @@ func ResolveEndpoints() (Endpoints, error) {
 	return ep, nil
 }
 
-// Bearer returns an access token string for API calls.
+// Bearer returns an access token string for API calls from the segregated harness config file.
 // It reuses an unexpired access token, otherwise it refreshes once.
 func Bearer(ctx context.Context) (string, error) {
 	path := ConfigPath()
@@ -286,9 +276,6 @@ func Bearer(ctx context.Context) (string, error) {
 	}
 	if strings.TrimSpace(cfg.RefreshToken) == "" {
 		return "", ErrNoRefreshToken
-	}
-	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-		path = AgentConfigPath()
 	}
 	return refresh(ctx, path, cfg)
 }
@@ -345,40 +332,6 @@ func refreshPresent() (bool, error) {
 func loadOptional() (*File, error) {
 	path := ConfigPath()
 	cfg, err := load(path)
-	if err == nil && (strings.TrimSpace(cfg.RefreshToken) != "" || strings.TrimSpace(cfg.AccessToken) != "") {
-		return cfg, nil
-	}
-	agentCfg, aErr := load(AgentConfigPath())
-	if aErr == nil {
-		if cfg == nil {
-			return agentCfg, nil
-		}
-		if strings.TrimSpace(cfg.RefreshToken) == "" && strings.TrimSpace(agentCfg.RefreshToken) != "" {
-			cfg.RefreshToken = agentCfg.RefreshToken
-			if strings.TrimSpace(agentCfg.ClientID) != "" {
-				cfg.ClientID = agentCfg.ClientID
-			}
-		}
-		if strings.TrimSpace(cfg.AccessToken) == "" {
-			cfg.AccessToken = agentCfg.AccessToken
-			if strings.TrimSpace(cfg.Expiry) == "" {
-				cfg.Expiry = agentCfg.Expiry
-			}
-		}
-		if strings.TrimSpace(cfg.AuthURL) == "" {
-			cfg.AuthURL = agentCfg.AuthURL
-		}
-		if strings.TrimSpace(cfg.TokenURL) == "" {
-			cfg.TokenURL = agentCfg.TokenURL
-		}
-		if strings.TrimSpace(cfg.DeviceAuthURL) == "" {
-			cfg.DeviceAuthURL = agentCfg.DeviceAuthURL
-		}
-		if strings.TrimSpace(cfg.APIBaseURL) == "" {
-			cfg.APIBaseURL = agentCfg.APIBaseURL
-		}
-		return cfg, nil
-	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return &File{}, nil

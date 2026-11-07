@@ -1724,3 +1724,132 @@ func TestMockAgy_Scenario18_Job110f47f09551baba_ASECompleteDuringBackgroundDrain
 		}
 	}
 }
+
+// Scenario 19 (job_bbd74e1ad21fbc40 / STORY-GOV-5177):
+// E2E integration test using mock-agy verifying:
+//  1. mock-agy completes STORY-GOV-5176 in docs/stories/ (committed cleanly) and writes terminal PLANNER_RESPONSE
+//     step #135 (status: "DONE", tool_calls: [], "## CRAFT Closeout") to brain transcript.jsonl, while step #1
+//     mentions a historical story ID (STORY-GOV-5175).
+//  2. mock-agy hangs WITHOUT emitting "WaitForConversationFullyIdle" (inBgDrain == false).
+//  3. CLIPromptRunner detects terminal PLANNER_RESPONSE + ASE worktree completion after bgDrainGrace,
+//     reaps the hung mock-agy process group, binds STORY-GOV-5176 (ignoring historical STORY-GOV-5175),
+//     and isolates execution from any ambient IAZIO_JOB_ID / IAZIO_FENCING_TOKEN environment variables.
+func TestMockAgy_Scenario19_JobBbd74e1ad21fbc40_TerminalPlannerResponseHangAndAmbientEnvIsolation(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "job_bbd74e1ad21fbc40_terminal_planner_response_no_bg_drain_marker")
+	t.Setenv("MOCK_AGY_FAST", "1")
+	t.Setenv("IAZIO_BG_DRAIN_GRACE_MS", "200")
+
+	// Set ambient env vars to verify test isolation does not leak or override explicit RunPromptOptions
+	t.Setenv("IAZIO_JOB_ID", "ambient_leaked_job_999")
+	t.Setenv("IAZIO_FENCING_TOKEN", "999")
+
+	var mu sync.Mutex
+	var postedChunks []string
+	var postedConvIDs []string
+	var boundStoryIDs []string
+	var requestPaths []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		requestPaths = append(requestPaths, r.URL.Path)
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			var body struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.Text != "" {
+				postedChunks = append(postedChunks, body.Text)
+			}
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/conversations"):
+			var body struct {
+				ConversationID string `json:"conversation_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.ConversationID != "" {
+				postedConvIDs = append(postedConvIDs, body.ConversationID)
+			}
+			w.WriteHeader(http.StatusOK)
+		case (r.Method == http.MethodPatch || r.Method == http.MethodPost) && strings.HasSuffix(r.URL.Path, "/story-binding"):
+			var body struct {
+				StoryID string `json:"story_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.StoryID != "" {
+				boundStoryIDs = append(boundStoryIDs, body.StoryID)
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	worktree := initTestGitWorktree(t)
+	_ = os.WriteFile(filepath.Join(worktree, ".gitignore"), []byte(".session_story_id\n.autopilot/\n"), 0o644)
+	_ = exec.Command("git", "-C", worktree, "add", ".gitignore").Run()
+	_ = exec.Command("git", "-C", worktree, "commit", "-m", "chore: initial").Run()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	runner := autopilot.NewPromptRunner("")
+	runner.BackgroundDrainGracePeriod = 200 * time.Millisecond
+
+	res, err := runner.RunPrompt(ctx, autopilot.RunPromptOptions{
+		PromptID:    "prompt_bbd74e1ad21fbc40",
+		JobID:       "job_bbd74e1ad21fbc40",
+		APIURL:      srv.URL,
+		Repo:        "/Users/romeo/work/meta-repo",
+		WorkingDir:  worktree,
+		Prompt:      "/autonomous-story-execution STORY-GOV-5176",
+		TargetAgent: "agy",
+		Timeout:     6 * time.Second,
+	})
+	if err != nil {
+		mu.Lock()
+		chunksDebug := strings.Join(postedChunks, "")
+		mu.Unlock()
+		t.Fatalf("expected RunPrompt for job_bbd74e1ad21fbc40 to complete cleanly, got error: %v (res=%+v)\nchunks:\n%s", err, res, chunksDebug)
+	}
+	if res == nil || res.Status != "completed" || res.ExitCode != 0 {
+		t.Fatalf("expected completed exit 0, got %+v", res)
+	}
+	if res.StoryID != "STORY-GOV-5176" {
+		t.Fatalf("expected StoryID STORY-GOV-5176 (ignoring historical STORY-GOV-5175), got %q", res.StoryID)
+	}
+	if res.ActiveConversationID != "0092d1cb-cc35-41ce-9143-a480dca5e283" {
+		t.Fatalf("expected conversation 0092d1cb-cc35-41ce-9143-a480dca5e283, got %q", res.ActiveConversationID)
+	}
+	if res.ResumeAttempts != 0 {
+		t.Fatalf("expected 0 auto-resume attempts when terminal PLANNER_RESPONSE + ASE flow completed, got %d", res.ResumeAttempts)
+	}
+
+	mu.Lock()
+	allChunks := strings.Join(postedChunks, "")
+	paths := append([]string(nil), requestPaths...)
+	stories := append([]string(nil), boundStoryIDs...)
+	mu.Unlock()
+
+	for _, p := range paths {
+		if strings.Contains(p, "ambient_leaked_job_999") {
+			t.Fatalf("ambient IAZIO_JOB_ID leaked into control plane request path: %s", p)
+		}
+	}
+	if len(stories) == 0 || stories[len(stories)-1] != "STORY-GOV-5176" {
+		t.Fatalf("expected story-binding for STORY-GOV-5176, got %v", stories)
+	}
+	for _, expected := range []string{
+		"[ASE-SUPERVISOR] Attached Antigravity conversation: 0092d1cb-cc35-41ce-9143-a480dca5e283",
+		"[agy step #135] output: All 10 findings for STORY-GOV-5176 have been remediated",
+		"[ase_completion.detected_during_bg_drain]",
+	} {
+		if !strings.Contains(allChunks, expected) {
+			t.Fatalf("expected streamed chunks to contain %q, got:\n%s", expected, allChunks)
+		}
+	}
+}

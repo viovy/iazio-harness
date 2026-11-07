@@ -592,6 +592,43 @@ func tailBrainTranscriptSteps(convID string, seenSteps map[int]bool) string {
 	return sb.String()
 }
 
+func isTranscriptAtTerminalPlannerResponse(convID string) bool {
+	if strings.TrimSpace(convID) == "" || !sessionstore.IsValidConversationID(convID) {
+		return false
+	}
+	brainDir := resolveBrainDir()
+	if brainDir == "" {
+		return false
+	}
+	transcriptPath := filepath.Join(brainDir, convID, ".system_generated", "logs", "transcript.jsonl")
+	f, err := os.Open(transcriptPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	var lastStep transcriptStep
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var step transcriptStep
+		if err := json.Unmarshal([]byte(line), &step); err != nil {
+			continue
+		}
+		if step.StepIndex > 0 {
+			lastStep = step
+		}
+	}
+	return lastStep.StepIndex > 0 &&
+		lastStep.Type == "PLANNER_RESPONSE" &&
+		strings.EqualFold(lastStep.Status, "DONE") &&
+		len(lastStep.ToolCalls) == 0
+}
+
 func hasBackgroundDrainLog(logPath, stdoutText, stderrText string) (bool, int) {
 	check := func(s string) (bool, int) {
 		trimmed := strings.TrimSpace(s)
@@ -761,9 +798,15 @@ func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gi
 		}
 	}
 	addStory(primaryStoryID)
-	for _, m := range storyIDRegex.FindAllStringSubmatch(combinedOutput, -1) {
-		if len(m) > 1 {
-			addStory(m[1])
+	primaryFoundInWorktree := false
+	if strings.TrimSpace(primaryStoryID) != "" {
+		primaryFoundInWorktree, _ = storyFrontmatterStatus(workingDir, primaryStoryID)
+	}
+	if !primaryFoundInWorktree {
+		for _, m := range storyIDRegex.FindAllStringSubmatch(combinedOutput, -1) {
+			if len(m) > 1 {
+				addStory(m[1])
+			}
 		}
 	}
 
@@ -1075,12 +1118,13 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	isMockAgy := strings.HasPrefix(baseEffectiveAgent, "mock-agy")
 	isDirectAgy := r.AutopilotBinary == "autopilot" && (baseEffectiveAgent == "agy" || baseEffectiveAgent == "agy.exe")
 
+	allowAmbientEnv := !isPromptRunnerTestBinary() || os.Getenv("IAZIO_TEST_ALLOW_AMBIENT_ENV") == "1"
 	jobID := strings.TrimSpace(opts.JobID)
-	if jobID == "" {
+	if jobID == "" && allowAmbientEnv {
 		jobID = strings.TrimSpace(os.Getenv("IAZIO_JOB_ID"))
 	}
 	apiURL := strings.TrimSpace(opts.APIURL)
-	if apiURL == "" {
+	if apiURL == "" && allowAmbientEnv {
 		apiURL = strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_URL"))
 	}
 	resolveToken := func() string {
@@ -1088,7 +1132,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 	token := resolveToken()
 	fencingToken := opts.FencingToken
-	if fencingToken == 0 {
+	if fencingToken == 0 && allowAmbientEnv {
 		if rawFT := strings.TrimSpace(os.Getenv("IAZIO_FENCING_TOKEN")); rawFT != "" {
 			if parsedFT, errFT := strconv.ParseInt(rawFT, 10, 64); errFT == nil {
 				fencingToken = parsedFT
@@ -1096,11 +1140,11 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		}
 	}
 	leaseToken := strings.TrimSpace(opts.LeaseToken)
-	if leaseToken == "" {
+	if leaseToken == "" && allowAmbientEnv {
 		leaseToken = strings.TrimSpace(os.Getenv("IAZIO_LEASE_TOKEN"))
 	}
 	initialResumeConv := strings.TrimSpace(opts.ResumeConversationID)
-	if initialResumeConv == "" {
+	if initialResumeConv == "" && allowAmbientEnv {
 		initialResumeConv = strings.TrimSpace(os.Getenv("IAZIO_RESUME_CONVERSATION_ID"))
 	}
 	targetBranch := strings.TrimSpace(opts.Branch)
@@ -1133,7 +1177,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	lastOutAt := startTime
 	streamedAny := false
 	detectedConvID := initialResumeConv
-	if detectedConvID == "" {
+	if detectedConvID == "" && allowAmbientEnv {
 		if envConv := strings.TrimSpace(os.Getenv("IAZIO_CONVERSATION_ID")); sessionstore.IsValidConversationID(envConv) {
 			detectedConvID = envConv
 		}
@@ -1565,9 +1609,11 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				streamMu.Unlock()
 
 				inBgDrain, bgTasks := hasBackgroundDrainLog(tmpLogPath, outSnapshot, errSnapshot)
-				if inBgDrain {
-					// If ASE/story execution is already completed in the worktree/transcript, settle immediately as completed!
-					if isASEFlowCompletedInWorktree(opts.WorkingDir, curBoundStory, fullOut+"\n"+fullTranscript+"\n"+fullErr, gitBin) {
+				terminalPlannerTurn := isTranscriptAtTerminalPlannerResponse(curConv)
+				if inBgDrain || terminalPlannerTurn {
+					// If ASE/story execution is already completed in the worktree/transcript and no SDLC child is running, settle immediately as completed!
+					sdlcActiveNow, _ := hasActiveSDLCChildProcess(toolPID)
+					if !sdlcActiveNow && isASEFlowCompletedInWorktree(opts.WorkingDir, curBoundStory, fullOut+"\n"+fullTranscript+"\n"+fullErr, gitBin) {
 						turnCompletedDuringDrain = true
 						turnBgDrainReaped = false
 						compNote := fmt.Sprintf(
@@ -1587,7 +1633,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					}
 					if bgDrainSince.IsZero() {
 						bgDrainSince = time.Now()
-					} else if time.Since(bgDrainSince) >= bgDrainGrace {
+					} else if time.Since(bgDrainSince) >= bgDrainGrace && (inBgDrain || time.Since(lastActivity) >= bgDrainGrace) {
 						if sdlcActive, sdlcCmd := hasActiveSDLCChildProcess(toolPID); sdlcActive && bgDrainDeferrals < maxBgDrainDeferrals {
 							bgDrainDeferrals++
 							bgDrainSince = time.Now()
@@ -1682,10 +1728,6 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 						)
 						_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", hbMsg)
 						lastHeartbeatChunkAt = time.Now()
-						streamMu.Lock()
-						lastOutAt = time.Now()
-						silentMs = 0
-						streamMu.Unlock()
 					}
 					_ = controlplane.PostTick(ctx, apiURL, tok, jobID, silentMs, os.Getpid(), toolPID, elapsedSec)
 					if toolAlive && time.Since(lastJobHeartbeatAt) >= 10*time.Second {
