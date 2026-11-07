@@ -857,3 +857,45 @@ func TestInspectAndRemediate_TrackedSessionStoryIDAndStrategyGitUpdate(t *testin
 	})
 	_ = resolveAutopilotBinary()
 }
+
+func TestResetASELocks_ClearsVerificationStatusAndASEStateFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	apDir := filepath.Join(tmpDir, ".autopilot")
+	if err := os.MkdirAll(apDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	stateFile := filepath.Join(apDir, "state.json")
+	aseStateFile := filepath.Join(apDir, "ase-state.json")
+	if err := os.WriteFile(stateFile, []byte(`{"state":"DONE","story_id":"STORY-GOV-5177","verification_status":"PASSED"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile state.json: %v", err)
+	}
+	if err := os.WriteFile(aseStateFile, []byte(`{"story_id":"STORY-GOV-5177","status":"DONE"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile ase-state.json: %v", err)
+	}
+	if err := ResetASELocks(tmpDir); err != nil {
+		t.Fatalf("ResetASELocks: %v", err)
+	}
+	if _, err := os.Stat(aseStateFile); !os.IsNotExist(err) {
+		t.Fatalf("expected ase-state.json to be removed after ResetASELocks, stat err=%v", err)
+	}
+	b, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("ReadFile state.json: %v", err)
+	}
+	if strings.Contains(string(b), `"verification_status": "PASSED"`) {
+		t.Fatalf("expected verification_status to be cleared, got: %s", string(b))
+	}
+
+	res := &RepoFleetStatusResult{
+		Branch:              "main",
+		ASEState:            "IDLE",
+		ToolLiveness:        "LIVE",
+		ExecutionProvenance: "INDEPENDENT_USER_SESSION",
+		NonMainSubmodules:   []string{"autopilot-plugins-internal (on chore/STORY-GOV-5177)"},
+	}
+	reconcileAdhocASEStateWithOpts(tmpDir, false, res)
+	if res.ASEState != "RUNNING" || res.CurrentPhase != "ADHOC_ASE" {
+		t.Fatalf("expected live agent with non-main submodule to be treated as RUNNING ADHOC_ASE, got state=%s phase=%s", res.ASEState, res.CurrentPhase)
+	}
+}
+
