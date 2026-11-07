@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -16,6 +17,30 @@ import (
 	"github.com/viovy/iazio-harness/internal/procutil"
 	"github.com/viovy/iazio-harness/internal/repolock"
 )
+
+var (
+	branchExplicitStoryRe = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+-[0-9]+)\b`)
+	branchSlugStoryRe     = regexp.MustCompile(`(?i)^(?:chore|feat|fix|refactor|docs|test|ci|perf|build)/(?:story-)?([a-z]{2,10})-([0-9]{2,6})(?:[-/]|$)`)
+)
+
+// InferStoryIDFromBranch extracts a canonical STORY-<CAT>-<NUM> identifier from a story branch name
+// (e.g. "chore/gov-5186-increase-jenkins-zfs-volume-25gb" -> "STORY-GOV-5186") or submodule status entry.
+func InferStoryIDFromBranch(branch string) string {
+	b := strings.TrimSpace(branch)
+	if b == "" || b == "main" || b == "master" || b == "HEAD" || b == "detached" {
+		return ""
+	}
+	if idx := strings.Index(b, "(on "); idx >= 0 {
+		b = strings.TrimSuffix(strings.TrimSpace(b[idx+4:]), ")")
+	}
+	if m := branchExplicitStoryRe.FindStringSubmatch(b); len(m) == 2 {
+		return strings.ToUpper(m[1])
+	}
+	if m := branchSlugStoryRe.FindStringSubmatch(b); len(m) == 3 {
+		return fmt.Sprintf("STORY-%s-%s", strings.ToUpper(m[1]), m[2])
+	}
+	return ""
+}
 
 // InspectOptions configures repository evaluation and inline self-remediation behavior.
 type InspectOptions struct {
@@ -581,8 +606,9 @@ func parseASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFl
 	}
 
 	isMainBranch := res.Branch == "" || res.Branch == "main" || res.Branch == "master"
+	canPruneCompletedStory := isMainBranch && len(res.NonMainSubmodules) == 0
 
-	// 2. Inspect .autopilot/state.json (and auto-remediate stale state when story is DONE or idle on main)
+	// 2. Inspect .autopilot/state.json (and auto-remediate stale state when story is DONE and repo is back on main)
 	stateFile := filepath.Join(repoPath, ".autopilot", "state.json")
 	if b, err := os.ReadFile(stateFile); err == nil {
 		var s struct {
@@ -592,7 +618,7 @@ func parseASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFl
 			UpdatedAt    string `json:"updated_at"`
 		}
 		if json.Unmarshal(b, &s) == nil {
-			storyDone := s.StoryID != "" && IsStoryCompletedOnDisk(repoPath, s.StoryID)
+			storyDone := canPruneCompletedStory && s.StoryID != "" && IsStoryCompletedOnDisk(repoPath, s.StoryID)
 			staleIdlePhase := s.StoryID == "" && s.CurrentPhase != "" && (s.State == "" || s.State == "IDLE") && len(locks) == 0 && isMainBranch
 			if autoRemediateTier1 && (storyDone || staleIdlePhase) {
 				resetAutopilotStateFileToIdle(stateFile)
@@ -621,8 +647,8 @@ func parseASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFl
 		}
 	}
 
-	// 3. Prune completed tmp/ase-resume-STORY-*.json checkpoints when unlocked
-	if autoRemediateTier1 && len(locks) == 0 {
+	// 3. Prune completed tmp/ase-resume-STORY-*.json checkpoints when unlocked and back on main
+	if autoRemediateTier1 && len(locks) == 0 && canPruneCompletedStory {
 		if matches, err := filepath.Glob(filepath.Join(repoPath, "tmp", "ase-resume-STORY-*.json")); err == nil {
 			for _, m := range matches {
 				base := filepath.Base(m)
@@ -651,7 +677,7 @@ func parseASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFl
 	if b, err := os.ReadFile(sessionPath); err == nil {
 		storyID := strings.TrimSpace(string(b))
 		if strings.HasPrefix(strings.ToUpper(storyID), "STORY-") {
-			if IsStoryCompletedOnDisk(repoPath, storyID) {
+			if canPruneCompletedStory && IsStoryCompletedOnDisk(repoPath, storyID) {
 				if autoRemediateTier1 {
 					if changed, action := cleanOrRestoreSessionStoryFile(repoPath, storyID); changed {
 						res.RemediationApplied = true
@@ -674,6 +700,28 @@ func parseASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFl
 						res.CurrentPhase = "ADHOC_ASE"
 					}
 				}
+			}
+		}
+	}
+
+	// 5. Infer ActiveStoryID from non-main story branch or non-main submodule branches when not bound in files
+	if res.ActiveStoryID == "" {
+		inferred := InferStoryIDFromBranch(res.Branch)
+		if inferred == "" {
+			for _, subEntry := range res.NonMainSubmodules {
+				if cand := InferStoryIDFromBranch(subEntry); cand != "" {
+					inferred = cand
+					break
+				}
+			}
+		}
+		if inferred != "" {
+			res.ActiveStoryID = inferred
+			if res.ASEState == "IDLE" || res.ASEState == "FAILED_DIRTY" {
+				res.ASEState = "RUNNING"
+			}
+			if res.CurrentPhase == "" {
+				res.CurrentPhase = "ADHOC_ASE"
 			}
 		}
 	}
@@ -799,6 +847,7 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 	// no locks, and no autopilot* process is an idle shell — NOT an active ad-hoc ASE execution.
 	hasAffirmativeASEEvidence := res.LockDetails != "" ||
 		isAutopilotProcess ||
+		(res.ToolLiveness == "LIVE" && (nonMainBranch || len(res.NonMainSubmodules) > 0)) ||
 		(res.ActiveStoryID != "" && (nonMainBranch || len(res.NonMainSubmodules) > 0 || hasScopedResume || res.ToolLiveness == "LIVE"))
 
 	if res.ToolLiveness == "LIVE" && res.ExecutionProvenance == "INDEPENDENT_USER_SESSION" && hasAffirmativeASEEvidence {

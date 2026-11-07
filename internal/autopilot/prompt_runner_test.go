@@ -1539,7 +1539,7 @@ func TestTurnLoop_SupervisorHeartbeatDoesNotResetSilentMs(t *testing.T) {
 	defer srv.Close()
 
 	binDir := t.TempDir()
-	mockSilent := filepath.Join(binDir, "mock-silent")
+	mockSilent := filepath.Join(binDir, "mock-agy-silent")
 	script := "#!/bin/sh\necho 'initial output'\nsleep 5\nexit 0\n"
 	if err := os.WriteFile(mockSilent, []byte(script), 0o755); err != nil {
 		t.Fatalf("write mock-silent: %v", err)
@@ -1623,7 +1623,7 @@ func TestTurnLoop_TerminalPlannerResponseWithInProgressStoryDoesNotPrematurelySe
 
 	// Drive RunPrompt end-to-end (R-04): terminal transcript + IN_PROGRESS story must NOT trigger
 	// premature turnBgDrainReaped or ase_completion.detected_during_bg_drain while child is alive.
-	mockInProgress := filepath.Join(t.TempDir(), "mock-inprogress-agy")
+	mockInProgress := filepath.Join(t.TempDir(), "mock-agy-inprogress")
 	script := "#!/bin/sh\n" +
 		"echo \"Conversation ID: " + convID + "\"\n" +
 		"echo \"bound story STORY-GOV-5199\"\n" +

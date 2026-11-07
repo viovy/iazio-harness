@@ -857,3 +857,44 @@ func TestInspectAndRemediate_TrackedSessionStoryIDAndStrategyGitUpdate(t *testin
 	})
 	_ = resolveAutopilotBinary()
 }
+
+func TestInferStoryIDFromBranchAndInFlightStoryBranchPreservesAdhocASE(t *testing.T) {
+	if got := InferStoryIDFromBranch("chore/gov-5186-increase-jenkins-zfs-volume-25gb"); got != "STORY-GOV-5186" {
+		t.Fatalf("expected STORY-GOV-5186, got %q", got)
+	}
+	if got := InferStoryIDFromBranch("autopilot-plugins-internal (on feat/STORY-IAZIO-0194-sync)"); got != "STORY-IAZIO-0194" {
+		t.Fatalf("expected STORY-IAZIO-0194, got %q", got)
+	}
+	if got := InferStoryIDFromBranch("main"); got != "" {
+		t.Fatalf("expected empty for main, got %q", got)
+	}
+
+	tmpDir := t.TempDir()
+	exec.Command("git", "init", "-b", "chore/gov-5186-increase-jenkins-zfs-volume-25gb", tmpDir).Run()
+	exec.Command("git", "-C", tmpDir, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", tmpDir, "config", "user.name", "Test User").Run()
+
+	storiesDir := filepath.Join(tmpDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0o755)
+	// Story file marked DONE for PR gate while branch is still active (not merged to main yet)
+	_ = os.WriteFile(filepath.Join(storiesDir, "2026-11-07-gov-5186-test.story.md"), []byte("---\nid: STORY-GOV-5186\nstatus: DONE\n---\n"), 0o644)
+	exec.Command("git", "-C", tmpDir, "add", ".").Run()
+	exec.Command("git", "-C", tmpDir, "commit", "-m", "feat: pre-land story commit").Run()
+	// Make dirty modification on the active story branch without .session_story_id
+	_ = os.WriteFile(filepath.Join(tmpDir, "work.txt"), []byte("in-flight\n"), 0o644)
+
+	res, err := InspectRepoFleetStatus(context.Background(), tmpDir)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus error: %v", err)
+	}
+	if res.ActiveStoryID != "STORY-GOV-5186" {
+		t.Errorf("expected ActiveStoryID=STORY-GOV-5186 inferred from branch, got %q", res.ActiveStoryID)
+	}
+	if res.ASEState != "RUNNING" {
+		t.Errorf("expected ASEState=RUNNING on active story branch even when story frontmatter is DONE for PR gate, got %q", res.ASEState)
+	}
+	if res.ExecutionProvenance != "INDEPENDENT_USER_SESSION" {
+		t.Errorf("expected ExecutionProvenance=INDEPENDENT_USER_SESSION, got %q", res.ExecutionProvenance)
+	}
+}
+
