@@ -1620,6 +1620,36 @@ func TestTurnLoop_TerminalPlannerResponseWithInProgressStoryDoesNotPrematurelySe
 	if isASEFlowCompletedInWorktree(repoDir, "STORY-GOV-5199", "Waiting for subagent...", "git") {
 		t.Fatalf("expected isASEFlowCompletedInWorktree=false while STORY-GOV-5199 is IN_PROGRESS")
 	}
+
+	// Drive RunPrompt end-to-end (R-04): terminal transcript + IN_PROGRESS story must NOT trigger
+	// premature turnBgDrainReaped or ase_completion.detected_during_bg_drain while child is alive.
+	mockInProgress := filepath.Join(t.TempDir(), "mock-inprogress-agy")
+	script := "#!/bin/sh\n" +
+		"echo \"Conversation ID: " + convID + "\"\n" +
+		"echo \"bound story STORY-GOV-5199\"\n" +
+		"sleep 3\n" +
+		"exit 0\n"
+	if err := os.WriteFile(mockInProgress, []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock script: %v", err)
+	}
+	res, err := NewPromptRunner("autopilot").RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:                   "test_in_progress_no_reap",
+		StoryID:                    "STORY-GOV-5199",
+		Prompt:                     "non-ase prompt STORY-GOV-5199",
+		TargetAgent:                mockInProgress,
+		WorkingDir:                 repoDir,
+		Timeout:                    6 * time.Second,
+		BackgroundDrainGracePeriod: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error running mock-inprogress-agy: %v", err)
+	}
+	if strings.Contains(res.Summary, "ase_completion.detected_during_bg_drain") || strings.Contains(res.Summary, "background_task.auto_reaped") {
+		t.Fatalf("expected no premature drain completion or auto-reap while STORY-GOV-5199 is IN_PROGRESS, got summary:\n%s", res.Summary)
+	}
+	if res.DurationMs < 2500 {
+		t.Fatalf("expected mock process to run for full 3s without premature reap (BackgroundDrainGracePeriod=100ms), got duration=%dms", res.DurationMs)
+	}
 }
 
 

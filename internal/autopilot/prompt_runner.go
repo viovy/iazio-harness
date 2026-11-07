@@ -1620,6 +1620,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		timeoutDeferrals := 0
 		bgDrainDeferrals := 0
 		var turnCompletedDuringDrain bool
+		var lastWorktreeCheckAt time.Time
 
 	turnLoop:
 		for {
@@ -1661,7 +1662,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 
 				inBgDrain, bgTasks := hasBackgroundDrainLog(tmpLogPath, outSnapshot, errSnapshot)
 				terminalPlannerTurn := isTranscriptAtTerminalPlannerResponse(curConv)
-				if inBgDrain || terminalPlannerTurn {
+				if inBgDrain || (terminalPlannerTurn && time.Since(lastWorktreeCheckAt) >= 10*time.Second) {
+					lastWorktreeCheckAt = time.Now()
 					// If ASE/story execution is already completed in the worktree/transcript and no SDLC child is running, settle immediately as completed!
 					sdlcActiveNow, _ := hasActiveSDLCChildProcess(toolPID)
 					if !sdlcActiveNow && isASEFlowCompletedInWorktree(opts.WorkingDir, curBoundStory, fullOut+"\n"+fullTranscript+"\n"+fullErr, gitBin) {
@@ -1776,7 +1778,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 							hbConv = "pending"
 						}
 						hbMsg := fmt.Sprintf(
-							"[%s] %s%ds, HarnessPID=%d, ToolPID=%d, Story=%s, Conv=%s)\n",
+							"[%s] %selapsed: %ds, HarnessPID=%d, ToolPID=%d, Story=%s, Conv=%s)\n",
 							time.Now().UTC().Format(time.RFC3339), SupervisorHeartbeatPrefix, elapsedSec, os.Getpid(), toolPID, hbStory, hbConv,
 						)
 						_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", hbMsg)
