@@ -171,7 +171,7 @@ func RemediateRepo(ctx context.Context, opts RemediateOptions) (*RemediateResult
 		res.Message = "skipped remediation: active repolock held"
 		return res, nil
 	}
-	if st.ASEState == "RUNNING" || st.ASEState == "IN_PROGRESS" || st.ExecutionProvenance == "COORDINATED_HARNESS" || st.LockDetails != "" || st.HasActiveGitLock {
+	if st.ASEState == "RUNNING" || st.ASEState == "IN_PROGRESS" || st.ExecutionProvenance == "COORDINATED_HARNESS" || st.LockDetails != "" || st.HasActiveGitLock || (st.ToolLiveness == "LIVE" && (len(st.NonMainSubmodules) > 0 || len(st.DirtySubmodules) > 0)) {
 		res.Skipped = true
 		res.SkipReason = "active_execution_or_lock"
 		res.FleetStatus = st

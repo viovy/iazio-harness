@@ -751,6 +751,7 @@ func removeModifiedFileFromStatus(res *RepoFleetStatusResult, relFile string) {
 }
 
 func resetAutopilotStateFileToIdle(stateFile string) {
+	_ = os.Remove(filepath.Join(filepath.Dir(stateFile), "ase-state.json"))
 	b, err := os.ReadFile(stateFile)
 	if err != nil {
 		return
@@ -762,6 +763,7 @@ func resetAutopilotStateFileToIdle(stateFile string) {
 	s["state"] = "IDLE"
 	s["story_id"] = ""
 	s["current_phase"] = ""
+	s["verification_status"] = ""
 	delete(s, "lock")
 	delete(s, "active_job_id")
 	s["updated_at"] = time.Now().UTC().Format(time.RFC3339)
@@ -799,7 +801,8 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 	// no locks, and no autopilot* process is an idle shell — NOT an active ad-hoc ASE execution.
 	hasAffirmativeASEEvidence := res.LockDetails != "" ||
 		isAutopilotProcess ||
-		(res.ActiveStoryID != "" && (nonMainBranch || len(res.NonMainSubmodules) > 0 || hasScopedResume || res.ToolLiveness == "LIVE"))
+		(res.ActiveStoryID != "" && (nonMainBranch || len(res.NonMainSubmodules) > 0 || hasScopedResume || res.ToolLiveness == "LIVE")) ||
+		(res.ToolLiveness == "LIVE" && (nonMainBranch || len(res.NonMainSubmodules) > 0))
 
 	if res.ToolLiveness == "LIVE" && res.ExecutionProvenance == "INDEPENDENT_USER_SESSION" && hasAffirmativeASEEvidence {
 		if res.ASEState == "IDLE" || res.ASEState == "FAILED_DIRTY" {
@@ -1159,6 +1162,7 @@ func ResetASELocks(repoPath string) error {
 	cleanPath := filepath.Clean(repoPath)
 	locks := []string{
 		filepath.Join(cleanPath, ".autopilot", "lock"),
+		filepath.Join(cleanPath, ".autopilot", "ase-state.json"),
 		filepath.Join(cleanPath, ".ase", "active.lock"),
 		filepath.Join(cleanPath, ".index.yml.lock"),
 	}
@@ -1181,6 +1185,7 @@ func ResetASELocks(repoPath string) error {
 			s["state"] = "IDLE"
 			s["story_id"] = ""
 			s["current_phase"] = ""
+			s["verification_status"] = ""
 			s["lock"] = nil
 			s["active_job_id"] = ""
 			s["updated_at"] = time.Now().UTC().Format(time.RFC3339)
