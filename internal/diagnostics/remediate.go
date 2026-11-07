@@ -2,18 +2,60 @@ package diagnostics
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/gitclean"
 	"github.com/viovy/iazio-harness/internal/procutil"
 	"github.com/viovy/iazio-harness/internal/repolock"
 )
+
+const (
+	// DefaultGitUpdateInterval is the default periodic repository update interval (30m).
+	DefaultGitUpdateInterval = 30 * time.Minute
+	// MinGitUpdateInterval is the minimum permitted periodic repository update interval (15m).
+	MinGitUpdateInterval = 15 * time.Minute
+	// MaxGitUpdateInterval is the maximum permitted periodic repository update interval (1h).
+	MaxGitUpdateInterval = 1 * time.Hour
+	// DefaultAgyRemediationCooldown is the circuit-breaker cooldown (60m) per worktree dirty state fingerprint.
+	DefaultAgyRemediationCooldown = 60 * time.Minute
+	// AgyGitUpdateRemediationPrompt is the canonical prompt passed to iazio-harness (agy) during Stage-2 escalation.
+	AgyGitUpdateRemediationPrompt = `execute shell prompt "autopilot git-update"`
+)
+
+// ClampGitUpdateInterval clamps a periodic git-update interval into [15m, 1h] (defaulting <=0 to 30m).
+func ClampGitUpdateInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return DefaultGitUpdateInterval
+	}
+	if d < MinGitUpdateInterval {
+		return MinGitUpdateInterval
+	}
+	if d > MaxGitUpdateInterval {
+		return MaxGitUpdateInterval
+	}
+	return d
+}
+
+// ParseGitUpdateInterval parses a duration string and clamps it into [15m, 1h] (defaulting empty/invalid to 30m).
+func ParseGitUpdateInterval(raw string) time.Duration {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return DefaultGitUpdateInterval
+	}
+	d, err := time.ParseDuration(trimmed)
+	if err != nil || d <= 0 {
+		return DefaultGitUpdateInterval
+	}
+	return ClampGitUpdateInterval(d)
+}
 
 // RemediateStrategy defines the self-remediation tier to execute on a repository.
 type RemediateStrategy string
@@ -70,16 +112,25 @@ func NormalizeStrategy(raw string) RemediateStrategy {
 	}
 }
 
-// IsEphemeralCachePath returns true for known background IDE/daemon cache or OS metadata files
-// that safely regenerate and should not block a repository on main.
+// IsEphemeralCachePath returns true for known background IDE/daemon cache, OS metadata, or
+// idle session/closeout/coverage files (.session_story_id, TestResults/Diagnostics/pr-closeout-proof-*.json,
+// cov_auth) that safely regenerate and should not block a repository on main.
 func IsEphemeralCachePath(relPath string) bool {
 	slash := filepath.ToSlash(strings.TrimSpace(relPath))
+	slash = strings.TrimPrefix(slash, "./")
+	if slash == "" {
+		return false
+	}
 	base := filepath.Base(slash)
-	if base == ".DS_Store" || base == "Thumbs.db" || base == ".session_story_id" {
+	if base == ".DS_Store" || base == "Thumbs.db" || base == ".session_story_id" || base == "cov_auth" || strings.HasPrefix(base, "cov_") {
+		return true
+	}
+	if strings.HasPrefix(base, "pr-closeout-proof-") && strings.HasSuffix(base, ".json") {
 		return true
 	}
 	if strings.Contains(slash, "/.gradle/") || strings.HasPrefix(slash, ".gradle/") ||
-		strings.Contains(slash, "/build/tmp/") || strings.Contains(slash, "/.dart_tool/") {
+		strings.Contains(slash, "/build/tmp/") || strings.HasPrefix(slash, "build/tmp/") ||
+		strings.Contains(slash, "/.dart_tool/") || strings.HasPrefix(slash, ".dart_tool/") {
 		return true
 	}
 	return false
@@ -498,4 +549,387 @@ func cleanSubmoduleEphemeralNoise(ctx context.Context, subFullPath string) bool 
 // JSON serializes RemediateResult as indented JSON.
 func (r *RemediateResult) JSON() ([]byte, error) {
 	return json.MarshalIndent(r, "", "  ")
+}
+
+// IsWorktreeIdleForGitUpdate returns true when repolock is idle and there is no active IN_PROGRESS ASE story
+// in .autopilot/ase-state.json (or the referenced story in .session_story_id / ase-state.json is already DONE).
+func IsWorktreeIdleForGitUpdate(repoPath string, pidAliveFn func(int) bool) bool {
+	cleanPath := filepath.Clean(strings.TrimSpace(repoPath))
+	if cleanPath == "" {
+		return false
+	}
+	if pidAliveFn == nil {
+		pidAliveFn = isPIDAlive
+	}
+	if lockInfo, err := repolock.Read(cleanPath); err == nil {
+		lockStatus := strings.ToUpper(strings.TrimSpace(lockInfo.Status))
+		if lockStatus != "COMPLETED" && lockStatus != "FAILED" && lockStatus != "IDLE" {
+			if (lockInfo.PID > 0 && pidAliveFn(lockInfo.PID)) ||
+				(lockInfo.HarnessPID > 0 && pidAliveFn(lockInfo.HarnessPID)) ||
+				(lockInfo.ToolPID > 0 && pidAliveFn(lockInfo.ToolPID)) {
+				return false
+			}
+		}
+	}
+	if _, err := os.Stat(filepath.Join(cleanPath, ".autopilot", "lock")); err == nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(cleanPath, ".ase", "active.lock")); err == nil {
+		return false
+	}
+
+	aseStateDone := false
+	aseStatePath := filepath.Join(cleanPath, ".autopilot", "ase-state.json")
+	if b, err := os.ReadFile(aseStatePath); err == nil {
+		var as struct {
+			StoryID string `json:"story_id"`
+			Status  string `json:"status"`
+			Phase   string `json:"phase"`
+		}
+		if json.Unmarshal(b, &as) == nil {
+			status := strings.ToUpper(strings.TrimSpace(as.Status))
+			phase := strings.ToLower(strings.TrimSpace(as.Phase))
+			if status == "DONE" || status == "COMPLETED" || phase == "completed" {
+				aseStateDone = true
+			} else if status == "IN_PROGRESS" || status == "RUNNING" {
+				if as.StoryID != "" && IsStoryCompletedOnDisk(cleanPath, as.StoryID) {
+					aseStateDone = true
+				} else {
+					return false
+				}
+			}
+		}
+	}
+
+	statePath := filepath.Join(cleanPath, ".autopilot", "state.json")
+	if b, err := os.ReadFile(statePath); err == nil {
+		var s struct {
+			State   string `json:"state"`
+			StoryID string `json:"story_id"`
+		}
+		if json.Unmarshal(b, &s) == nil {
+			st := strings.ToUpper(strings.TrimSpace(s.State))
+			if (st == "IN_PROGRESS" || st == "RUNNING") && !aseStateDone {
+				if s.StoryID == "" || !IsStoryCompletedOnDisk(cleanPath, s.StoryID) {
+					return false
+				}
+			}
+		}
+	}
+
+	return true
+}
+
+func cleanOrRestoreArtifactInDir(ctx context.Context, dir, relPath string) bool {
+	relSlash := filepath.ToSlash(strings.TrimSpace(relPath))
+	if relSlash == "" {
+		return false
+	}
+	fullPath := filepath.Join(dir, filepath.FromSlash(relSlash))
+	if isGitTrackedFile(dir, relSlash) {
+		out, err := procutil.CommandContext(ctx, "git", "-C", dir, "status", "--porcelain", "--", relSlash).Output()
+		if err == nil && strings.TrimSpace(string(out)) != "" {
+			if procutil.CommandContext(ctx, "git", "-C", dir, "checkout", "HEAD", "--", relSlash).Run() == nil ||
+				procutil.CommandContext(ctx, "git", "-C", dir, "checkout", "--", relSlash).Run() == nil {
+				return true
+			}
+		}
+		return false
+	}
+	if _, err := os.Stat(fullPath); err == nil {
+		if os.RemoveAll(fullPath) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// SanitizeIdleEphemeralArtifacts cleans or restores ephemeral artifacts (.session_story_id,
+// TestResults/Diagnostics/pr-closeout-proof-*.json, cov_auth) when repolock is idle and no IN_PROGRESS ASE story is active.
+func SanitizeIdleEphemeralArtifacts(ctx context.Context, repoPath string, pidAliveFn func(int) bool) ([]string, bool) {
+	if !IsWorktreeIdleForGitUpdate(repoPath, pidAliveFn) {
+		return nil, false
+	}
+	cleanPath := filepath.Clean(strings.TrimSpace(repoPath))
+	var cleaned []string
+	seen := make(map[string]bool)
+	record := func(rel string) {
+		if !seen[rel] {
+			seen[rel] = true
+			cleaned = append(cleaned, rel)
+		}
+	}
+
+	for _, rel := range []string{".session_story_id", "cov_auth"} {
+		if cleanOrRestoreArtifactInDir(ctx, cleanPath, rel) {
+			record(rel)
+		}
+	}
+	if matches, err := filepath.Glob(filepath.Join(cleanPath, "TestResults", "Diagnostics", "pr-closeout-proof-*.json")); err == nil {
+		for _, m := range matches {
+			if rel, rErr := filepath.Rel(cleanPath, m); rErr == nil {
+				relSlash := filepath.ToSlash(rel)
+				if cleanOrRestoreArtifactInDir(ctx, cleanPath, relSlash) {
+					record(relSlash)
+				}
+			}
+		}
+	}
+	if matches, err := filepath.Glob(filepath.Join(cleanPath, "cov_*")); err == nil {
+		for _, m := range matches {
+			if rel, rErr := filepath.Rel(cleanPath, m); rErr == nil {
+				relSlash := filepath.ToSlash(rel)
+				if cleanOrRestoreArtifactInDir(ctx, cleanPath, relSlash) {
+					record(relSlash)
+				}
+			}
+		}
+	}
+	if out, err := procutil.CommandContext(ctx, "git", "-C", cleanPath, "status", "--porcelain").Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if len(line) < 4 {
+				continue
+			}
+			rel := strings.TrimSpace(line[3:])
+			if IsEphemeralCachePath(rel) {
+				if cleanOrRestoreArtifactInDir(ctx, cleanPath, rel) {
+					record(filepath.ToSlash(rel))
+				}
+			}
+		}
+	}
+	return cleaned, true
+}
+
+// ComputeWorktreeDirtyFingerprint computes a deterministic fingerprint combining git_head_sha,
+// git_tree_sha, and the current dirty status porcelain for Stage-2 agy cooldown tracking.
+func ComputeWorktreeDirtyFingerprint(ctx context.Context, repoPath string) (headSHA, treeSHA, fingerprint string) {
+	if out, err := procutil.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "HEAD").Output(); err == nil {
+		headSHA = strings.TrimSpace(string(out))
+	}
+	if out, err := procutil.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "HEAD^{tree}").Output(); err == nil {
+		treeSHA = strings.TrimSpace(string(out))
+	}
+	porcelain := ""
+	if out, err := procutil.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch").Output(); err == nil {
+		porcelain = strings.TrimSpace(string(out))
+	}
+	sum := sha256.Sum256([]byte(headSHA + ":" + treeSHA + ":" + porcelain))
+	fingerprint = fmt.Sprintf("%s:%s:%x", headSHA, treeSHA, sum[:8])
+	return headSHA, treeSHA, fingerprint
+}
+
+// TwoStageGitUpdateResult captures the outcome of a 2-stage worktree git-update and remediation pass in iazio-harness.
+type TwoStageGitUpdateResult struct {
+	RepoPath              string   `json:"repo_path"`
+	Skipped               bool     `json:"skipped,omitempty"`
+	SkipReason            string   `json:"skip_reason,omitempty"`
+	SanitizedArtifacts    []string `json:"sanitized_artifacts,omitempty"`
+	Stage1Executed        bool     `json:"stage1_executed"`
+	Stage1Success         bool     `json:"stage1_success"`
+	Stage1Output          string   `json:"stage1_output,omitempty"`
+	Stage2Escalated       bool     `json:"stage2_escalated"`
+	Stage2CooldownSkipped bool     `json:"stage2_cooldown_skipped,omitempty"`
+	Stage2Success         bool     `json:"stage2_success"`
+	Stage2Output          string   `json:"stage2_output,omitempty"`
+	DirtyFingerprint      string   `json:"dirty_fingerprint,omitempty"`
+	QueueResumed          bool     `json:"queue_resumed"`
+	IsClean               bool     `json:"is_clean"`
+}
+
+type agyCooldownState struct {
+	Fingerprint string
+	HeadSHA     string
+	TreeSHA     string
+	AttemptedAt time.Time
+}
+
+// TwoStageGitUpdateRemediator coordinates Step 0 (ephemeral artifact cleanup), Step 1 (shell autopilot git-update),
+// and Step 2 (agy escalation with 60m fingerprint cooldown and queue auto-resume).
+type TwoStageGitUpdateRemediator struct {
+	mu          sync.Mutex
+	Interval    time.Duration
+	CooldownDur time.Duration
+	ShellUpdate func(ctx context.Context, repoPath string) (string, error)
+	AgyEscalate func(ctx context.Context, repoPath, prompt, diagnosticOutput string) (string, error)
+	ResumeQueue func(ctx context.Context, repoPath string) error
+	IsPIDAlive  func(int) bool
+	Now         func() time.Time
+	cooldowns   map[string]agyCooldownState
+}
+
+// NewTwoStageGitUpdateRemediator creates a 2-stage git-update remediator with clamped interval [15m, 1h] and 60m cooldown.
+func NewTwoStageGitUpdateRemediator(interval time.Duration) *TwoStageGitUpdateRemediator {
+	return &TwoStageGitUpdateRemediator{
+		Interval:    ClampGitUpdateInterval(interval),
+		CooldownDur: DefaultAgyRemediationCooldown,
+		IsPIDAlive:  isPIDAlive,
+		Now:         time.Now,
+		cooldowns:   make(map[string]agyCooldownState),
+	}
+}
+
+func isWorktreeCleanOnMain(ctx context.Context, repoPath string) bool {
+	out, err := procutil.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch").Output()
+	if err != nil {
+		return false
+	}
+	branch := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+		if strings.HasPrefix(l, "# branch.head ") {
+			branch = strings.TrimPrefix(l, "# branch.head ")
+		} else if strings.HasPrefix(l, "# branch.ab ") {
+			parts := strings.Fields(strings.TrimPrefix(l, "# branch.ab "))
+			if len(parts) >= 2 && (parts[0] != "+0" || parts[1] != "-0") {
+				return false
+			}
+		} else if !strings.HasPrefix(l, "# ") {
+			if strings.HasPrefix(l, "? ") {
+				p := strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(l[2:])), "./")
+				if p == ".iazio" || strings.HasPrefix(p, ".iazio/") || p == ".autopilot" || strings.HasPrefix(p, ".autopilot/") {
+					continue
+				}
+			}
+			return false
+		}
+	}
+	return branch == "main" || branch == "master"
+}
+
+// Execute runs the 2-stage worktree git-update and remediation flow on repoPath.
+func (r *TwoStageGitUpdateRemediator) Execute(ctx context.Context, repoPath string) TwoStageGitUpdateResult {
+	cleanPath := filepath.Clean(strings.TrimSpace(repoPath))
+	res := TwoStageGitUpdateResult{RepoPath: cleanPath}
+
+	pidAlive := r.IsPIDAlive
+	if pidAlive == nil {
+		pidAlive = isPIDAlive
+	}
+	nowFn := r.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	cooldown := r.CooldownDur
+	if cooldown <= 0 {
+		cooldown = DefaultAgyRemediationCooldown
+	}
+
+	if !IsWorktreeIdleForGitUpdate(cleanPath, pidAlive) {
+		res.Skipped = true
+		res.SkipReason = "active_execution_or_in_progress_story"
+		return res
+	}
+
+	sanitized, _ := SanitizeIdleEphemeralArtifacts(ctx, cleanPath, pidAlive)
+	res.SanitizedArtifacts = sanitized
+
+	lockHandle, lockErr := repolock.Acquire(cleanPath, repolock.LockInfo{
+		JobID:  "autopilot-git-update",
+		PID:    os.Getpid(),
+		Status: "RUNNING",
+	}, pidAlive)
+	if lockErr != nil {
+		res.Skipped = true
+		res.SkipReason = "repolock_busy"
+		return res
+	}
+	releaseLock := func() {
+		if lockHandle != nil {
+			_ = lockHandle.Release()
+			_ = repolock.ForceRelease(cleanPath)
+			lockHandle = nil
+		}
+	}
+	defer releaseLock()
+
+	res.Stage1Executed = true
+	var step1Out string
+	var step1Err error
+	if r.ShellUpdate != nil {
+		step1Out, step1Err = r.ShellUpdate(ctx, cleanPath)
+	} else {
+		autopilotBin := resolveAutopilotBinary()
+		if autopilotBin == "" {
+			autopilotBin = "autopilot"
+		}
+		cmd := procutil.CommandContext(ctx, autopilotBin, "git-update")
+		cmd.Dir = cleanPath
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		b, err := cmd.CombinedOutput()
+		step1Out, step1Err = strings.TrimSpace(string(b)), err
+	}
+	res.Stage1Output = step1Out
+
+	releaseLock()
+	_, _ = SanitizeIdleEphemeralArtifacts(ctx, cleanPath, pidAlive)
+	if step1Err == nil && isWorktreeCleanOnMain(ctx, cleanPath) {
+		res.Stage1Success = true
+		res.IsClean = true
+		r.mu.Lock()
+		if r.cooldowns != nil {
+			delete(r.cooldowns, cleanPath)
+		}
+		r.mu.Unlock()
+		if r.ResumeQueue != nil {
+			if r.ResumeQueue(ctx, cleanPath) == nil {
+				res.QueueResumed = true
+			}
+		}
+		return res
+	}
+
+	if !IsWorktreeIdleForGitUpdate(cleanPath, pidAlive) {
+		return res
+	}
+
+	headSHA, treeSHA, fp := ComputeWorktreeDirtyFingerprint(ctx, cleanPath)
+	res.DirtyFingerprint = fp
+	now := nowFn().UTC()
+
+	r.mu.Lock()
+	if r.cooldowns == nil {
+		r.cooldowns = make(map[string]agyCooldownState)
+	}
+	if prev, ok := r.cooldowns[cleanPath]; ok && prev.Fingerprint == fp && now.Sub(prev.AttemptedAt) < cooldown {
+		r.mu.Unlock()
+		res.Stage2CooldownSkipped = true
+		return res
+	}
+	r.cooldowns[cleanPath] = agyCooldownState{
+		Fingerprint: fp,
+		HeadSHA:     headSHA,
+		TreeSHA:     treeSHA,
+		AttemptedAt: now,
+	}
+	r.mu.Unlock()
+
+	diagOut := step1Out
+	if diagOut == "" && step1Err != nil {
+		diagOut = step1Err.Error()
+	}
+
+	res.Stage2Escalated = true
+	if r.AgyEscalate != nil {
+		out2, err2 := r.AgyEscalate(ctx, cleanPath, AgyGitUpdateRemediationPrompt, diagOut)
+		res.Stage2Output = out2
+		_, _ = SanitizeIdleEphemeralArtifacts(ctx, cleanPath, pidAlive)
+		if err2 == nil && isWorktreeCleanOnMain(ctx, cleanPath) {
+			res.Stage2Success = true
+			res.IsClean = true
+			r.mu.Lock()
+			delete(r.cooldowns, cleanPath)
+			r.mu.Unlock()
+			if r.ResumeQueue != nil {
+				if r.ResumeQueue(ctx, cleanPath) == nil {
+					res.QueueResumed = true
+				}
+			}
+		}
+	}
+
+	return res
 }
