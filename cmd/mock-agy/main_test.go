@@ -444,4 +444,30 @@ func TestMockAgy_ScenariosUnit(t *testing.T) {
 			t.Fatalf("expected STORY-GOV-5154 in stdout: %s", stdout.String())
 		}
 	})
+
+	t.Run("Scenario20_JobBbd74e1ad21fbc40_TerminalPlannerResponseNoBgDrainMarker", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		origWd, _ := os.Getwd()
+		_ = os.Chdir(tmpDir)
+		defer func() { _ = os.Chdir(origWd) }()
+
+		t.Setenv("HOME", tmpDir)
+		t.Setenv("MOCK_AGY_UNIT", "1")
+
+		_ = exec.Command("git", "init").Run()
+		_ = exec.Command("git", "config", "user.email", "test@test.local").Run()
+		_ = exec.Command("git", "config", "user.name", "Tester").Run()
+
+		logFile := filepath.Join(tmpDir, "job_bbd74e1ad21fbc40.log")
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"--log-file=" + logFile, "--print=/autonomous-story-execution STORY-GOV-5176"}, "job_bbd74e1ad21fbc40_terminal_planner_response_no_bg_drain_marker", &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("expected exit 0, got %d: %s", code, stderr.String())
+		}
+		stdout.Reset()
+		code2 := run([]string{"--conversation=0092d1cb-cc35-41ce-9143-a480dca5e283", "--print=/autonomous-story-execution STORY-GOV-5176"}, "job_bbd74e1ad21fbc40_terminal_planner_response_no_bg_drain_marker", &stdout, &stderr)
+		if code2 != 0 || !strings.Contains(stdout.String(), "0092d1cb-cc35-41ce-9143-a480dca5e283") {
+			t.Fatalf("expected exit 0 and conversation in stdout, got code=%d out=%s", code2, stdout.String())
+		}
+	})
 }

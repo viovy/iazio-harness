@@ -1449,6 +1449,9 @@ func TestStory0193_PostResponseIdleDrainSettlementAndTestBinaryIsolation(t *test
 	if !isLoopbackControlPlaneURL("http://127.0.0.1:8080") || !isLoopbackControlPlaneURL("http://localhost:8080") || !isLoopbackControlPlaneURL("http://[::1]:8080") {
 		t.Fatal("expected valid loopback URLs to be accepted")
 	}
+	if isLoopbackControlPlaneURL("") || isLoopbackControlPlaneURL("://bad-url") || isLoopbackControlPlaneURL("ftp://localhost:21") || isLoopbackControlPlaneURL("http://") {
+		t.Fatal("expected empty, malformed, or non-http URLs to be rejected by isLoopbackControlPlaneURL")
+	}
 	if isLoopbackControlPlaneURL("http://localhost.evil.tld:8080") || isLoopbackControlPlaneURL("http://127.0.0.1.nip.io:8080") || isLoopbackControlPlaneURL("https://tian.go.ro/iazio-harness-api") {
 		t.Fatal("expected spoofed or external URLs to be rejected by isLoopbackControlPlaneURL")
 	}
@@ -1465,6 +1468,16 @@ func TestStory0193_PostResponseIdleDrainSettlementAndTestBinaryIsolation(t *test
 			gotJob, gotAPI, gotLease, gotResume, gotEnvConv, gotFT)
 	}
 
+	// Verify explicit IAZIO_TEST_ALLOW_AMBIENT_ENV=1 + loopback IAZIO_HARNESS_API_URL preserves ambient env vars
+	t.Setenv("IAZIO_TEST_ALLOW_AMBIENT_ENV", "1")
+	t.Setenv("IAZIO_HARNESS_API_URL", "http://127.0.0.1:18080")
+	gotJob2, gotAPI2, gotLease2, gotResume2, gotEnvConv2, gotFT2 := resolveControlPlaneEnv(RunPromptOptions{})
+	if gotJob2 != "job_bbd74e1ad21fbc40" || gotAPI2 != "http://127.0.0.1:18080" || gotLease2 != "lease-prod-77" || gotResume2 != "11111111-2222-3333-4444-555555555555" || gotEnvConv2 != "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" || gotFT2 != 77 {
+		t.Fatalf("expected resolveControlPlaneEnv with IAZIO_TEST_ALLOW_AMBIENT_ENV=1 and loopback URL to preserve env vars, got job=%q api=%q lease=%q resume=%q conv=%q ft=%d",
+			gotJob2, gotAPI2, gotLease2, gotResume2, gotEnvConv2, gotFT2)
+	}
+	t.Setenv("IAZIO_TEST_ALLOW_AMBIENT_ENV", "")
+
 	// 4. Verify isTranscriptAtTerminalCompletedResponse step baseline check and RunPrompt post-turn-idle settlement
 	// with empty opts.StoryID (auto-discovered from worktree) and growing PostTick silent_ms.
 	convID := "0092d1cb-cc35-41ce-9143-a480dca5e283"
@@ -1473,15 +1486,28 @@ func TestStory0193_PostResponseIdleDrainSettlementAndTestBinaryIsolation(t *test
 		t.Fatalf("mkdir logDir: %v", err)
 	}
 	transcriptPath := filepath.Join(logDir, "transcript.jsonl")
+	padding := strings.Repeat(`{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"`+strings.Repeat("x", 1024)+`"}`+"\n", 260)
 	terminalLine := `{"step_index":477,"type":"PLANNER_RESPONSE","status":"DONE","content":"## CRAFT Closeout\nCompleted STORY-GOV-5176."}` + "\n"
-	if err := os.WriteFile(transcriptPath, []byte(terminalLine), 0o644); err != nil {
+	if err := os.WriteFile(transcriptPath, []byte(padding+terminalLine), 0o644); err != nil {
 		t.Fatalf("write transcript: %v", err)
+	}
+	if !isTranscriptAtTerminalPlannerResponse(convID) {
+		t.Fatalf("expected isTranscriptAtTerminalPlannerResponse(%s)=true", convID)
 	}
 	if !isTranscriptAtTerminalCompletedResponse(convID, 0) {
 		t.Fatalf("expected isTranscriptAtTerminalCompletedResponse(%s, 0)=true", convID)
 	}
 	if isTranscriptAtTerminalCompletedResponse(convID, 477) {
 		t.Fatalf("expected isTranscriptAtTerminalCompletedResponse(%s, 477)=false when step_index <= minStepIndex", convID)
+	}
+	if isTranscriptAtTerminalCompletedResponse("", 0) || isTranscriptAtTerminalCompletedResponse("00000000-0000-0000-0000-000000000000", 0) {
+		t.Fatalf("expected false for empty or missing conversation transcript")
+	}
+	if shouldSettlePostTurnIdle(repoDir, "", "STORY-GOV-5176", "", "git", 0, 0, time.Now().Add(-10*time.Second), 100*time.Millisecond) {
+		t.Fatalf("expected shouldSettlePostTurnIdle=false for empty curConv")
+	}
+	if shouldSettlePostTurnIdle(repoDir, convID, "STORY-GOV-5176", "", "git", 0, 477, time.Now().Add(-10*time.Second), 100*time.Millisecond) {
+		t.Fatalf("expected shouldSettlePostTurnIdle=false when minStepIndex >= lastStep")
 	}
 
 	var tickMu sync.Mutex
