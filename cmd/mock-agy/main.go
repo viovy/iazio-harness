@@ -803,6 +803,53 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "[mock-agy] Completed STORY-IAZIO-0185 in new conversation %s.\n", fallbackConv)
 		return 0
 
+	case "job_bbd74e1ad21fbc40_terminal_planner_response_no_bg_drain_marker":
+		// Scenario (job_bbd74e1ad21fbc40 / STORY-GOV-5177):
+		// Reproduces job_bbd74e1ad21fbc40 where:
+		// 1. Primary story STORY-GOV-5176 is marked status: DONE in docs/stories/ and committed cleanly, while
+		//    conversation output also mentions an older historical story ID (STORY-GOV-5175).
+		// 2. Brain transcript step #135 is a terminal PLANNER_RESPONSE (status: "DONE", tool_calls: []) containing
+		//    the final "## CRAFT Closeout" and "## Fleet Git Status Summary".
+		// 3. agy --print NEVER emits "WaitForConversationFullyIdle" (inBgDrain == false) and hangs after step #135.
+		// 4. CLIPromptRunner must detect terminal PLANNER_RESPONSE + ASE worktree completion after bgDrainGrace,
+		//    reap the hung agy process group, and return Status="completed", ExitCode=0, StoryID="STORY-GOV-5176".
+		cid := conversationID
+		if cid == "" {
+			cid = "0092d1cb-cc35-41ce-9143-a480dca5e283"
+		}
+		if logFileWriter != nil {
+			fmt.Fprintf(logFileWriter, "Created conversation %s\n", cid)
+		} else {
+			fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+		}
+		_ = os.MkdirAll(filepath.Join("docs", "stories"), 0755)
+		storyFile := filepath.Join("docs", "stories", "2026-11-06-gov-5176-remediate-all-10-findings.story.md")
+		_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-5176\ntitle: Remediate All 10 Findings (F-01 through F-10) from Canonical AI, Autopilot, and Iazio Deep Review\nstatus: DONE\n---\n"), 0644)
+		_ = procutil.Command("git", "add", "docs").Run()
+		_ = procutil.Command("git", "commit", "-m", "feat(gov-5176): remediate all 10 findings [STORY-GOV-5176]").Run()
+		_ = os.WriteFile(".session_story_id", []byte("STORY-GOV-5176\n"), 0644)
+
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+			_ = os.MkdirAll(convDir, 0755)
+			_ = os.WriteFile(filepath.Join(convDir, cid+".db"), []byte("mock-db"), 0644)
+
+			logsDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain", cid, ".system_generated", "logs")
+			_ = os.MkdirAll(logsDir, 0755)
+			transcriptPath := filepath.Join(logsDir, "transcript.jsonl")
+			step1 := `{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"Follow up after STORY-GOV-5175 and execute STORY-GOV-5176"}` + "\n"
+			step135 := `{"step_index":135,"type":"PLANNER_RESPONSE","status":"DONE","content":"All 10 findings for STORY-GOV-5176 have been remediated and verified.\n\n## CRAFT Closeout\n\n## Fleet Git Status Summary\n"}` + "\n"
+			_ = os.WriteFile(transcriptPath, []byte(step1+step135), 0644)
+		}
+
+		// Hang WITHOUT printing WaitForConversationFullyIdle
+		hangSleep := 30 * time.Second
+		if os.Getenv("MOCK_AGY_UNIT") == "1" {
+			hangSleep = 5 * time.Millisecond
+		}
+		time.Sleep(hangSleep)
+		return 0
+
 	default:
 		// Default simple execution
 		if conversationID != "" {

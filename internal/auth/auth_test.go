@@ -108,7 +108,7 @@ func TestStatus(t *testing.T) {
 	}
 }
 
-func TestStatus_AgentFallback(t *testing.T) {
+func TestStatus_NoCrossToolAgentFallback(t *testing.T) {
 	dir := t.TempDir()
 	harnessFile := filepath.Join(dir, "harness.json")
 	agentFile := filepath.Join(dir, "agent.json")
@@ -117,21 +117,27 @@ func TestStatus_AgentFallback(t *testing.T) {
 	t.Setenv("IAZIO_AGENT_CONFIG", agentFile)
 
 	st, err := Status()
-	if err != nil || !st.RefreshPresent || st.ConfigPath != agentFile || st.APIBaseURL != "https://tian.go.ro/agent-api" {
-		t.Errorf("expected fallback to agent config, got %+v, err=%v", st, err)
+	if err != nil || st.RefreshPresent || st.ConfigPath != harnessFile {
+		t.Errorf("expected strict segregation (no fallback to agent config), got %+v, err=%v", st, err)
 	}
 
 	cfg, err := LoadOptional()
-	if err != nil || cfg.RefreshToken != "agent-rt" || cfg.APIBaseURL != "https://tian.go.ro/agent-api" {
-		t.Errorf("expected LoadOptional fallback to agent config, got %+v, err=%v", cfg, err)
+	if err != nil || cfg.RefreshToken != "" || cfg.APIBaseURL != "" {
+		t.Errorf("expected LoadOptional to ignore agent config when harness config missing, got %+v, err=%v", cfg, err)
 	}
 
+	_ = os.WriteFile(harnessFile, []byte(`{"refresh_token":"harness-rt","api_base_url":"https://tian.go.ro/iazio-harness-api"}`), 0o600)
 	if err := Logout(); err != nil {
 		t.Fatalf("unexpected logout err: %v", err)
 	}
 	stPostLogout, err := Status()
 	if err != nil || stPostLogout.RefreshPresent {
-		t.Errorf("expected tokens cleared after Logout, got %+v, err=%v", stPostLogout, err)
+		t.Errorf("expected tokens cleared in harness.json after Logout, got %+v, err=%v", stPostLogout, err)
+	}
+	// Verify agent.json was not touched by harness Logout
+	agentRaw, _ := os.ReadFile(agentFile)
+	if !strings.Contains(string(agentRaw), "agent-rt") {
+		t.Errorf("expected agent.json to remain untouched by harness Logout, got %s", string(agentRaw))
 	}
 }
 

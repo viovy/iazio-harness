@@ -1390,5 +1390,187 @@ exit 0
 	}
 }
 
+func TestStory0193_PostResponseIdleDrainSettlementAndTestBinaryIsolation(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("MOCK_AGY_FAST", "1")
+	t.Setenv("IAZIO_BG_DRAIN_GRACE_SECONDS", "1")
+
+	// 1. Verify hasBackgroundDrainLog skips trailing benign idle noise (fetchAvailableModels, loadCodeAssist, token refreshed)
+	noiseLogPath := filepath.Join(t.TempDir(), "agy-drain-noise.log")
+	noiseLog := strings.Join([]string{
+		`I1106 23:17:07.123456 1527564 log.go:349] WaitForConversationFullyIdle: waiting for 1 background task(s) to finish`,
+		`E1106 23:23:07.123456 1527564 http_helpers.go:108] request failed (status 503): service unavailable`,
+		`W1106 23:23:07.123457 1527564 log.go:353] fetchAvailableModels failed: status 503`,
+		`W1106 23:29:07.123457 1527564 log.go:353] loadCodeAssist failed: status 502`,
+		`W1107 00:00:07.123457 1527564 browser.go:707] token refreshed`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(noiseLogPath, []byte(noiseLog), 0o644); err != nil {
+		t.Fatalf("write noiseLogPath: %v", err)
+	}
+	if inDrain, tasks := hasBackgroundDrainLog(noiseLogPath, "", ""); !inDrain || tasks != 1 {
+		t.Fatalf("expected hasBackgroundDrainLog=true tasks=1 despite trailing idle noise, got inDrain=%v tasks=%d", inDrain, tasks)
+	}
+
+	// 2. Verify storyFrontmatterStatus fails closed as IN_PROGRESS on conflicting duplicates (one IN_PROGRESS, one DONE),
+	// returns DONE when duplicate files are both DONE, and isASEFlowCompletedInWorktree ignores unrelated IN_PROGRESS stories in combinedOutput.
+	repoDir := t.TempDir()
+	_ = exec.Command("git", "-C", repoDir, "init").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Tester").Run()
+
+	storiesDir := filepath.Join(repoDir, "docs", "stories")
+	if err := os.MkdirAll(storiesDir, 0o755); err != nil {
+		t.Fatalf("mkdir stories: %v", err)
+	}
+	dupOldPath := filepath.Join(storiesDir, "2026-11-01-dup-old.story.md")
+	dupDonePath := filepath.Join(storiesDir, "2026-11-02-dup-done.story.md")
+	_ = os.WriteFile(dupOldPath, []byte("---\nid: STORY-DUP-001\nstatus: IN_PROGRESS\n---\n"), 0o644)
+	_ = os.WriteFile(dupDonePath, []byte("---\nid: STORY-DUP-001\nstatus: DONE\n---\n"), 0o644)
+	if found, st := storyFrontmatterStatus(repoDir, "STORY-DUP-001"); !found || st != "IN_PROGRESS" {
+		t.Fatalf("expected conflicting duplicate story files to fail closed as IN_PROGRESS, got st=%q found=%v", st, found)
+	}
+	_ = os.WriteFile(dupOldPath, []byte("---\nid: STORY-DUP-001\nstatus: DONE\n---\n"), 0o644)
+	if found, st := storyFrontmatterStatus(repoDir, "STORY-DUP-001"); !found || st != "DONE" {
+		t.Fatalf("expected storyFrontmatterStatus(STORY-DUP-001)=DONE when duplicate files agree on DONE, got st=%q found=%v", st, found)
+	}
+
+	// Unrelated historical story that happens to be IN_PROGRESS in worktree, mentioned in combinedOutput
+	_ = os.WriteFile(filepath.Join(storiesDir, "2026-11-01-other.story.md"), []byte("---\nid: STORY-OTHER-999\nstatus: IN_PROGRESS\n---\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(storiesDir, "2026-11-07-gov-5176.story.md"), []byte("---\nid: STORY-GOV-5176\nstatus: DONE\n---\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(repoDir, ".session_story_id"), []byte("STORY-GOV-5176\n"), 0o644)
+	_ = exec.Command("git", "-C", repoDir, "add", ".").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "feat(STORY-GOV-5176): complete").Run()
+	if !isASEFlowCompletedInWorktree(repoDir, "STORY-GOV-5176", "inspected STORY-OTHER-999 during audit\n## CRAFT Closeout\nAll done", "git") {
+		t.Fatalf("expected isASEFlowCompletedInWorktree=true when primaryStoryID STORY-GOV-5176 is DONE even if combinedOutput mentions STORY-OTHER-999")
+	}
+
+	// 3. Verify strict loopback URL parsing and resolveControlPlaneEnv test-binary isolation across all 5 env vars
+	if !isLoopbackControlPlaneURL("http://127.0.0.1:8080") || !isLoopbackControlPlaneURL("http://localhost:8080") || !isLoopbackControlPlaneURL("http://[::1]:8080") {
+		t.Fatal("expected valid loopback URLs to be accepted")
+	}
+	if isLoopbackControlPlaneURL("") || isLoopbackControlPlaneURL("://bad-url") || isLoopbackControlPlaneURL("ftp://localhost:21") || isLoopbackControlPlaneURL("http://") {
+		t.Fatal("expected empty, malformed, or non-http URLs to be rejected by isLoopbackControlPlaneURL")
+	}
+	if isLoopbackControlPlaneURL("http://localhost.evil.tld:8080") || isLoopbackControlPlaneURL("http://127.0.0.1.nip.io:8080") || isLoopbackControlPlaneURL("https://tian.go.ro/iazio-harness-api") {
+		t.Fatal("expected spoofed or external URLs to be rejected by isLoopbackControlPlaneURL")
+	}
+
+	t.Setenv("IAZIO_HARNESS_API_URL", "https://production.invalid.example/iazio-harness-api")
+	t.Setenv("IAZIO_JOB_ID", "job_bbd74e1ad21fbc40")
+	t.Setenv("IAZIO_FENCING_TOKEN", "77")
+	t.Setenv("IAZIO_LEASE_TOKEN", "lease-prod-77")
+	t.Setenv("IAZIO_RESUME_CONVERSATION_ID", "11111111-2222-3333-4444-555555555555")
+	t.Setenv("IAZIO_CONVERSATION_ID", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	gotJob, gotAPI, gotLease, gotResume, gotEnvConv, gotFT := resolveControlPlaneEnv(RunPromptOptions{})
+	if gotJob != "" || gotAPI != "" || gotLease != "" || gotResume != "" || gotEnvConv != "" || gotFT != 0 {
+		t.Fatalf("expected resolveControlPlaneEnv to clear all inherited non-loopback env vars in test binary, got job=%q api=%q lease=%q resume=%q conv=%q ft=%d",
+			gotJob, gotAPI, gotLease, gotResume, gotEnvConv, gotFT)
+	}
+
+	// Verify explicit IAZIO_TEST_ALLOW_AMBIENT_ENV=1 + loopback IAZIO_HARNESS_API_URL preserves ambient env vars
+	t.Setenv("IAZIO_TEST_ALLOW_AMBIENT_ENV", "1")
+	t.Setenv("IAZIO_HARNESS_API_URL", "http://127.0.0.1:18080")
+	gotJob2, gotAPI2, gotLease2, gotResume2, gotEnvConv2, gotFT2 := resolveControlPlaneEnv(RunPromptOptions{})
+	if gotJob2 != "job_bbd74e1ad21fbc40" || gotAPI2 != "http://127.0.0.1:18080" || gotLease2 != "lease-prod-77" || gotResume2 != "11111111-2222-3333-4444-555555555555" || gotEnvConv2 != "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" || gotFT2 != 77 {
+		t.Fatalf("expected resolveControlPlaneEnv with IAZIO_TEST_ALLOW_AMBIENT_ENV=1 and loopback URL to preserve env vars, got job=%q api=%q lease=%q resume=%q conv=%q ft=%d",
+			gotJob2, gotAPI2, gotLease2, gotResume2, gotEnvConv2, gotFT2)
+	}
+	t.Setenv("IAZIO_TEST_ALLOW_AMBIENT_ENV", "")
+
+	// 4. Verify isTranscriptAtTerminalCompletedResponse step baseline check and RunPrompt post-turn-idle settlement
+	// with empty opts.StoryID (auto-discovered from worktree) and growing PostTick silent_ms.
+	convID := "0092d1cb-cc35-41ce-9143-a480dca5e283"
+	logDir := filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain", convID, ".system_generated", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("mkdir logDir: %v", err)
+	}
+	transcriptPath := filepath.Join(logDir, "transcript.jsonl")
+	padding := strings.Repeat(`{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"`+strings.Repeat("x", 1024)+`"}`+"\n", 260)
+	terminalLine := `{"step_index":477,"type":"PLANNER_RESPONSE","status":"DONE","content":"## CRAFT Closeout\nCompleted STORY-GOV-5176."}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(padding+terminalLine), 0o644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	if !isTranscriptAtTerminalPlannerResponse(convID) {
+		t.Fatalf("expected isTranscriptAtTerminalPlannerResponse(%s)=true", convID)
+	}
+	if !isTranscriptAtTerminalCompletedResponse(convID, 0) {
+		t.Fatalf("expected isTranscriptAtTerminalCompletedResponse(%s, 0)=true", convID)
+	}
+	if isTranscriptAtTerminalCompletedResponse(convID, 477) {
+		t.Fatalf("expected isTranscriptAtTerminalCompletedResponse(%s, 477)=false when step_index <= minStepIndex", convID)
+	}
+	if isTranscriptAtTerminalCompletedResponse("", 0) || isTranscriptAtTerminalCompletedResponse("00000000-0000-0000-0000-000000000000", 0) {
+		t.Fatalf("expected false for empty or missing conversation transcript")
+	}
+	if shouldSettlePostTurnIdle(repoDir, "", "STORY-GOV-5176", "", "git", 0, 0, time.Now().Add(-10*time.Second), 100*time.Millisecond) {
+		t.Fatalf("expected shouldSettlePostTurnIdle=false for empty curConv")
+	}
+	if shouldSettlePostTurnIdle(repoDir, convID, "STORY-GOV-5176", "", "git", 0, 477, time.Now().Add(-10*time.Second), 100*time.Millisecond) {
+		t.Fatalf("expected shouldSettlePostTurnIdle=false when minStepIndex >= lastStep")
+	}
+
+	var tickMu sync.Mutex
+	var maxSilentMs int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/chunks") {
+			var body struct {
+				Type        string `json:"type"`
+				SilentForMs int64  `json:"silent_for_ms"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.Type == "OUTPUT_TICK" {
+				tickMu.Lock()
+				if body.SilentForMs > maxSilentMs {
+					maxSilentMs = body.SilentForMs
+				}
+				tickMu.Unlock()
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	mockAgyBin := filepath.Join(t.TempDir(), "mock-agy-post-turn-hang")
+	script := fmt.Sprintf(`#!/usr/bin/env bash
+echo "CONVERSATION_ID: %s"
+echo "ALLOCATED_STORY_ID: STORY-GOV-5176"
+echo "## CRAFT Closeout"
+echo "## Fleet Git Status Summary"
+sleep 30
+`, convID)
+	if err := os.WriteFile(mockAgyBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock-agy-post-turn-hang: %v", err)
+	}
+
+	runner := NewPromptRunner("autopilot")
+	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_ase_0193",
+		JobID:       "job_local_0193",
+		APIURL:      srv.URL,
+		Repo:        "meta-repo",
+		StoryID:     "", // Empty StoryID: exercises auto-discovery without resetting lastOutAt on every tick (F-01)
+		Prompt:      "/autonomous-story-execution",
+		TargetAgent: mockAgyBin,
+		WorkingDir:  repoDir,
+		Timeout:     10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("expected RunPrompt to settle post-turn idle completion without timing out, got err=%v", err)
+	}
+	if res.Status != "completed" || res.ExitCode != 0 {
+		t.Fatalf("expected status=completed exit=0, got status=%s exit=%d", res.Status, res.ExitCode)
+	}
+	if !strings.Contains(res.Summary, "ase_completion.detected_post_turn_idle") {
+		t.Fatalf("expected summary to contain ase_completion.detected_post_turn_idle, got:\n%s", res.Summary)
+	}
+	tickMu.Lock()
+	gotMaxSilent := maxSilentMs
+	tickMu.Unlock()
+	if gotMaxSilent <= 0 {
+		t.Fatalf("expected PostTick silent_ms to grow > 0 while tool is silent, got maxSilentMs=%d", gotMaxSilent)
+	}
+}
+
 
 
