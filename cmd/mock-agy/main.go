@@ -12,6 +12,11 @@ import (
 )
 
 func main() {
+	base := strings.TrimSuffix(strings.ToLower(filepath.Base(os.Args[0])), ".exe")
+	if strings.HasSuffix(base, "-mcp") || (len(os.Args) > 1 && os.Args[1] == "serve") {
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	}
 	os.Exit(run(os.Args[1:], strings.TrimSpace(os.Getenv("MOCK_AGY_SCENARIO")), os.Stdout, os.Stderr))
 }
 
@@ -803,16 +808,18 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "[mock-agy] Completed STORY-IAZIO-0185 in new conversation %s.\n", fallbackConv)
 		return 0
 
-	case "job_bbd74e1ad21fbc40_terminal_planner_response_no_bg_drain_marker":
+	case "job_bbd74e1ad21fbc40_terminal_planner_response_no_bg_drain_marker",
+		"job_bbd74e1ad21fbc40_terminal_planner_with_mcp_child":
 		// Scenario (job_bbd74e1ad21fbc40 / STORY-GOV-5177):
 		// Reproduces job_bbd74e1ad21fbc40 where:
 		// 1. Primary story STORY-GOV-5176 is marked status: DONE in docs/stories/ and committed cleanly, while
 		//    conversation output also mentions an older historical story ID (STORY-GOV-5175).
 		// 2. Brain transcript step #135 is a terminal PLANNER_RESPONSE (status: "DONE", tool_calls: []) containing
 		//    the final "## CRAFT Closeout" and "## Fleet Git Status Summary".
-		// 3. agy --print NEVER emits "WaitForConversationFullyIdle" (inBgDrain == false) and hangs after step #135.
+		// 3. agy --print NEVER emits "WaitForConversationFullyIdle" (inBgDrain == false) and hangs after step #135
+		//    (optionally with a long-lived "autopilot-mcp serve" child process running under agy).
 		// 4. CLIPromptRunner must detect terminal PLANNER_RESPONSE + ASE worktree completion after bgDrainGrace,
-		//    reap the hung agy process group, and return Status="completed", ExitCode=0, StoryID="STORY-GOV-5176".
+		//    ignore MCP server child processes, reap the hung agy process group, and return Status="completed", ExitCode=0, StoryID="STORY-GOV-5176".
 		cid := conversationID
 		if cid == "" {
 			cid = "0092d1cb-cc35-41ce-9143-a480dca5e283"
@@ -840,6 +847,32 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			step1 := `{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"Follow up after STORY-GOV-5175 and execute STORY-GOV-5176"}` + "\n"
 			step135 := `{"step_index":135,"type":"PLANNER_RESPONSE","status":"DONE","content":"All 10 findings for STORY-GOV-5176 have been remediated and verified.\n\n## CRAFT Closeout\n\n## Fleet Git Status Summary\n"}` + "\n"
 			_ = os.WriteFile(transcriptPath, []byte(step1+step135), 0644)
+		}
+
+		if scenario == "job_bbd74e1ad21fbc40_terminal_planner_with_mcp_child" {
+			// Spawn a genuine non-exec'd child binary named "autopilot-mcp" with arg "serve"
+			if selfExe, err := os.Executable(); err == nil && selfExe != "" {
+				if mcpDir, err := os.MkdirTemp("", "mock-mcp-bin-*"); err == nil {
+					defer os.RemoveAll(mcpDir)
+					mcpBinName := "autopilot-mcp"
+					if strings.HasSuffix(strings.ToLower(selfExe), ".exe") {
+						mcpBinName += ".exe"
+					}
+					mcpBinPath := filepath.Join(mcpDir, mcpBinName)
+					if err := os.Symlink(selfExe, mcpBinPath); err != nil {
+						if b, rErr := os.ReadFile(selfExe); rErr == nil {
+							_ = os.WriteFile(mcpBinPath, b, 0o755)
+						}
+					}
+					mcpChild := procutil.Command(mcpBinPath, "serve")
+					_ = mcpChild.Start()
+					defer func() {
+						if mcpChild != nil && mcpChild.Process != nil {
+							_ = mcpChild.Process.Kill()
+						}
+					}()
+				}
+			}
 		}
 
 		// Hang WITHOUT printing WaitForConversationFullyIdle

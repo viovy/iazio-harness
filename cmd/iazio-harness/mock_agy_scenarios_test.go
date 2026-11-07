@@ -1846,10 +1846,50 @@ func TestMockAgy_Scenario19_JobBbd74e1ad21fbc40_TerminalPlannerResponseHangAndAm
 	for _, expected := range []string{
 		"[ASE-SUPERVISOR] Attached Antigravity conversation: 0092d1cb-cc35-41ce-9143-a480dca5e283",
 		"[agy step #135] output: All 10 findings for STORY-GOV-5176 have been remediated",
-		"[ase_completion.detected_during_bg_drain]",
+		"[ase_completion.detected_at_terminal_turn]",
 	} {
 		if !strings.Contains(allChunks, expected) {
 			t.Fatalf("expected streamed chunks to contain %q, got:\n%s", expected, allChunks)
 		}
 	}
 }
+
+func TestMockAgy_Scenario19b_TerminalPlannerResponseWithMCPChildSettles(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "job_bbd74e1ad21fbc40_terminal_planner_with_mcp_child")
+	t.Setenv("MOCK_AGY_FAST", "1")
+	t.Setenv("IAZIO_BG_DRAIN_GRACE_MS", "200")
+
+	worktree := initTestGitWorktree(t)
+	_ = os.WriteFile(filepath.Join(worktree, ".gitignore"), []byte(".session_story_id\n.autopilot/\n"), 0o644)
+	_ = exec.Command("git", "-C", worktree, "add", ".gitignore").Run()
+	_ = exec.Command("git", "-C", worktree, "commit", "-m", "chore: initial").Run()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	runner := autopilot.NewPromptRunner("")
+	runner.BackgroundDrainGracePeriod = 200 * time.Millisecond
+
+	start := time.Now()
+	res, err := runner.RunPrompt(ctx, autopilot.RunPromptOptions{
+		PromptID:    "prompt_bbd74e1ad21fbc40_mcp_child",
+		JobID:       "job_bbd74e1ad21fbc40_mcp_child",
+		Repo:        "/Users/romeo/work/meta-repo",
+		WorkingDir:  worktree,
+		Prompt:      "/autonomous-story-execution STORY-GOV-5176",
+		TargetAgent: "agy",
+		Timeout:     8 * time.Second,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("expected RunPrompt with MCP child to settle cleanly via ase_completion, got error: %v", err)
+	}
+	if res == nil || res.Status != "completed" || res.ExitCode != 0 {
+		t.Fatalf("expected completed exit 0, got %+v", res)
+	}
+	if elapsed >= 15*time.Second {
+		t.Fatalf("expected turn to settle well before the 30s mock sleep despite 'autopilot-mcp serve' child, took %s", elapsed)
+	}
+}
+

@@ -1390,187 +1390,392 @@ exit 0
 	}
 }
 
-func TestStory0193_PostResponseIdleDrainSettlementAndTestBinaryIsolation(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
-	t.Setenv("MOCK_AGY_FAST", "1")
-	t.Setenv("IAZIO_BG_DRAIN_GRACE_SECONDS", "1")
+func TestJobBbd74e1ad21fbc40_TerminalTranscriptCompletionAndAmbientEnvIsolation(t *testing.T) {
+	brainDir := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainDir)
 
-	// 1. Verify hasBackgroundDrainLog skips trailing benign idle noise (fetchAvailableModels, loadCodeAssist, token refreshed)
-	noiseLogPath := filepath.Join(t.TempDir(), "agy-drain-noise.log")
-	noiseLog := strings.Join([]string{
-		`I1106 23:17:07.123456 1527564 log.go:349] WaitForConversationFullyIdle: waiting for 1 background task(s) to finish`,
-		`E1106 23:23:07.123456 1527564 http_helpers.go:108] request failed (status 503): service unavailable`,
-		`W1106 23:23:07.123457 1527564 log.go:353] fetchAvailableModels failed: status 503`,
-		`W1106 23:29:07.123457 1527564 log.go:353] loadCodeAssist failed: status 502`,
-		`W1107 00:00:07.123457 1527564 browser.go:707] token refreshed`,
-	}, "\n") + "\n"
-	if err := os.WriteFile(noiseLogPath, []byte(noiseLog), 0o644); err != nil {
-		t.Fatalf("write noiseLogPath: %v", err)
+	// 1. Verify isTranscriptAtTerminalPlannerResponse
+	convID := "0092d1cb-cc35-41ce-9143-a480dca5e283"
+	tpDir := filepath.Join(brainDir, convID, ".system_generated", "logs")
+	if err := os.MkdirAll(tpDir, 0o755); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
 	}
-	if inDrain, tasks := hasBackgroundDrainLog(noiseLogPath, "", ""); !inDrain || tasks != 1 {
-		t.Fatalf("expected hasBackgroundDrainLog=true tasks=1 despite trailing idle noise, got inDrain=%v tasks=%d", inDrain, tasks)
+	tpFile := filepath.Join(tpDir, "transcript.jsonl")
+	_ = os.WriteFile(tpFile, []byte(`{"step_index":368,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command"}]}`+"\n"), 0o600)
+	if isTranscriptAtTerminalPlannerResponse(convID) {
+		t.Fatalf("expected false when last PLANNER_RESPONSE has tool_calls")
+	}
+	_ = os.WriteFile(tpFile, []byte(
+		`{"step_index":368,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command"}]}`+"\n"+
+			`{"step_index":477,"type":"PLANNER_RESPONSE","status":"DONE","content":"## CRAFT Closeout\nAll 10 findings remediated for STORY-GOV-5176.","tool_calls":[]}`+"\n",
+	), 0o600)
+	if !isTranscriptAtTerminalPlannerResponse(convID) {
+		t.Fatalf("expected true when last step is terminal PLANNER_RESPONSE with status=DONE and empty tool_calls")
 	}
 
-	// 2. Verify storyFrontmatterStatus fails closed as IN_PROGRESS on conflicting duplicates (one IN_PROGRESS, one DONE),
-	// returns DONE when duplicate files are both DONE, and isASEFlowCompletedInWorktree ignores unrelated IN_PROGRESS stories in combinedOutput.
-	repoDir := t.TempDir()
-	_ = exec.Command("git", "-C", repoDir, "init").Run()
-	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
-	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Tester").Run()
-
+	// 2. Verify isASEFlowCompletedInWorktree ignores unrelated historical IN_PROGRESS stories when primaryStoryID is found and DONE
+	repoDir := initTestGitRepo(t)
 	storiesDir := filepath.Join(repoDir, "docs", "stories")
 	if err := os.MkdirAll(storiesDir, 0o755); err != nil {
 		t.Fatalf("mkdir stories: %v", err)
 	}
-	dupOldPath := filepath.Join(storiesDir, "2026-11-01-dup-old.story.md")
-	dupDonePath := filepath.Join(storiesDir, "2026-11-02-dup-done.story.md")
-	_ = os.WriteFile(dupOldPath, []byte("---\nid: STORY-DUP-001\nstatus: IN_PROGRESS\n---\n"), 0o644)
-	_ = os.WriteFile(dupDonePath, []byte("---\nid: STORY-DUP-001\nstatus: DONE\n---\n"), 0o644)
-	if found, st := storyFrontmatterStatus(repoDir, "STORY-DUP-001"); !found || st != "IN_PROGRESS" {
-		t.Fatalf("expected conflicting duplicate story files to fail closed as IN_PROGRESS, got st=%q found=%v", st, found)
-	}
-	_ = os.WriteFile(dupOldPath, []byte("---\nid: STORY-DUP-001\nstatus: DONE\n---\n"), 0o644)
-	if found, st := storyFrontmatterStatus(repoDir, "STORY-DUP-001"); !found || st != "DONE" {
-		t.Fatalf("expected storyFrontmatterStatus(STORY-DUP-001)=DONE when duplicate files agree on DONE, got st=%q found=%v", st, found)
-	}
-
-	// Unrelated historical story that happens to be IN_PROGRESS in worktree, mentioned in combinedOutput
-	_ = os.WriteFile(filepath.Join(storiesDir, "2026-11-01-other.story.md"), []byte("---\nid: STORY-OTHER-999\nstatus: IN_PROGRESS\n---\n"), 0o644)
-	_ = os.WriteFile(filepath.Join(storiesDir, "2026-11-07-gov-5176.story.md"), []byte("---\nid: STORY-GOV-5176\nstatus: DONE\n---\n"), 0o644)
-	_ = os.WriteFile(filepath.Join(repoDir, ".session_story_id"), []byte("STORY-GOV-5176\n"), 0o644)
-	_ = exec.Command("git", "-C", repoDir, "add", ".").Run()
-	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "feat(STORY-GOV-5176): complete").Run()
-	if !isASEFlowCompletedInWorktree(repoDir, "STORY-GOV-5176", "inspected STORY-OTHER-999 during audit\n## CRAFT Closeout\nAll done", "git") {
-		t.Fatalf("expected isASEFlowCompletedInWorktree=true when primaryStoryID STORY-GOV-5176 is DONE even if combinedOutput mentions STORY-OTHER-999")
+	primaryPath := filepath.Join(storiesDir, "2026-11-07-gov-5176-canonical-ai-autopilot-iazio-deep-review-remediation.story.md")
+	unrelatedOldPath := filepath.Join(storiesDir, "2026-10-01-gov-1001-old-in-progress.story.md")
+	_ = os.WriteFile(primaryPath, []byte("---\nid: STORY-GOV-5176\ntitle: Remediate All 10 Findings\nstatus: DONE\n---\n"), 0o600)
+	_ = os.WriteFile(unrelatedOldPath, []byte("---\nid: STORY-GOV-1001\ntitle: Historical Unrelated Story\nstatus: IN_PROGRESS\n---\n"), 0o600)
+	for _, args := range [][]string{
+		{"add", "docs"},
+		{"commit", "-m", "feat(STORY-GOV-5176): complete story"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, string(out))
+		}
 	}
 
-	// 3. Verify strict loopback URL parsing and resolveControlPlaneEnv test-binary isolation across all 5 env vars
-	if !isLoopbackControlPlaneURL("http://127.0.0.1:8080") || !isLoopbackControlPlaneURL("http://localhost:8080") || !isLoopbackControlPlaneURL("http://[::1]:8080") {
-		t.Fatal("expected valid loopback URLs to be accepted")
-	}
-	if isLoopbackControlPlaneURL("") || isLoopbackControlPlaneURL("://bad-url") || isLoopbackControlPlaneURL("ftp://localhost:21") || isLoopbackControlPlaneURL("http://") {
-		t.Fatal("expected empty, malformed, or non-http URLs to be rejected by isLoopbackControlPlaneURL")
-	}
-	if isLoopbackControlPlaneURL("http://localhost.evil.tld:8080") || isLoopbackControlPlaneURL("http://127.0.0.1.nip.io:8080") || isLoopbackControlPlaneURL("https://tian.go.ro/iazio-harness-api") {
-		t.Fatal("expected spoofed or external URLs to be rejected by isLoopbackControlPlaneURL")
+	combinedWithUnrelatedMention := "Completed STORY-GOV-5176 (see historical note STORY-GOV-1001).\n## CRAFT Closeout"
+	if !isASEFlowCompletedInWorktree(repoDir, "STORY-GOV-5176", combinedWithUnrelatedMention, "git") {
+		t.Fatalf("expected isASEFlowCompletedInWorktree=true for DONE primaryStoryID STORY-GOV-5176 even when combinedOutput mentions unrelated STORY-GOV-1001")
 	}
 
-	t.Setenv("IAZIO_HARNESS_API_URL", "https://production.invalid.example/iazio-harness-api")
+	// 3. Verify ambient IAZIO_JOB_ID / IAZIO_HARNESS_API_URL are ignored inside test binaries when opts.JobID == ""
+	var ambientCalls int
+	var mu sync.Mutex
+	ambientSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ambientCalls++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ambientSrv.Close()
+
 	t.Setenv("IAZIO_JOB_ID", "job_bbd74e1ad21fbc40")
-	t.Setenv("IAZIO_FENCING_TOKEN", "77")
-	t.Setenv("IAZIO_LEASE_TOKEN", "lease-prod-77")
-	t.Setenv("IAZIO_RESUME_CONVERSATION_ID", "11111111-2222-3333-4444-555555555555")
-	t.Setenv("IAZIO_CONVERSATION_ID", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
-	gotJob, gotAPI, gotLease, gotResume, gotEnvConv, gotFT := resolveControlPlaneEnv(RunPromptOptions{})
-	if gotJob != "" || gotAPI != "" || gotLease != "" || gotResume != "" || gotEnvConv != "" || gotFT != 0 {
-		t.Fatalf("expected resolveControlPlaneEnv to clear all inherited non-loopback env vars in test binary, got job=%q api=%q lease=%q resume=%q conv=%q ft=%d",
-			gotJob, gotAPI, gotLease, gotResume, gotEnvConv, gotFT)
+	t.Setenv("IAZIO_HARNESS_API_URL", ambientSrv.URL)
+
+	binDir := t.TempDir()
+	mockEcho := filepath.Join(binDir, "mock-echo")
+	_ = os.WriteFile(mockEcho, []byte("#!/bin/sh\necho 'done STORY-EXPLICIT-111'\nexit 0\n"), 0o755)
+
+	runner := NewPromptRunner(mockEcho)
+	if _, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:   "unit_test_isolation",
+		StoryID:    "STORY-EXPLICIT-111",
+		Prompt:     "Execute story STORY-EXPLICIT-111",
+		WorkingDir: repoDir,
+	}); err != nil {
+		t.Fatalf("RunPrompt isolated test failed: %v", err)
+	}
+	mu.Lock()
+	gotAmbientCalls := ambientCalls
+	mu.Unlock()
+	if gotAmbientCalls != 0 {
+		t.Fatalf("expected 0 control-plane calls to ambient IAZIO_HARNESS_API_URL when opts.JobID/APIURL are empty in test binary, got %d", gotAmbientCalls)
 	}
 
-	// Verify explicit IAZIO_TEST_ALLOW_AMBIENT_ENV=1 + loopback IAZIO_HARNESS_API_URL preserves ambient env vars
-	t.Setenv("IAZIO_TEST_ALLOW_AMBIENT_ENV", "1")
-	t.Setenv("IAZIO_HARNESS_API_URL", "http://127.0.0.1:18080")
-	gotJob2, gotAPI2, gotLease2, gotResume2, gotEnvConv2, gotFT2 := resolveControlPlaneEnv(RunPromptOptions{})
-	if gotJob2 != "job_bbd74e1ad21fbc40" || gotAPI2 != "http://127.0.0.1:18080" || gotLease2 != "lease-prod-77" || gotResume2 != "11111111-2222-3333-4444-555555555555" || gotEnvConv2 != "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" || gotFT2 != 77 {
-		t.Fatalf("expected resolveControlPlaneEnv with IAZIO_TEST_ALLOW_AMBIENT_ENV=1 and loopback URL to preserve env vars, got job=%q api=%q lease=%q resume=%q conv=%q ft=%d",
-			gotJob2, gotAPI2, gotLease2, gotResume2, gotEnvConv2, gotFT2)
-	}
-	t.Setenv("IAZIO_TEST_ALLOW_AMBIENT_ENV", "")
-
-	// 4. Verify isTranscriptAtTerminalCompletedResponse step baseline check and RunPrompt post-turn-idle settlement
-	// with empty opts.StoryID (auto-discovered from worktree) and growing PostTick silent_ms.
-	convID := "0092d1cb-cc35-41ce-9143-a480dca5e283"
-	logDir := filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain", convID, ".system_generated", "logs")
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		t.Fatalf("mkdir logDir: %v", err)
-	}
-	transcriptPath := filepath.Join(logDir, "transcript.jsonl")
-	padding := strings.Repeat(`{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"`+strings.Repeat("x", 1024)+`"}`+"\n", 260)
-	terminalLine := `{"step_index":477,"type":"PLANNER_RESPONSE","status":"DONE","content":"## CRAFT Closeout\nCompleted STORY-GOV-5176."}` + "\n"
-	if err := os.WriteFile(transcriptPath, []byte(padding+terminalLine), 0o644); err != nil {
-		t.Fatalf("write transcript: %v", err)
-	}
-	if !isTranscriptAtTerminalPlannerResponse(convID) {
-		t.Fatalf("expected isTranscriptAtTerminalPlannerResponse(%s)=true", convID)
-	}
-	if !isTranscriptAtTerminalCompletedResponse(convID, 0) {
-		t.Fatalf("expected isTranscriptAtTerminalCompletedResponse(%s, 0)=true", convID)
-	}
-	if isTranscriptAtTerminalCompletedResponse(convID, 477) {
-		t.Fatalf("expected isTranscriptAtTerminalCompletedResponse(%s, 477)=false when step_index <= minStepIndex", convID)
-	}
-	if isTranscriptAtTerminalCompletedResponse("", 0) || isTranscriptAtTerminalCompletedResponse("00000000-0000-0000-0000-000000000000", 0) {
-		t.Fatalf("expected false for empty or missing conversation transcript")
-	}
-	if shouldSettlePostTurnIdle(repoDir, "", "STORY-GOV-5176", "", "git", 0, 0, time.Now().Add(-10*time.Second), 100*time.Millisecond) {
-		t.Fatalf("expected shouldSettlePostTurnIdle=false for empty curConv")
-	}
-	if shouldSettlePostTurnIdle(repoDir, convID, "STORY-GOV-5176", "", "git", 0, 477, time.Now().Add(-10*time.Second), 100*time.Millisecond) {
-		t.Fatalf("expected shouldSettlePostTurnIdle=false when minStepIndex >= lastStep")
+	// 4. Verify end-to-end RunPrompt settles when transcript reaches terminal PLANNER_RESPONSE and primary story is DONE even if agy --print hangs without WaitForConversationFullyIdle log
+	mockAgyHang := filepath.Join(binDir, "mock-agy-hang")
+	hangScript := fmt.Sprintf(`#!/bin/sh
+echo "CONVERSATION_ID: %s"
+echo "ALLOCATED_STORY_ID: STORY-GOV-5176"
+sleep 5
+exit 0
+`, convID)
+	if err := os.WriteFile(mockAgyHang, []byte(hangScript), 0o755); err != nil {
+		t.Fatalf("write mock-agy-hang: %v", err)
 	}
 
-	var tickMu sync.Mutex
-	var maxSilentMs int64
+	runner2 := NewPromptRunner("autopilot")
+	runner2.GracePeriod = 50 * time.Millisecond
+	res, err := runner2.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:                   "prompt_job_bbd74e1ad21fbc40",
+		JobID:                      "job_bbd74e1ad21fbc40",
+		APIURL:                     ambientSrv.URL,
+		Token:                      "tok",
+		StoryID:                    "STORY-GOV-5176",
+		Prompt:                     "/autonomous-story-execution STORY-GOV-5176",
+		TargetAgent:                mockAgyHang,
+		WorkingDir:                 repoDir,
+		Timeout:                    2 * time.Second,
+		BackgroundDrainGracePeriod: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("expected hung agy after terminal PLANNER_RESPONSE + DONE story to settle cleanly, got err=%v", err)
+	}
+	if res.Status != "completed" || res.ExitCode != 0 {
+		t.Fatalf("expected completed ExitCode=0, got Status=%q ExitCode=%d", res.Status, res.ExitCode)
+	}
+}
+
+func TestTurnLoop_SupervisorHeartbeatDoesNotResetSilentMs(t *testing.T) {
+	origInterval := supervisorHeartbeatInterval
+	supervisorHeartbeatInterval = 150 * time.Millisecond
+	t.Cleanup(func() { supervisorHeartbeatInterval = origInterval })
+
+	var (
+		mu              sync.Mutex
+		heartbeatChunks int
+		tickSilentMs    []int64
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/chunks") {
 			var body struct {
 				Type        string `json:"type"`
+				Text        string `json:"text"`
 				SilentForMs int64  `json:"silent_for_ms"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body.Type == "OUTPUT_TICK" {
-				tickMu.Lock()
-				if body.SilentForMs > maxSilentMs {
-					maxSilentMs = body.SilentForMs
-				}
-				tickMu.Unlock()
+			mu.Lock()
+			if body.Type == "OUTPUT_CHUNK" && strings.Contains(body.Text, SupervisorHeartbeatPrefix) {
+				heartbeatChunks++
 			}
+			if body.Type == "OUTPUT_TICK" {
+				tickSilentMs = append(tickSilentMs, body.SilentForMs)
+			}
+			mu.Unlock()
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
-	mockAgyBin := filepath.Join(t.TempDir(), "mock-agy-post-turn-hang")
-	script := fmt.Sprintf(`#!/usr/bin/env bash
-echo "CONVERSATION_ID: %s"
-echo "ALLOCATED_STORY_ID: STORY-GOV-5176"
-echo "## CRAFT Closeout"
-echo "## Fleet Git Status Summary"
-sleep 30
-`, convID)
-	if err := os.WriteFile(mockAgyBin, []byte(script), 0o755); err != nil {
-		t.Fatalf("write mock-agy-post-turn-hang: %v", err)
+	binDir := t.TempDir()
+	mockSilent := filepath.Join(binDir, "mock-silent")
+	script := "#!/bin/sh\necho 'initial output'\nsleep 5\nexit 0\n"
+	if err := os.WriteFile(mockSilent, []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock-silent: %v", err)
 	}
 
 	runner := NewPromptRunner("autopilot")
-	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
-		PromptID:    "prompt_ase_0193",
-		JobID:       "job_local_0193",
+	runner.GracePeriod = 50 * time.Millisecond
+	_, _ = runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "test_silent_ms",
+		JobID:       "job_silent_ms",
 		APIURL:      srv.URL,
-		Repo:        "meta-repo",
-		StoryID:     "", // Empty StoryID: exercises auto-discovery without resetting lastOutAt on every tick (F-01)
-		Prompt:      "/autonomous-story-execution",
-		TargetAgent: mockAgyBin,
-		WorkingDir:  repoDir,
-		Timeout:     10 * time.Second,
+		Token:       "tok",
+		Prompt:      "non-ase prompt",
+		TargetAgent: mockSilent,
+		WorkingDir:  t.TempDir(),
+		Timeout:     4500 * time.Millisecond,
 	})
-	if err != nil {
-		t.Fatalf("expected RunPrompt to settle post-turn idle completion without timing out, got err=%v", err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if heartbeatChunks < 2 {
+		t.Fatalf("expected >= 2 supervisor heartbeat chunks, got %d", heartbeatChunks)
 	}
-	if res.Status != "completed" || res.ExitCode != 0 {
-		t.Fatalf("expected status=completed exit=0, got status=%s exit=%d", res.Status, res.ExitCode)
+	if len(tickSilentMs) < 2 {
+		t.Fatalf("expected >= 2 OUTPUT_TICK payloads, got %v", tickSilentMs)
 	}
-	if !strings.Contains(res.Summary, "ase_completion.detected_post_turn_idle") {
-		t.Fatalf("expected summary to contain ase_completion.detected_post_turn_idle, got:\n%s", res.Summary)
-	}
-	tickMu.Lock()
-	gotMaxSilent := maxSilentMs
-	tickMu.Unlock()
-	if gotMaxSilent <= 0 {
-		t.Fatalf("expected PostTick silent_ms to grow > 0 while tool is silent, got maxSilentMs=%d", gotMaxSilent)
+	if tickSilentMs[len(tickSilentMs)-1] <= tickSilentMs[0] || tickSilentMs[len(tickSilentMs)-1] < 2000 {
+		t.Fatalf("expected silent_ms to increase monotonically across supervisor heartbeats without resetting to 0, got %v", tickSilentMs)
 	}
 }
 
+func TestTurnLoop_TerminalPlannerResponseWithInProgressStoryDoesNotPrematurelySettle(t *testing.T) {
+	brainDir := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainDir)
 
+	convID := "1192d1cb-cc35-41ce-9143-a480dca5e283"
+	logDir := filepath.Join(brainDir, convID, ".system_generated", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	transcriptPath := filepath.Join(logDir, "transcript.jsonl")
+	content := `{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"Execute story STORY-GOV-5199"}` + "\n" +
+		`{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting for subagent...","tool_calls":[]}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	if !isTranscriptAtTerminalPlannerResponse(convID) {
+		t.Fatalf("expected isTranscriptAtTerminalPlannerResponse=true")
+	}
+
+	repoDir := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test User"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, string(out))
+		}
+	}
+	storiesDir := filepath.Join(repoDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0o755)
+	_ = os.WriteFile(filepath.Join(storiesDir, "2026-11-07-gov-5199-in-progress.story.md"), []byte("---\nid: STORY-GOV-5199\ntitle: In Progress Story\nstatus: IN_PROGRESS\n---\n"), 0o600)
+	for _, args := range [][]string{
+		{"add", "docs"},
+		{"commit", "-m", "chore: add IN_PROGRESS story"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, string(out))
+		}
+	}
+
+	if isASEFlowCompletedInWorktree(repoDir, "STORY-GOV-5199", "Waiting for subagent...", "git") {
+		t.Fatalf("expected isASEFlowCompletedInWorktree=false while STORY-GOV-5199 is IN_PROGRESS")
+	}
+
+	// Drive RunPrompt end-to-end (R-04): terminal transcript + IN_PROGRESS story must NOT trigger
+	// premature turnBgDrainReaped or ase_completion.detected_during_bg_drain while child is alive.
+	mockInProgress := filepath.Join(t.TempDir(), "mock-inprogress-agy")
+	script := "#!/bin/sh\n" +
+		"echo \"Conversation ID: " + convID + "\"\n" +
+		"echo \"bound story STORY-GOV-5199\"\n" +
+		"sleep 3\n" +
+		"exit 0\n"
+	if err := os.WriteFile(mockInProgress, []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock script: %v", err)
+	}
+	res, err := NewPromptRunner("autopilot").RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:                   "test_in_progress_no_reap",
+		StoryID:                    "STORY-GOV-5199",
+		Prompt:                     "non-ase prompt STORY-GOV-5199",
+		TargetAgent:                mockInProgress,
+		WorkingDir:                 repoDir,
+		Timeout:                    6 * time.Second,
+		BackgroundDrainGracePeriod: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error running mock-inprogress-agy: %v", err)
+	}
+	if strings.Contains(res.Summary, "ase_completion.detected_during_bg_drain") || strings.Contains(res.Summary, "background_task.auto_reaped") {
+		t.Fatalf("expected no premature drain completion or auto-reap while STORY-GOV-5199 is IN_PROGRESS, got summary:\n%s", res.Summary)
+	}
+	if res.DurationMs < 2500 {
+		t.Fatalf("expected mock process to run for full 3s without premature reap (BackgroundDrainGracePeriod=100ms), got duration=%dms", res.DurationMs)
+	}
+}
+
+func TestHasActiveSDLCChildProcess_IgnoresMCPServerDescendants(t *testing.T) {
+	origFind := findChildProcessesFunc
+	t.Cleanup(func() { findChildProcessesFunc = origFind })
+
+	// 1. MCP-server descendants of agy must be ignored by hasActiveSDLCChildProcess and hasActiveConversationActivity
+	findChildProcessesFunc = func(rootPID int) []engines.BackgroundTaskInfo {
+		return []engines.BackgroundTaskInfo{
+			{PID: 101, Command: "/Users/romeo/.local/bin/autopilot-mcp serve"},
+			{PID: 102, Command: "npm exec chrome-devtools-mcp@latest"},
+			{PID: 103, Command: "dart mcp-server"},
+		}
+	}
+	if active, cmd := hasActiveSDLCChildProcess(100); active {
+		t.Fatalf("expected MCP server descendants to be ignored, got active=true cmd=%q", cmd)
+	}
+	_, activeChildren := hasActiveConversationActivity("", 100, time.Time{}, 30*time.Second)
+	if activeChildren != 0 {
+		t.Fatalf("expected MCP server descendants to be excluded from activeChildren count, got %d", activeChildren)
+	}
+
+	// 2. Real SDLC commands ('autopilot git-flow finish', 'go test ./...', 'make validate-local') must be detected
+	for _, sdlcCmd := range []string{
+		"autopilot git-flow finish",
+		"go test ./...",
+		"make validate-local",
+	} {
+		findChildProcessesFunc = func(rootPID int) []engines.BackgroundTaskInfo {
+			return []engines.BackgroundTaskInfo{
+				{PID: 101, Command: "/Users/romeo/.local/bin/autopilot-mcp serve"},
+				{PID: 201, Command: sdlcCmd},
+			}
+		}
+		active, matched := hasActiveSDLCChildProcess(100)
+		if !active || matched != sdlcCmd {
+			t.Fatalf("expected SDLC command %q to be detected, got active=%v matched=%q", sdlcCmd, active, matched)
+		}
+	}
+}
+
+func TestIsSDLCChildCommandLine_DetectsSDLCInMCPNamedPaths(t *testing.T) {
+	origFind := findChildProcessesFunc
+	t.Cleanup(func() { findChildProcessesFunc = origFind })
+
+	// 1. Real SDLC commands in MCP-named repos/packages must be detected as SDLC and NOT classified as daemons
+	sdlcInMCPPaths := []string{
+		"go test -race ./pkg/mcp/...",
+		"/tmp/go-build123/b001/mcp.test -test.v",
+		"go build ./cmd/autopilot-mcp",
+		"make -C iazio-mcp test",
+		`git commit -m "fix(mcp): harden ticket lock"`,
+	}
+	for _, cmd := range sdlcInMCPPaths {
+		if !isSDLCChildCommandLine(cmd) {
+			t.Fatalf("expected %q to be detected as SDLC child command line", cmd)
+		}
+		if isMCPOrDaemonChildProcess(cmd) {
+			t.Fatalf("expected %q NOT to be classified as MCP/daemon child process", cmd)
+		}
+		findChildProcessesFunc = func(rootPID int) []engines.BackgroundTaskInfo {
+			return []engines.BackgroundTaskInfo{{PID: 301, Command: cmd}}
+		}
+		if active, matched := hasActiveSDLCChildProcess(100); !active || matched != cmd {
+			t.Fatalf("expected hasActiveSDLCChildProcess to detect %q, got active=%v matched=%q", cmd, active, matched)
+		}
+		_, activeChildren := hasActiveConversationActivity("", 100, time.Time{}, 30*time.Second)
+		if activeChildren != 1 {
+			t.Fatalf("expected hasActiveConversationActivity to count %q in activeChildren, got %d", cmd, activeChildren)
+		}
+	}
+
+	// 2. Genuine MCP/LSP daemons must NOT be detected as SDLC and MUST be classified as daemons
+	mcpDaemons := []string{
+		"/Users/romeo/.local/bin/autopilot-mcp serve",
+		"npm exec chrome-devtools-mcp@latest",
+		"dart mcp-server",
+		"gopls serve",
+	}
+	for _, daemonCmd := range mcpDaemons {
+		if isSDLCChildCommandLine(daemonCmd) {
+			t.Fatalf("expected MCP/LSP daemon %q NOT to be detected as SDLC child command line", daemonCmd)
+		}
+		if !isMCPOrDaemonChildProcess(daemonCmd) {
+			t.Fatalf("expected MCP/LSP daemon %q to be classified as MCP/daemon child process", daemonCmd)
+		}
+		findChildProcessesFunc = func(rootPID int) []engines.BackgroundTaskInfo {
+			return []engines.BackgroundTaskInfo{{PID: 401, Command: daemonCmd}}
+		}
+		if active, matched := hasActiveSDLCChildProcess(100); active {
+			t.Fatalf("expected hasActiveSDLCChildProcess to ignore %q, got active=true matched=%q", daemonCmd, matched)
+		}
+		_, activeChildren := hasActiveConversationActivity("", 100, time.Time{}, 30*time.Second)
+		if activeChildren != 0 {
+			t.Fatalf("expected hasActiveConversationActivity to exclude %q from activeChildren, got %d", daemonCmd, activeChildren)
+		}
+	}
+
+	// 3. Verify IAZIO_PARENT_HARNESS_PID nested-harness ambient-env gate (R2-05)
+	var parentHarnessHit int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parentHarnessHit++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	t.Setenv("IAZIO_TEST_ALLOW_AMBIENT_ENV", "1")
+	t.Setenv("IAZIO_PARENT_HARNESS_PID", "999999")
+	t.Setenv("IAZIO_JOB_ID", "job_nested_child_leak")
+	t.Setenv("IAZIO_HARNESS_API_URL", srv.URL)
+
+	fakeBin := makeFakeAutopilot(t)
+	repoDir := initTestGitRepo(t)
+	_, err := NewPromptRunner(fakeBin).RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:   "test_nested_parent_pid",
+		StoryID:    "STORY-NESTED-999",
+		Repo:       "test-submodule",
+		Prompt:     "Execute task",
+		WorkingDir: repoDir,
+		Timeout:    5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("unexpected RunPrompt error under IAZIO_PARENT_HARNESS_PID: %v", err)
+	}
+	if parentHarnessHit != 0 {
+		t.Fatalf("expected nested harness child (IAZIO_PARENT_HARNESS_PID=999999) to suppress ambient IAZIO_JOB_ID/IAZIO_HARNESS_API_URL, got %d hits", parentHarnessHit)
+	}
+}
 
