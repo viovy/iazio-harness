@@ -193,9 +193,9 @@ func run(args []string) error {
 	case "codebase":
 		return runCodebaseCommand(args[1:])
 	case "status", "fleet-status", "inspect":
-		return runFleetStatusCommand(args[1:])
+		return runFleetStatusCommandWithContext(ctx, args[1:])
 	case "repo":
-		return runRepoCommand(args[1:])
+		return runRepoCommandWithContext(ctx, args[1:])
 	case "remediate":
 		return runRepoRemediateCommand(args[1:])
 	case "heal-ase":
@@ -2682,6 +2682,10 @@ func resolveExecutionOptions(job controlplane.JobDetail, promptBody string) (mod
 }
 
 func runFleetStatusCommand(args []string) error {
+	return runFleetStatusCommandWithContext(context.Background(), args)
+}
+
+func runFleetStatusCommandWithContext(ctx context.Context, args []string) error {
 	repoPath := "."
 	var jsonOutput, autoRemediate bool
 	for i := 0; i < len(args); i++ {
@@ -2699,12 +2703,22 @@ func runFleetStatusCommand(args []string) error {
 			autoRemediate = true
 		}
 	}
-	res, err := diagnostics.InspectRepoFleetStatusWithOptions(context.Background(), repoPath, diagnostics.InspectOptions{
+	res, err := diagnostics.InspectRepoFleetStatusWithOptions(ctx, repoPath, diagnostics.InspectOptions{
 		AutoRemediateTier1: true,
 		AutoRemediateSafe:  autoRemediate,
 	})
 	if err != nil {
 		return err
+	}
+	if span := telemetry.SpanFromContext(ctx); span != nil && res != nil {
+		span.SetTag("repo.path", res.RepoPath)
+		span.SetTag("git.branch", res.Branch)
+		span.SetTag("ase.state", res.ASEState)
+		span.SetTag("current.phase", res.CurrentPhase)
+		span.SetTag("active.story_id", res.ActiveStoryID)
+		span.SetTag("tool.liveness", res.ToolLiveness)
+		span.SetTag("execution.provenance", res.ExecutionProvenance)
+		span.SetTag("remediation.applied", strconv.FormatBool(res.RemediationApplied))
 	}
 	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
@@ -2716,16 +2730,20 @@ func runFleetStatusCommand(args []string) error {
 }
 
 func runRepoCommand(args []string) error {
+	return runRepoCommandWithContext(context.Background(), args)
+}
+
+func runRepoCommandWithContext(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return runFleetStatusCommand(args)
+		return runFleetStatusCommandWithContext(ctx, args)
 	}
 	switch args[0] {
 	case "evaluate", "status", "inspect":
-		return runFleetStatusCommand(args[1:])
+		return runFleetStatusCommandWithContext(ctx, args[1:])
 	case "remediate", "heal":
 		return runRepoRemediateCommand(args[1:])
 	default:
-		return runFleetStatusCommand(args)
+		return runFleetStatusCommandWithContext(ctx, args)
 	}
 }
 

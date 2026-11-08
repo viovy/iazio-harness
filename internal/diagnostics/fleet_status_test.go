@@ -898,3 +898,98 @@ func TestInferStoryIDFromBranchAndInFlightStoryBranchPreservesAdhocASE(t *testin
 	}
 }
 
+func TestStoryGov5197_AdhocASEFalsePositiveAndMaintenanceBranchAutoRemediation(t *testing.T) {
+	for _, cmdLine := range []string{
+		"/usr/local/bin/iazio-harness daemon",
+		"/usr/local/bin/iazio-agent run",
+		"/usr/local/bin/iazio-harvester watch",
+		"node /opt/.antigravity-ide/extensions/datacloud/mcp_proxy_bundle.js",
+		"/Applications/Antigravity IDE Helper (Plugin)",
+	} {
+		if !isDiagnosticCmdLine(cmdLine) {
+			t.Errorf("expected isDiagnosticCmdLine(%q)=true", cmdLine)
+		}
+	}
+
+	if !isAutomatedMaintenanceBranch("chore/governance-pointers-20261108-055824") {
+		t.Errorf("expected chore/governance-pointers-* to be classified as automated maintenance branch")
+	}
+	if isAutomatedMaintenanceBranch("fix/gov-5197-test") {
+		t.Errorf("expected fix/gov-5197-test NOT to be classified as automated maintenance branch")
+	}
+
+	if got := parsePsElapsedDuration("04-00:37:05"); got != 4*24*time.Hour+37*time.Minute+5*time.Second {
+		t.Errorf("unexpected elapsed duration for 04-00:37:05: %v", got)
+	}
+	if got := parsePsElapsedDuration("31:30"); got != 31*time.Minute+30*time.Second {
+		t.Errorf("unexpected elapsed duration for 31:30: %v", got)
+	}
+	if got := extractConversationIDFromArgs([]string{"agy", "--conversation=conv-abc"}); got != "conv-abc" {
+		t.Errorf("expected conv-abc, got %q", got)
+	}
+	if got := extractConversationIDFromArgs([]string{"agy", "-c", "conv-xyz"}); got != "conv-xyz" {
+		t.Errorf("expected conv-xyz, got %q", got)
+	}
+
+	// 1. Automated governance-pointers branch with idle/live shell and no story must NOT report ADHOC_ASE
+	tmpMaint := t.TempDir()
+	exec.Command("git", "init", "-b", "main", tmpMaint).Run()
+	exec.Command("git", "-C", tmpMaint, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", tmpMaint, "config", "user.name", "Test User").Run()
+	_ = os.WriteFile(filepath.Join(tmpMaint, "README.md"), []byte("v1\n"), 0o644)
+	exec.Command("git", "-C", tmpMaint, "add", ".").Run()
+	exec.Command("git", "-C", tmpMaint, "commit", "-m", "init main").Run()
+	exec.Command("git", "-C", tmpMaint, "checkout", "-b", "chore/governance-pointers-20261108-055824").Run()
+
+	maintRes := &RepoFleetStatusResult{
+		RepoPath:            tmpMaint,
+		Branch:              "chore/governance-pointers-20261108-055824",
+		IsClean:             false,
+		WorktreeState:       "BRANCH_NOT_MAIN",
+		ASEState:            "IDLE",
+		AgentTool:           "agy",
+		AgentPID:            88833,
+		ToolLiveness:        "LIVE",
+		ExecutionProvenance: "INDEPENDENT_USER_SESSION",
+	}
+	reconcileAdhocASEState(tmpMaint, maintRes)
+	if maintRes.ASEState != "IDLE" || maintRes.ExecutionProvenance != "NONE" {
+		t.Errorf("expected maintenance branch without story/locks to remain IDLE/NONE, got state=%s prov=%s", maintRes.ASEState, maintRes.ExecutionProvenance)
+	}
+
+	// InspectRepoFleetStatus should auto-remediate clean chore/governance-pointers-* back to main
+	inspectedMaint, err := InspectRepoFleetStatus(context.Background(), tmpMaint)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus(tmpMaint): %v", err)
+	}
+	if inspectedMaint.Branch != "main" || !inspectedMaint.IsClean || inspectedMaint.ASEState != "IDLE" {
+		t.Errorf("expected chore/governance-pointers-* to auto-checkout main and report CLEAN/IDLE, got branch=%s clean=%v state=%s",
+			inspectedMaint.Branch, inspectedMaint.IsClean, inspectedMaint.ASEState)
+	}
+
+	// 2. Completed story branch with explicit IDLE .autopilot/state.json and no active agent tool
+	tmpDone := t.TempDir()
+	exec.Command("git", "init", "-b", "main", tmpDone).Run()
+	exec.Command("git", "-C", tmpDone, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", tmpDone, "config", "user.name", "Test User").Run()
+	_ = os.WriteFile(filepath.Join(tmpDone, ".gitignore"), []byte(".autopilot/\n.session_story_id\n"), 0o644)
+	storiesDir := filepath.Join(tmpDone, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0o755)
+	_ = os.WriteFile(filepath.Join(storiesDir, "2026-11-08-gov-5195-test.story.md"), []byte("---\nid: STORY-GOV-5195\nstatus: DONE\n---\n"), 0o644)
+	exec.Command("git", "-C", tmpDone, "add", ".").Run()
+	exec.Command("git", "-C", tmpDone, "commit", "-m", "main with DONE story").Run()
+	exec.Command("git", "-C", tmpDone, "checkout", "-b", "fix/gov-5195-fix-global-queue").Run()
+	_ = os.MkdirAll(filepath.Join(tmpDone, ".autopilot"), 0o755)
+	_ = os.WriteFile(filepath.Join(tmpDone, ".autopilot", "state.json"), []byte(`{"state":"IDLE","story_id":""}`), 0o644)
+
+	inspectedDone, err := InspectRepoFleetStatus(context.Background(), tmpDone)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus(tmpDone): %v", err)
+	}
+	if inspectedDone.ASEState != "IDLE" || inspectedDone.ActiveStoryID != "" || inspectedDone.Branch != "main" {
+		t.Errorf("expected completed story branch with IDLE state.json to clear ADHOC_ASE and checkout main, got state=%s story=%q branch=%s",
+			inspectedDone.ASEState, inspectedDone.ActiveStoryID, inspectedDone.Branch)
+	}
+}
+
+
