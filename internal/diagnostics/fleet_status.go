@@ -138,14 +138,14 @@ func InspectRepoFleetStatusWithOptions(ctx context.Context, repoPath string, opt
 		}
 	}
 
-	// 2. Git Submodules (use native C builtin submodule--helper status to avoid spawning MSYS2 sh.exe on Windows)
-	subCmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "submodule--helper", "status", "--recursive")
+	// 2. Git Submodules (use native C builtin submodule--helper status without --recursive so legacy nested gitlinks do not abort status)
+	subCmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "submodule--helper", "status")
 	subOut, err := subCmd.CombinedOutput()
 	if err != nil {
-		subCmd = procutil.CommandContext(ctx, "git", "-C", cleanPath, "submodule", "status", "--recursive")
+		subCmd = procutil.CommandContext(ctx, "git", "-C", cleanPath, "submodule", "status")
 		subOut, err = subCmd.CombinedOutput()
 	}
-	if err == nil {
+	if err == nil || len(subOut) > 0 {
 		parseSubmoduleStatus(ctx, cleanPath, string(subOut), res)
 	}
 
@@ -189,6 +189,13 @@ func InspectRepoFleetStatusWithOptions(ctx context.Context, repoPath string, opt
 
 	// 4b. Reconcile ad-hoc ASE session state and provenance (strict evidence gate)
 	reconcileAdhocASEStateWithOpts(cleanPath, opts.AutoRemediateTier1, res)
+
+	// 4b2. Auto-remediate completed story branches or automated governance-pointers branches back to main when idle
+	if (opts.AutoRemediateTier1 || opts.AutoRemediateSafe) && !isMainBranch {
+		if autoRemediateCompletedOrMaintenanceBranch(ctx, cleanPath, res) {
+			isMainBranch = res.Branch == "main" || res.Branch == "master"
+		}
+	}
 
 	// 4c. Optional Tier 2 safe remediation when idle on main/master
 	if opts.AutoRemediateSafe && (res.ASEState == "IDLE" || res.ASEState == "FAILED_DIRTY") && isMainBranch && res.LockDetails == "" && !res.HasActiveGitLock {
@@ -476,7 +483,7 @@ func parseGitPorcelainV2(out string, res *RepoFleetStatusResult) {
 	lines := strings.Split(out, "\n")
 	for _, l := range lines {
 		l = strings.TrimSpace(l)
-		if l == "" {
+		if l == "" || strings.HasPrefix(l, "fatal:") || strings.HasPrefix(l, "error:") {
 			continue
 		}
 		if strings.HasPrefix(l, "# branch.head ") {
@@ -533,7 +540,7 @@ func parseSubmoduleStatus(ctx context.Context, cleanPath string, out string, res
 	seenDrift := make(map[string]bool)
 	for _, l := range lines {
 		l = strings.TrimSpace(l)
-		if l == "" {
+		if l == "" || strings.HasPrefix(l, "fatal:") || strings.HasPrefix(l, "error:") {
 			continue
 		}
 		parts := strings.Fields(l)
@@ -551,7 +558,7 @@ func parseSubmoduleStatus(ctx context.Context, cleanPath string, out string, res
 					}
 				}
 				if currBranch, ok := readGitWorktreeBranch(fullSubPath); ok {
-					if currBranch != "main" && currBranch != "master" {
+					if currBranch != "main" && currBranch != "master" && currBranch != "detached" {
 						res.NonMainSubmodules = append(res.NonMainSubmodules, fmt.Sprintf("%s (on %s)", subPath, currBranch))
 					}
 				} else {
@@ -561,7 +568,7 @@ func parseSubmoduleStatus(ctx context.Context, cleanPath string, out string, res
 						if currBranch == "" {
 							currBranch = "detached"
 						}
-						if currBranch != "main" && currBranch != "master" {
+						if currBranch != "main" && currBranch != "master" && currBranch != "detached" {
 							res.NonMainSubmodules = append(res.NonMainSubmodules, fmt.Sprintf("%s (on %s)", subPath, currBranch))
 						}
 					}
@@ -828,9 +835,125 @@ func isDiagnosticCmdLine(cmdLine string) bool {
 		strings.Contains(lower, "autopilot-mcp") ||
 		strings.Contains(lower, "iazio-mcp") ||
 		strings.Contains(lower, "mcp serve") ||
+		strings.Contains(lower, "mcp-server") ||
+		strings.Contains(lower, "mcp_proxy_bundle") ||
+		strings.Contains(lower, "chrome-devtools-mcp") ||
 		strings.Contains(lower, "git-update") ||
+		strings.Contains(lower, "iazio-harness daemon") ||
+		strings.Contains(lower, "iazio-agent") ||
+		strings.Contains(lower, "iazio-harvester") ||
+		strings.Contains(lower, "antigravity ide helper") ||
+		strings.Contains(lower, "gradle-server") ||
+		strings.Contains(lower, "org.eclipse.equinox") ||
 		strings.Contains(lower, " --hub") ||
 		strings.HasSuffix(strings.TrimSpace(lower), "--hub")
+}
+
+func isAutomatedMaintenanceBranch(branch string) bool {
+	b := strings.ToLower(strings.TrimSpace(branch))
+	return strings.HasPrefix(b, "chore/governance-pointers-") ||
+		strings.HasPrefix(b, "chore/submodule-pointers-") ||
+		strings.HasPrefix(b, "chore/auto-sync-")
+}
+
+func hasExplicitIdleStateFile(repoPath string) bool {
+	if strings.TrimSpace(repoPath) == "" {
+		return false
+	}
+	if b, err := os.ReadFile(filepath.Join(repoPath, ".autopilot", "ase-state.json")); err == nil {
+		var as struct {
+			Status string `json:"status"`
+			Phase  string `json:"phase"`
+		}
+		if json.Unmarshal(b, &as) == nil {
+			if strings.EqualFold(strings.TrimSpace(as.Status), "DONE") ||
+				strings.EqualFold(strings.TrimSpace(as.Status), "COMPLETED") ||
+				strings.EqualFold(strings.TrimSpace(as.Phase), "completed") {
+				return true
+			}
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(repoPath, ".autopilot", "state.json")); err == nil {
+		var s struct {
+			State   string `json:"state"`
+			StoryID string `json:"story_id"`
+		}
+		if json.Unmarshal(b, &s) == nil {
+			if strings.EqualFold(strings.TrimSpace(s.State), "IDLE") && strings.TrimSpace(s.StoryID) == "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func autoRemediateCompletedOrMaintenanceBranch(ctx context.Context, cleanPath string, res *RepoFleetStatusResult) bool {
+	if res == nil || res.HasActiveGitLock || res.LockDetails != "" || res.ToolLiveness == "LIVE" || res.ASEState == "RUNNING" {
+		return false
+	}
+	if len(res.ModifiedFiles) > 0 || len(res.DirtySubmodules) > 0 {
+		return false
+	}
+	inferredStory := InferStoryIDFromBranch(res.Branch)
+	eligible := isAutomatedMaintenanceBranch(res.Branch) ||
+		(inferredStory != "" && IsStoryCompletedOnDisk(cleanPath, inferredStory) && hasExplicitIdleStateFile(cleanPath))
+	if !eligible {
+		return false
+	}
+	if lockInfo, err := repolock.Read(cleanPath); err == nil && lockInfo.PID > 0 && isPIDAlive(lockInfo.PID) {
+		return false
+	}
+	prevBranch := res.Branch
+	checkoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	checkoutErr := procutil.CommandContext(checkoutCtx, "git", "-C", cleanPath, "checkout", "main").Run()
+	cancel()
+	if checkoutErr != nil {
+		return false
+	}
+	pullCtx, cancelPull := context.WithTimeout(ctx, 15*time.Second)
+	pullCmd := procutil.CommandContext(pullCtx, "git", "-C", cleanPath, "pull", "--ff-only", "--no-recurse-submodules", "origin", "main")
+	pullCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if pullErr := pullCmd.Run(); pullErr != nil && isAutomatedMaintenanceBranch(prevBranch) {
+		fetchCmd := procutil.CommandContext(pullCtx, "git", "-C", cleanPath, "fetch", "origin", "main")
+		fetchCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		if fetchCmd.Run() == nil {
+			_ = procutil.CommandContext(pullCtx, "git", "-C", cleanPath, "reset", "--hard", "origin/main").Run()
+		}
+	}
+	cancelPull()
+
+	res.Branch = "main"
+	res.Ahead = 0
+	res.Behind = 0
+	if out, err := procutil.CommandContext(ctx, "git", "-C", cleanPath, "status", "--porcelain=v2", "--branch").CombinedOutput(); err == nil {
+		res.ModifiedFiles = nil
+		res.UntrackedFiles = nil
+		res.DirtySubmodules = nil
+		res.SubmoduleDrift = nil
+		res.IsClean = true
+		parseGitPorcelainV2(string(out), res)
+	}
+	res.DirtyFilesCount = len(res.ModifiedFiles) + len(res.DirtySubmodules)
+	res.UntrackedFilesCount = len(res.UntrackedFiles)
+	if len(res.ModifiedFiles) > 0 || len(res.DirtySubmodules) > 0 {
+		res.WorktreeState = "DIRTY_MODIFIED"
+		res.IsClean = false
+	} else if len(res.UntrackedFiles) > 0 {
+		res.WorktreeState = "DIRTY_UNTRACKED_ONLY"
+		res.IsClean = false
+	} else if len(res.NonMainSubmodules) > 0 {
+		res.WorktreeState = "SUBMODULES_NOT_MAIN"
+		res.IsClean = false
+	} else if len(res.SubmoduleDrift) > 0 {
+		res.WorktreeState = "CLEAN_SUBMODULE_DRIFT"
+		res.IsClean = true
+	} else {
+		res.WorktreeState = "CLEAN"
+		res.IsClean = true
+	}
+	res.RemediationApplied = true
+	res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("checked out main from completed/maintenance branch %s", prevBranch))
+	return true
 }
 
 func reconcileAdhocASEState(repoPath string, res *RepoFleetStatusResult) {
@@ -842,12 +965,39 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 	hasScopedResume := res.ActiveStoryID != "" && hasActiveScopedResumeFile(repoPath, res.ActiveStoryID)
 	isAutopilotProcess := strings.HasPrefix(strings.ToLower(res.AgentTool), "autopilot")
 
+	// If ActiveStoryID was inferred or read on a completed story, .autopilot/state.json is explicitly IDLE,
+	// and no active agent process, lock, or resume file exists, clear the completed story so post-ASE branches
+	// do not stay locked in ADHOC_ASE after the agent exits.
+	if res.ActiveStoryID != "" && res.ToolLiveness != "LIVE" && res.LockDetails == "" && !hasScopedResume &&
+		IsStoryCompletedOnDisk(repoPath, res.ActiveStoryID) && hasExplicitIdleStateFile(repoPath) {
+		if autoRemediateTier1 {
+			if changed, action := cleanOrRestoreSessionStoryFile(repoPath, res.ActiveStoryID); changed {
+				res.RemediationApplied = true
+				res.RemediationActions = append(res.RemediationActions, action)
+				removeModifiedFileFromStatus(res, ".session_story_id")
+			}
+		}
+		res.ActiveStoryID = ""
+		if res.CurrentPhase == "ADHOC_ASE" {
+			res.CurrentPhase = ""
+		}
+		if res.ASEState == "RUNNING" {
+			if res.WorktreeState == "DIRTY_MODIFIED" {
+				res.ASEState = "FAILED_DIRTY"
+			} else {
+				res.ASEState = "IDLE"
+			}
+		}
+		res.ExecutionProvenance = "NONE"
+	}
+
 	// Strict Ad-Hoc ASE Evidence Gate:
-	// An interactive agent shell (agy/cursor/opencode/claude) sitting on clean main with no bound story,
-	// no locks, and no autopilot* process is an idle shell — NOT an active ad-hoc ASE execution.
+	// An interactive agent shell (agy/cursor/opencode/claude) sitting on clean main or an automated
+	// maintenance branch (chore/governance-pointers-*) with no bound story, no locks, and no autopilot*
+	// process is an idle shell — NOT an active ad-hoc ASE execution.
 	hasAffirmativeASEEvidence := res.LockDetails != "" ||
 		isAutopilotProcess ||
-		(res.ToolLiveness == "LIVE" && (nonMainBranch || len(res.NonMainSubmodules) > 0)) ||
+		(res.ToolLiveness == "LIVE" && (nonMainBranch || len(res.NonMainSubmodules) > 0) && !isAutomatedMaintenanceBranch(res.Branch)) ||
 		(res.ActiveStoryID != "" && (nonMainBranch || len(res.NonMainSubmodules) > 0 || hasScopedResume || res.ToolLiveness == "LIVE"))
 
 	if res.ToolLiveness == "LIVE" && res.ExecutionProvenance == "INDEPENDENT_USER_SESSION" && hasAffirmativeASEEvidence {
@@ -1050,89 +1200,145 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 	}
 }
 
+func extractConversationIDFromArgs(cmdArgs []string) string {
+	for i := 0; i < len(cmdArgs); i++ {
+		if strings.HasPrefix(cmdArgs[i], "--conversation=") {
+			return strings.TrimPrefix(cmdArgs[i], "--conversation=")
+		}
+		if (cmdArgs[i] == "--conversation" || cmdArgs[i] == "-c") && i+1 < len(cmdArgs) {
+			return cmdArgs[i+1]
+		}
+	}
+	return ""
+}
+
+// parsePsElapsedDuration parses ps etime format ([[dd-]hh:]mm:ss) into time.Duration.
+func parsePsElapsedDuration(etime string) time.Duration {
+	raw := strings.TrimSpace(etime)
+	if raw == "" {
+		return 0
+	}
+	days := 0
+	if dashIdx := strings.Index(raw, "-"); dashIdx > 0 {
+		if d, err := strconv.Atoi(raw[:dashIdx]); err == nil {
+			days = d
+		}
+		raw = raw[dashIdx+1:]
+	}
+	parts := strings.Split(raw, ":")
+	var hours, mins, secs int
+	switch len(parts) {
+	case 3:
+		hours, _ = strconv.Atoi(parts[0])
+		mins, _ = strconv.Atoi(parts[1])
+		secs, _ = strconv.Atoi(parts[2])
+	case 2:
+		mins, _ = strconv.Atoi(parts[0])
+		secs, _ = strconv.Atoi(parts[1])
+	default:
+		return 0
+	}
+	return time.Duration(days)*24*time.Hour +
+		time.Duration(hours)*time.Hour +
+		time.Duration(mins)*time.Minute +
+		time.Duration(secs)*time.Second
+}
+
+// parseDarwinLsofBrainTranscripts extracts the most recently modified brain conversation ID and transcript timestamp
+// from lsof -F n output.
+func parseDarwinLsofBrainTranscripts(lsofOut string) (convID string, newestTranscript time.Time) {
+	seenBrains := make(map[string]bool)
+	for _, line := range strings.Split(lsofOut, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "n") {
+			continue
+		}
+		p := strings.TrimPrefix(line, "n")
+		idx := strings.Index(p, "/brain/")
+		if idx < 0 {
+			continue
+		}
+		rest := p[idx+len("/brain/"):]
+		slashIdx := strings.IndexByte(rest, '/')
+		candID := rest
+		if slashIdx >= 0 {
+			candID = rest[:slashIdx]
+		}
+		if len(candID) < 8 || strings.HasPrefix(candID, ".") || seenBrains[candID] {
+			continue
+		}
+		seenBrains[candID] = true
+		brainDir := p[:idx+len("/brain/")+len(candID)]
+		for _, rel := range []string{
+			filepath.Join(".system_generated", "logs", "transcript.jsonl"),
+			filepath.Join(".system_generated", "logs", "transcript_full.jsonl"),
+		} {
+			if fi, stErr := os.Stat(filepath.Join(brainDir, rel)); stErr == nil {
+				if fi.ModTime().After(newestTranscript) {
+					newestTranscript = fi.ModTime()
+					if convID == "" {
+						convID = candID
+					}
+				}
+			}
+		}
+	}
+	return convID, newestTranscript
+}
+
+// inspectDarwinAgentProcess determines provenance, active conversation ID, and whether an interactive
+// CLI process has been sitting idle at a prompt (>15m elapsed with no recent brain transcript activity).
+func inspectDarwinAgentProcess(pid int, etime string, cmdLine string, hasRepoLock bool) (provenance string, convID string, isIdle bool) {
+	provenance = "INDEPENDENT_USER_SESSION"
+	convID = extractConversationIDFromArgs(strings.Fields(cmdLine))
+
+	envCtx, cancelEnv := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	envOut, envErr := procutil.CommandContext(envCtx, "ps", "eww", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+	cancelEnv()
+	if envErr == nil {
+		envStr := string(envOut)
+		if strings.Contains(envStr, "IAZIO_MANAGED_BY=harness") ||
+			strings.Contains(envStr, "IAZIO_HARNESS_JOB_ID") ||
+			strings.Contains(envStr, "IAZIO_AGENT_MANAGED=1") {
+			provenance = "COORDINATED_HARNESS"
+		}
+	}
+	if provenance == "COORDINATED_HARNESS" {
+		return provenance, convID, false
+	}
+
+	elapsed := parsePsElapsedDuration(etime)
+	lsofCtx, cancelLsof := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	lsofOut, lsofErr := procutil.CommandContext(lsofCtx, "lsof", "-p", strconv.Itoa(pid), "-F", "n").Output()
+	cancelLsof()
+	var newestTranscript time.Time
+	if lsofErr == nil && len(lsofOut) > 0 {
+		lsofConv, ts := parseDarwinLsofBrainTranscripts(string(lsofOut))
+		newestTranscript = ts
+		if convID == "" && lsofConv != "" {
+			convID = lsofConv
+		}
+	}
+
+	if !hasRepoLock && elapsed > 15*time.Minute {
+		if newestTranscript.IsZero() || time.Since(newestTranscript) > 15*time.Minute {
+			return provenance, convID, true
+		}
+	}
+	return provenance, convID, false
+}
+
 func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult) {
 	if runtime.GOOS != "windows" {
 		selfPID := os.Getpid()
 		parentPID := os.Getppid()
-		cmd := procutil.Command("ps", "-ef")
+		cmd := procutil.Command("ps", "-axo", "pid=,ppid=,etime=,args=")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return
 		}
-		lines := strings.Split(string(out), "\n")
-		type candidateProc struct {
-			pid  int
-			tool string
-			line string
-		}
-		var cwdCandidates []candidateProc
-
-		for _, l := range lines {
-			if isDiagnosticCmdLine(l) {
-				continue
-			}
-			fields := strings.Fields(l)
-			pid := 0
-			if len(fields) > 1 {
-				if p, err := strconv.Atoi(fields[1]); err == nil {
-					pid = p
-				}
-			}
-			if pid <= 1 || pid == selfPID || pid == parentPID {
-				continue
-			}
-			matchedTool := ""
-			for _, tool := range knownAgentBinaries {
-				if strings.Contains(l, tool) {
-					matchedTool = tool
-					break
-				}
-			}
-			if matchedTool == "" {
-				continue
-			}
-
-			// 1. Direct command-line path match with strict boundary verification
-			if LineContainsExactRepoPath(l, repoPath) {
-				res.AgentPID = pid
-				res.AgentTool = matchedTool
-				res.ToolLiveness = "LIVE"
-				res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
-				return
-			}
-			cwdCandidates = append(cwdCandidates, candidateProc{pid: pid, tool: matchedTool, line: l})
-		}
-
-		// 2. Check working directory of candidate agent processes via lsof -a -d cwd -p <pids> -F pn
-		if len(cwdCandidates) > 0 {
-			pidStrs := make([]string, 0, len(cwdCandidates))
-			pidToTool := make(map[int]string, len(cwdCandidates))
-			for _, c := range cwdCandidates {
-				pidStrs = append(pidStrs, strconv.Itoa(c.pid))
-				pidToTool[c.pid] = c.tool
-			}
-			lsofCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			lsofCmd := procutil.CommandContext(lsofCtx, "lsof", "-a", "-d", "cwd", "-p", strings.Join(pidStrs, ","), "-F", "pn")
-			lsofOut, lsofErr := lsofCmd.Output()
-			cancel()
-			if lsofErr == nil && len(lsofOut) > 0 {
-				currPID := 0
-				for _, line := range strings.Split(string(lsofOut), "\n") {
-					line = strings.TrimSpace(line)
-					if strings.HasPrefix(line, "p") {
-						currPID, _ = strconv.Atoi(strings.TrimPrefix(line, "p"))
-					} else if strings.HasPrefix(line, "n") && currPID > 0 {
-						cwd := strings.TrimPrefix(line, "n")
-						if HasExactRepoPathBoundary(cwd, repoPath) {
-							res.AgentPID = currPID
-							res.AgentTool = pidToTool[currPID]
-							res.ToolLiveness = "LIVE"
-							res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
-							return
-						}
-					}
-				}
-			}
+		if parsePsOutputForAgentProcesses(string(out), selfPID, parentPID, repoPath, res) {
+			return
 		}
 	}
 	if res.LockDetails != "" {
@@ -1142,6 +1348,102 @@ func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult)
 	} else if res.ASEState == "FAILED_DIRTY" || (!res.IsClean && res.ASEState != "RUNNING") {
 		res.ToolLiveness = "TERMINATED"
 	}
+}
+
+func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPath string, res *RepoFleetStatusResult) bool {
+	lines := strings.Split(psOut, "\n")
+	type candidateProc struct {
+		pid   int
+		tool  string
+		etime string
+		line  string
+	}
+	var cwdCandidates []candidateProc
+
+	for _, l := range lines {
+		if isDiagnosticCmdLine(l) {
+			continue
+		}
+		fields := strings.Fields(l)
+		if len(fields) < 4 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 1 || pid == selfPID || pid == parentPID {
+			continue
+		}
+		etime := fields[2]
+		argv0 := fields[3]
+		matchedTool, ok := isAgentTool(argv0)
+		if !ok {
+			base0 := strings.ToLower(filepath.Base(argv0))
+			if (base0 == "env" || base0 == "sh" || base0 == "bash" || base0 == "zsh") && len(fields) > 4 {
+				matchedTool, ok = isAgentTool(fields[4])
+			}
+		}
+		if !ok || matchedTool == "" {
+			continue
+		}
+		cmdLine := strings.Join(fields[3:], " ")
+
+		// 1. Direct command-line path match with strict boundary verification
+		if LineContainsExactRepoPath(cmdLine, repoPath) {
+			prov, convID, isIdle := inspectDarwinAgentProcess(pid, etime, cmdLine, res.LockDetails != "")
+			if isIdle {
+				continue
+			}
+			res.AgentPID = pid
+			res.AgentTool = matchedTool
+			res.ToolLiveness = "LIVE"
+			res.ExecutionProvenance = prov
+			if convID != "" && res.ActiveConversationID == "" {
+				res.ActiveConversationID = convID
+			}
+			return true
+		}
+		cwdCandidates = append(cwdCandidates, candidateProc{pid: pid, tool: matchedTool, etime: etime, line: cmdLine})
+	}
+
+	// 2. Check working directory of candidate agent processes via lsof -a -d cwd -p <pids> -F pn
+	if len(cwdCandidates) > 0 {
+		pidStrs := make([]string, 0, len(cwdCandidates))
+		pidToCand := make(map[int]candidateProc, len(cwdCandidates))
+		for _, c := range cwdCandidates {
+			pidStrs = append(pidStrs, strconv.Itoa(c.pid))
+			pidToCand[c.pid] = c
+		}
+		lsofCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		lsofCmd := procutil.CommandContext(lsofCtx, "lsof", "-a", "-d", "cwd", "-p", strings.Join(pidStrs, ","), "-F", "pn")
+		lsofOut, lsofErr := lsofCmd.Output()
+		cancel()
+		if lsofErr == nil && len(lsofOut) > 0 {
+			currPID := 0
+			for _, line := range strings.Split(string(lsofOut), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "p") {
+					currPID, _ = strconv.Atoi(strings.TrimPrefix(line, "p"))
+				} else if strings.HasPrefix(line, "n") && currPID > 0 {
+					cwd := strings.TrimPrefix(line, "n")
+					if HasExactRepoPathBoundary(cwd, repoPath) {
+						cand := pidToCand[currPID]
+						prov, convID, isIdle := inspectDarwinAgentProcess(currPID, cand.etime, cand.line, res.LockDetails != "")
+						if isIdle {
+							continue
+						}
+						res.AgentPID = currPID
+						res.AgentTool = cand.tool
+						res.ToolLiveness = "LIVE"
+						res.ExecutionProvenance = prov
+						if convID != "" && res.ActiveConversationID == "" {
+							res.ActiveConversationID = convID
+						}
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 // ReapOrphanedProcesses terminates any orphaned child/helper processes whose cwd is inside repoPath.
