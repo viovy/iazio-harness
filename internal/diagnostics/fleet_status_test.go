@@ -2,6 +2,7 @@ package diagnostics
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -924,11 +925,87 @@ func TestStoryGov5197_AdhocASEFalsePositiveAndMaintenanceBranchAutoRemediation(t
 	if got := parsePsElapsedDuration("31:30"); got != 31*time.Minute+30*time.Second {
 		t.Errorf("unexpected elapsed duration for 31:30: %v", got)
 	}
+	if got := parsePsElapsedDuration(""); got != 0 {
+		t.Errorf("unexpected elapsed duration for empty string: %v", got)
+	}
+	if got := parsePsElapsedDuration("invalid"); got != 0 {
+		t.Errorf("unexpected elapsed duration for invalid string: %v", got)
+	}
 	if got := extractConversationIDFromArgs([]string{"agy", "--conversation=conv-abc"}); got != "conv-abc" {
 		t.Errorf("expected conv-abc, got %q", got)
 	}
 	if got := extractConversationIDFromArgs([]string{"agy", "-c", "conv-xyz"}); got != "conv-xyz" {
 		t.Errorf("expected conv-xyz, got %q", got)
+	}
+	if got := extractConversationIDFromArgs([]string{"agy", "--print"}); got != "" {
+		t.Errorf("expected empty convID, got %q", got)
+	}
+
+	// Test parseDarwinLsofBrainTranscripts and inspectDarwinAgentProcess
+	tmpBrainBase := t.TempDir()
+	brainConvID := "12345678-aaaa-bbbb-cccc-1234567890ab"
+	transcriptDir := filepath.Join(tmpBrainBase, "brain", brainConvID, ".system_generated", "logs")
+	_ = os.MkdirAll(transcriptDir, 0o755)
+	transcriptFile := filepath.Join(transcriptDir, "transcript.jsonl")
+	_ = os.WriteFile(transcriptFile, []byte(`{"step_index":1}`+"\n"), 0o644)
+	lsofSample := fmt.Sprintf("p9999\nn/tmp/other\nn%s\nn%s/extra\n", filepath.Join(tmpBrainBase, "brain", brainConvID), filepath.Join(tmpBrainBase, "brain", ".hidden"))
+	parsedConv, parsedTS := parseDarwinLsofBrainTranscripts(lsofSample)
+	if parsedConv != brainConvID || parsedTS.IsZero() {
+		t.Errorf("expected parsedConv=%s and non-zero timestamp, got conv=%q ts=%v", brainConvID, parsedConv, parsedTS)
+	}
+
+	prov, convID, isIdle := inspectDarwinAgentProcess(os.Getpid(), "00:10", "agy --conversation=conv-short", false)
+	if prov != "INDEPENDENT_USER_SESSION" || convID != "conv-short" || isIdle {
+		t.Errorf("unexpected inspectDarwinAgentProcess result for short elapsed: prov=%s conv=%s idle=%v", prov, convID, isIdle)
+	}
+	_, _, isIdleLong := inspectDarwinAgentProcess(999999, "02-00:00:00", "agy chat", false)
+	if !isIdleLong {
+		t.Errorf("expected non-existent PID with 2d elapsed and no lock to be classified as idle")
+	}
+
+	// Test parsePsOutputForAgentProcesses and discoverAgentProcessesFallback
+	psRepoDir := t.TempDir()
+	psSample := strings.Join([]string{
+		"64435 1 01:00 node /opt/.antigravity-ide/extensions/mcp_proxy_bundle.js " + psRepoDir,
+		fmt.Sprintf("%d 1 00:05 env agy --cwd %s --conversation=conv-ps-match", os.Getpid()+100000, psRepoDir),
+	}, "\n")
+	psRes := &RepoFleetStatusResult{RepoPath: psRepoDir}
+	if !parsePsOutputForAgentProcesses(psSample, os.Getpid(), os.Getppid(), psRepoDir, psRes) {
+		t.Errorf("expected parsePsOutputForAgentProcesses to match env agy process")
+	}
+	if psRes.AgentTool != "agy" || psRes.ActiveConversationID != "conv-ps-match" {
+		t.Errorf("unexpected psRes: tool=%q conv=%q", psRes.AgentTool, psRes.ActiveConversationID)
+	}
+	fallbackRes := &RepoFleetStatusResult{RepoPath: psRepoDir, LockDetails: "locked"}
+	discoverAgentProcessesFallback(psRepoDir, fallbackRes)
+	if fallbackRes.ASEState != "ORPHANED" || fallbackRes.ToolLiveness != "KILLED" {
+		t.Errorf("expected discoverAgentProcessesFallback with lock and no process to set ORPHANED/KILLED, got state=%s live=%s", fallbackRes.ASEState, fallbackRes.ToolLiveness)
+	}
+
+	// Test parseSubmoduleStatus (detached HEAD must NOT be added to NonMainSubmodules, feature branch must be)
+	subRoot := t.TempDir()
+	subDetached := filepath.Join(subRoot, "sub-detached")
+	subFeature := filepath.Join(subRoot, "sub-feature")
+	_ = os.MkdirAll(filepath.Join(subDetached, ".git"), 0o755)
+	_ = os.WriteFile(filepath.Join(subDetached, ".git", "HEAD"), []byte("88bb4eb187dce4679bff2a71d0bbfd08fbeeb2f6\n"), 0o644)
+	_ = os.MkdirAll(filepath.Join(subFeature, ".git"), 0o755)
+	_ = os.WriteFile(filepath.Join(subFeature, ".git", "HEAD"), []byte("ref: refs/heads/fix/gov-5197-sub\n"), 0o644)
+	subRes := &RepoFleetStatusResult{Branch: "main"}
+	subOut := "+88bb4eb187dce4679bff2a71d0bbfd08fbeeb2f6 sub-detached (heads/main)\n 88bb4eb187dce4679bff2a71d0bbfd08fbeeb2f6 sub-feature (heads/fix/gov-5197-sub)\n-88bb4eb187dce4679bff2a71d0bbfd08fbeeb2f6 sub-uninit\n"
+	parseSubmoduleStatus(context.Background(), subRoot, subOut, subRes)
+	if len(subRes.NonMainSubmodules) != 1 || !strings.Contains(subRes.NonMainSubmodules[0], "sub-feature") {
+		t.Errorf("expected only sub-feature in NonMainSubmodules (not detached HEAD), got %v", subRes.NonMainSubmodules)
+	}
+	if len(subRes.SubmoduleDrift) != 1 || subRes.SubmoduleDrift[0] != "sub-detached" {
+		t.Errorf("expected sub-detached in SubmoduleDrift, got %v", subRes.SubmoduleDrift)
+	}
+
+	// Test hasExplicitIdleStateFile with .autopilot/ase-state.json
+	aseDoneDir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(aseDoneDir, ".autopilot"), 0o755)
+	_ = os.WriteFile(filepath.Join(aseDoneDir, ".autopilot", "ase-state.json"), []byte(`{"status":"DONE","phase":"completed"}`), 0o644)
+	if !hasExplicitIdleStateFile(aseDoneDir) {
+		t.Errorf("expected hasExplicitIdleStateFile=true when ase-state.json has status=DONE")
 	}
 
 	// 1. Automated governance-pointers branch with idle/live shell and no story must NOT report ADHOC_ASE

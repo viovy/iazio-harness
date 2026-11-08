@@ -2829,4 +2829,10 @@ func TestRunRepo_EvaluateAndRemediate(t *testing.T) {
 	if err := run([]string{"remediate", "--worktree-path", tmpDir, "--force", "--json"}); err != nil {
 		t.Fatalf("run remediate force-clean failed: %v", err)
 	}
+	if err := runFleetStatusCommand([]string{"--repo=" + tmpDir, "--json"}); err != nil {
+		t.Fatalf("runFleetStatusCommand failed: %v", err)
+	}
+	if err := runRepoCommand([]string{"evaluate", "--repo=" + tmpDir}); err != nil {
+		t.Fatalf("runRepoCommand failed: %v", err)
+	}
 }

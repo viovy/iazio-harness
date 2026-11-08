@@ -1244,6 +1244,48 @@ func parsePsElapsedDuration(etime string) time.Duration {
 		time.Duration(secs)*time.Second
 }
 
+// parseDarwinLsofBrainTranscripts extracts the most recently modified brain conversation ID and transcript timestamp
+// from lsof -F n output.
+func parseDarwinLsofBrainTranscripts(lsofOut string) (convID string, newestTranscript time.Time) {
+	seenBrains := make(map[string]bool)
+	for _, line := range strings.Split(lsofOut, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "n") {
+			continue
+		}
+		p := strings.TrimPrefix(line, "n")
+		idx := strings.Index(p, "/brain/")
+		if idx < 0 {
+			continue
+		}
+		rest := p[idx+len("/brain/"):]
+		slashIdx := strings.IndexByte(rest, '/')
+		candID := rest
+		if slashIdx >= 0 {
+			candID = rest[:slashIdx]
+		}
+		if len(candID) < 8 || strings.HasPrefix(candID, ".") || seenBrains[candID] {
+			continue
+		}
+		seenBrains[candID] = true
+		brainDir := p[:idx+len("/brain/")+len(candID)]
+		for _, rel := range []string{
+			filepath.Join(".system_generated", "logs", "transcript.jsonl"),
+			filepath.Join(".system_generated", "logs", "transcript_full.jsonl"),
+		} {
+			if fi, stErr := os.Stat(filepath.Join(brainDir, rel)); stErr == nil {
+				if fi.ModTime().After(newestTranscript) {
+					newestTranscript = fi.ModTime()
+					if convID == "" {
+						convID = candID
+					}
+				}
+			}
+		}
+	}
+	return convID, newestTranscript
+}
+
 // inspectDarwinAgentProcess determines provenance, active conversation ID, and whether an interactive
 // CLI process has been sitting idle at a prompt (>15m elapsed with no recent brain transcript activity).
 func inspectDarwinAgentProcess(pid int, etime string, cmdLine string, hasRepoLock bool) (provenance string, convID string, isIdle bool) {
@@ -1270,42 +1312,11 @@ func inspectDarwinAgentProcess(pid int, etime string, cmdLine string, hasRepoLoc
 	lsofOut, lsofErr := procutil.CommandContext(lsofCtx, "lsof", "-p", strconv.Itoa(pid), "-F", "n").Output()
 	cancelLsof()
 	var newestTranscript time.Time
-	seenBrains := make(map[string]bool)
 	if lsofErr == nil && len(lsofOut) > 0 {
-		for _, line := range strings.Split(string(lsofOut), "\n") {
-			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "n") {
-				continue
-			}
-			p := strings.TrimPrefix(line, "n")
-			idx := strings.Index(p, "/brain/")
-			if idx < 0 {
-				continue
-			}
-			rest := p[idx+len("/brain/"):]
-			slashIdx := strings.IndexByte(rest, '/')
-			candID := rest
-			if slashIdx >= 0 {
-				candID = rest[:slashIdx]
-			}
-			if len(candID) < 8 || strings.HasPrefix(candID, ".") || seenBrains[candID] {
-				continue
-			}
-			seenBrains[candID] = true
-			brainDir := p[:idx+len("/brain/")+len(candID)]
-			for _, rel := range []string{
-				filepath.Join(".system_generated", "logs", "transcript.jsonl"),
-				filepath.Join(".system_generated", "logs", "transcript_full.jsonl"),
-			} {
-				if fi, stErr := os.Stat(filepath.Join(brainDir, rel)); stErr == nil {
-					if fi.ModTime().After(newestTranscript) {
-						newestTranscript = fi.ModTime()
-						if convID == "" {
-							convID = candID
-						}
-					}
-				}
-			}
+		lsofConv, ts := parseDarwinLsofBrainTranscripts(string(lsofOut))
+		newestTranscript = ts
+		if convID == "" && lsofConv != "" {
+			convID = lsofConv
 		}
 	}
 
@@ -1326,97 +1337,8 @@ func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult)
 		if err != nil {
 			return
 		}
-		lines := strings.Split(string(out), "\n")
-		type candidateProc struct {
-			pid   int
-			tool  string
-			etime string
-			line  string
-		}
-		var cwdCandidates []candidateProc
-
-		for _, l := range lines {
-			if isDiagnosticCmdLine(l) {
-				continue
-			}
-			fields := strings.Fields(l)
-			if len(fields) < 4 {
-				continue
-			}
-			pid, err := strconv.Atoi(fields[0])
-			if err != nil || pid <= 1 || pid == selfPID || pid == parentPID {
-				continue
-			}
-			etime := fields[2]
-			argv0 := fields[3]
-			matchedTool, ok := isAgentTool(argv0)
-			if !ok {
-				base0 := strings.ToLower(filepath.Base(argv0))
-				if (base0 == "env" || base0 == "sh" || base0 == "bash" || base0 == "zsh") && len(fields) > 4 {
-					matchedTool, ok = isAgentTool(fields[4])
-				}
-			}
-			if !ok || matchedTool == "" {
-				continue
-			}
-			cmdLine := strings.Join(fields[3:], " ")
-
-			// 1. Direct command-line path match with strict boundary verification
-			if LineContainsExactRepoPath(cmdLine, repoPath) {
-				prov, convID, isIdle := inspectDarwinAgentProcess(pid, etime, cmdLine, res.LockDetails != "")
-				if isIdle {
-					continue
-				}
-				res.AgentPID = pid
-				res.AgentTool = matchedTool
-				res.ToolLiveness = "LIVE"
-				res.ExecutionProvenance = prov
-				if convID != "" && res.ActiveConversationID == "" {
-					res.ActiveConversationID = convID
-				}
-				return
-			}
-			cwdCandidates = append(cwdCandidates, candidateProc{pid: pid, tool: matchedTool, etime: etime, line: cmdLine})
-		}
-
-		// 2. Check working directory of candidate agent processes via lsof -a -d cwd -p <pids> -F pn
-		if len(cwdCandidates) > 0 {
-			pidStrs := make([]string, 0, len(cwdCandidates))
-			pidToCand := make(map[int]candidateProc, len(cwdCandidates))
-			for _, c := range cwdCandidates {
-				pidStrs = append(pidStrs, strconv.Itoa(c.pid))
-				pidToCand[c.pid] = c
-			}
-			lsofCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			lsofCmd := procutil.CommandContext(lsofCtx, "lsof", "-a", "-d", "cwd", "-p", strings.Join(pidStrs, ","), "-F", "pn")
-			lsofOut, lsofErr := lsofCmd.Output()
-			cancel()
-			if lsofErr == nil && len(lsofOut) > 0 {
-				currPID := 0
-				for _, line := range strings.Split(string(lsofOut), "\n") {
-					line = strings.TrimSpace(line)
-					if strings.HasPrefix(line, "p") {
-						currPID, _ = strconv.Atoi(strings.TrimPrefix(line, "p"))
-					} else if strings.HasPrefix(line, "n") && currPID > 0 {
-						cwd := strings.TrimPrefix(line, "n")
-						if HasExactRepoPathBoundary(cwd, repoPath) {
-							cand := pidToCand[currPID]
-							prov, convID, isIdle := inspectDarwinAgentProcess(currPID, cand.etime, cand.line, res.LockDetails != "")
-							if isIdle {
-								continue
-							}
-							res.AgentPID = currPID
-							res.AgentTool = cand.tool
-							res.ToolLiveness = "LIVE"
-							res.ExecutionProvenance = prov
-							if convID != "" && res.ActiveConversationID == "" {
-								res.ActiveConversationID = convID
-							}
-							return
-						}
-					}
-				}
-			}
+		if parsePsOutputForAgentProcesses(string(out), selfPID, parentPID, repoPath, res) {
+			return
 		}
 	}
 	if res.LockDetails != "" {
@@ -1426,6 +1348,102 @@ func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult)
 	} else if res.ASEState == "FAILED_DIRTY" || (!res.IsClean && res.ASEState != "RUNNING") {
 		res.ToolLiveness = "TERMINATED"
 	}
+}
+
+func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPath string, res *RepoFleetStatusResult) bool {
+	lines := strings.Split(psOut, "\n")
+	type candidateProc struct {
+		pid   int
+		tool  string
+		etime string
+		line  string
+	}
+	var cwdCandidates []candidateProc
+
+	for _, l := range lines {
+		if isDiagnosticCmdLine(l) {
+			continue
+		}
+		fields := strings.Fields(l)
+		if len(fields) < 4 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 1 || pid == selfPID || pid == parentPID {
+			continue
+		}
+		etime := fields[2]
+		argv0 := fields[3]
+		matchedTool, ok := isAgentTool(argv0)
+		if !ok {
+			base0 := strings.ToLower(filepath.Base(argv0))
+			if (base0 == "env" || base0 == "sh" || base0 == "bash" || base0 == "zsh") && len(fields) > 4 {
+				matchedTool, ok = isAgentTool(fields[4])
+			}
+		}
+		if !ok || matchedTool == "" {
+			continue
+		}
+		cmdLine := strings.Join(fields[3:], " ")
+
+		// 1. Direct command-line path match with strict boundary verification
+		if LineContainsExactRepoPath(cmdLine, repoPath) {
+			prov, convID, isIdle := inspectDarwinAgentProcess(pid, etime, cmdLine, res.LockDetails != "")
+			if isIdle {
+				continue
+			}
+			res.AgentPID = pid
+			res.AgentTool = matchedTool
+			res.ToolLiveness = "LIVE"
+			res.ExecutionProvenance = prov
+			if convID != "" && res.ActiveConversationID == "" {
+				res.ActiveConversationID = convID
+			}
+			return true
+		}
+		cwdCandidates = append(cwdCandidates, candidateProc{pid: pid, tool: matchedTool, etime: etime, line: cmdLine})
+	}
+
+	// 2. Check working directory of candidate agent processes via lsof -a -d cwd -p <pids> -F pn
+	if len(cwdCandidates) > 0 {
+		pidStrs := make([]string, 0, len(cwdCandidates))
+		pidToCand := make(map[int]candidateProc, len(cwdCandidates))
+		for _, c := range cwdCandidates {
+			pidStrs = append(pidStrs, strconv.Itoa(c.pid))
+			pidToCand[c.pid] = c
+		}
+		lsofCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		lsofCmd := procutil.CommandContext(lsofCtx, "lsof", "-a", "-d", "cwd", "-p", strings.Join(pidStrs, ","), "-F", "pn")
+		lsofOut, lsofErr := lsofCmd.Output()
+		cancel()
+		if lsofErr == nil && len(lsofOut) > 0 {
+			currPID := 0
+			for _, line := range strings.Split(string(lsofOut), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "p") {
+					currPID, _ = strconv.Atoi(strings.TrimPrefix(line, "p"))
+				} else if strings.HasPrefix(line, "n") && currPID > 0 {
+					cwd := strings.TrimPrefix(line, "n")
+					if HasExactRepoPathBoundary(cwd, repoPath) {
+						cand := pidToCand[currPID]
+						prov, convID, isIdle := inspectDarwinAgentProcess(currPID, cand.etime, cand.line, res.LockDetails != "")
+						if isIdle {
+							continue
+						}
+						res.AgentPID = currPID
+						res.AgentTool = cand.tool
+						res.ToolLiveness = "LIVE"
+						res.ExecutionProvenance = prov
+						if convID != "" && res.ActiveConversationID == "" {
+							res.ActiveConversationID = convID
+						}
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 // ReapOrphanedProcesses terminates any orphaned child/helper processes whose cwd is inside repoPath.
