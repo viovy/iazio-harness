@@ -1069,4 +1069,99 @@ func TestStoryGov5197_AdhocASEFalsePositiveAndMaintenanceBranchAutoRemediation(t
 	}
 }
 
+func TestStoryIazio0200_LinuxBrainFDActiveASETurnAndMaintenanceBranchHealing(t *testing.T) {
+	appDataDir := t.TempDir()
+	convID := "0bfc5ce7-9110-46e3-90d0-7d8133a07d68"
+	convDir := filepath.Join(appDataDir, "conversations")
+	presDir := filepath.Join(appDataDir, "presence")
+	logsDir := filepath.Join(appDataDir, "brain", convID, ".system_generated", "logs")
+	_ = os.MkdirAll(convDir, 0o755)
+	_ = os.MkdirAll(presDir, 0o755)
+	_ = os.MkdirAll(logsDir, 0o755)
+
+	convDB := filepath.Join(convDir, convID+".db")
+	presLock := filepath.Join(presDir, convID+".lock")
+	transcriptPath := filepath.Join(logsDir, "transcript.jsonl")
+	_ = os.WriteFile(convDB, []byte("sqlite"), 0o644)
+	_ = os.WriteFile(presLock, []byte("lock"), 0o644)
+
+	// 1. In-flight ASE turn (last step is PLANNER_RESPONSE with tool_calls)
+	inFlightLines := strings.Join([]string{
+		`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"/autonomous-story-execution deep review"}`,
+		`{"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"autopilot-story index-upsert --story STORY-IAZIO-0200"}}]}`,
+	}, "\n") + "\n"
+	_ = os.WriteFile(transcriptPath, []byte(inFlightLines), 0o644)
+
+	gotConv, gotTS, activeASE, inferredStory := inspectOpenAgentPathsForBrainAndASE([]string{convDB + "-wal", presLock}, time.Now())
+	if gotConv != convID || gotTS.IsZero() || !activeASE || inferredStory != "STORY-IAZIO-0200" {
+		t.Fatalf("expected active ASE turn from open .db/.lock paths, got conv=%q ts=%v active=%v story=%q",
+			gotConv, gotTS, activeASE, inferredStory)
+	}
+
+	// Reconcile on main while HasActiveAgentASETurn=true -> must report RUNNING / ADHOC_ASE / INDEPENDENT_USER_SESSION
+	repoDir := t.TempDir()
+	activeRes := &RepoFleetStatusResult{
+		RepoPath:              repoDir,
+		Branch:                "main",
+		IsClean:               true,
+		WorktreeState:         "CLEAN",
+		ASEState:              "IDLE",
+		AgentTool:             "agy",
+		AgentPID:              3967534,
+		ToolLiveness:          "LIVE",
+		ExecutionProvenance:   "INDEPENDENT_USER_SESSION",
+		ActiveConversationID:  gotConv,
+		HasActiveAgentASETurn: true,
+		ActiveStoryID:         inferredStory,
+	}
+	reconcileAdhocASEState(repoDir, activeRes)
+	if activeRes.ASEState != "RUNNING" || activeRes.CurrentPhase != "ADHOC_ASE" || activeRes.ExecutionProvenance != "INDEPENDENT_USER_SESSION" {
+		t.Fatalf("expected active brain ASE turn on main to report RUNNING/ADHOC_ASE/INDEPENDENT_USER_SESSION, got %+v", activeRes)
+	}
+
+	// 2. Completed ASE turn (last step is PLANNER_RESPONSE with status=DONE and no tool_calls)
+	completedLines := inFlightLines + `{"step_index":6,"type":"PLANNER_RESPONSE","status":"DONE","content":"## CRAFT Closeout"}` + "\n"
+	_ = os.WriteFile(transcriptPath, []byte(completedLines), 0o644)
+	_, _, activeAfterDone, _ := inspectOpenAgentPathsForBrainAndASE([]string{convDB}, time.Now())
+	if activeAfterDone {
+		t.Fatalf("expected completed final PLANNER_RESPONSE without tool_calls to report activeASE=false")
+	}
+
+	// 3. Maintenance branch auto-healing even when idle shell has ToolLiveness=LIVE but ExecutionProvenance=NONE
+	maintRepo := t.TempDir()
+	exec.Command("git", "init", "-b", "main", maintRepo).Run()
+	exec.Command("git", "-C", maintRepo, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", maintRepo, "config", "user.name", "Test User").Run()
+	_ = os.WriteFile(filepath.Join(maintRepo, "README.md"), []byte("v1\n"), 0o644)
+	exec.Command("git", "-C", maintRepo, "add", ".").Run()
+	exec.Command("git", "-C", maintRepo, "commit", "-m", "init main").Run()
+	exec.Command("git", "-C", maintRepo, "checkout", "-b", "chore/governance-pointers-20261109-072028").Run()
+	reportsDir := filepath.Join(maintRepo, "tmp", "reports")
+	_ = os.MkdirAll(reportsDir, 0o755)
+	sirPath := filepath.Join(reportsDir, "intervention-git-update-sir-5002c92fd239.json")
+	_ = os.WriteFile(sirPath, []byte(`{"status":"OPEN"}`), 0o644)
+
+	idleShellMaint := &RepoFleetStatusResult{
+		RepoPath:            maintRepo,
+		Branch:              "chore/governance-pointers-20261109-072028",
+		IsClean:             false,
+		WorktreeState:       "BRANCH_NOT_MAIN",
+		ASEState:            "IDLE",
+		AgentTool:           "agy",
+		AgentPID:            3967534,
+		ToolLiveness:        "LIVE",
+		ExecutionProvenance: "NONE",
+	}
+	if !autoRemediateCompletedOrMaintenanceBranch(context.Background(), maintRepo, idleShellMaint) {
+		t.Fatalf("expected autoRemediateCompletedOrMaintenanceBranch to heal chore/governance-pointers-* even with idle LIVE shell")
+	}
+	if idleShellMaint.Branch != "main" {
+		t.Fatalf("expected Branch=main after healing, got %q", idleShellMaint.Branch)
+	}
+	if _, err := os.Stat(sirPath); !os.IsNotExist(err) {
+		t.Fatalf("expected stale intervention-git-update-sir JSON to be removed on maintenance branch heal")
+	}
+}
+
+
 

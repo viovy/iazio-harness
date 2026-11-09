@@ -19,8 +19,9 @@ import (
 )
 
 var (
-	branchExplicitStoryRe = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+-[0-9]+)\b`)
-	branchSlugStoryRe     = regexp.MustCompile(`(?i)^(?:chore|feat|fix|refactor|docs|test|ci|perf|build)/(?:story-)?([a-z]{2,10})-([0-9]{2,6})(?:[-/]|$)`)
+	branchExplicitStoryRe  = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+-[0-9]+)\b`)
+	branchSlugStoryRe      = regexp.MustCompile(`(?i)^(?:chore|feat|fix|refactor|docs|test|ci|perf|build)/(?:story-)?([a-z]{2,10})-([0-9]{2,6})(?:[-/]|$)`)
+	transcriptBoundStoryRe = regexp.MustCompile(`(?i)(?:--story[=\s\\"']+|session_story_id[^\n]{0,80}?)(STORY-[A-Z0-9]+-[0-9]+)`)
 )
 
 // InferStoryIDFromBranch extracts a canonical STORY-<CAT>-<NUM> identifier from a story branch name
@@ -73,10 +74,11 @@ type RepoFleetStatusResult struct {
 	LockDetails          string   `json:"lock_details,omitempty"`
 	AgentTool            string   `json:"agent_tool,omitempty"`
 	AgentPID             int      `json:"agent_pid,omitempty"`
-	ToolLiveness         string   `json:"tool_liveness"`        // LIVE, TERMINATED, KILLED, NONE
-	ExecutionProvenance  string   `json:"execution_provenance"` // INDEPENDENT_USER_SESSION, COORDINATED_HARNESS, COORDINATED_HARNESS_FAILED, NONE
-	ActiveConversationID string   `json:"active_conversation_id,omitempty"`
-	MetadataYmlRaw       string   `json:"metadata_yml_raw,omitempty"`
+	ToolLiveness           string   `json:"tool_liveness"`        // LIVE, TERMINATED, KILLED, NONE
+	ExecutionProvenance    string   `json:"execution_provenance"` // INDEPENDENT_USER_SESSION, COORDINATED_HARNESS, COORDINATED_HARNESS_FAILED, NONE
+	ActiveConversationID   string   `json:"active_conversation_id,omitempty"`
+	HasActiveAgentASETurn  bool     `json:"has_active_agent_ase_turn,omitempty"`
+	MetadataYmlRaw         string   `json:"metadata_yml_raw,omitempty"`
 	MetadataYmlSHA       string   `json:"metadata_yml_sha,omitempty"`
 	MetadataYmlModTime   string   `json:"metadata_yml_mod_time,omitempty"`
 	GitVersion           string   `json:"git_version,omitempty"`
@@ -350,29 +352,7 @@ func LineContainsExactRepoPath(cmdLine, repoPath string) bool {
 	}
 }
 
-// IsStoryCompletedOnDisk returns true if storyID is marked DONE in .autopilot/ase-state.json,
-// docs/stories/*.story.md, child family docs/stories/*.story.md, or docs/stories/index.yml.
-func IsStoryCompletedOnDisk(repoPath, storyID string) bool {
-	sid := strings.ToUpper(strings.TrimSpace(storyID))
-	if repoPath == "" || !strings.HasPrefix(sid, "STORY-") {
-		return false
-	}
-
-	// 1. Check .autopilot/ase-state.json
-	if b, err := os.ReadFile(filepath.Join(repoPath, ".autopilot", "ase-state.json")); err == nil {
-		var aseSt struct {
-			StoryID string `json:"story_id"`
-			Status  string `json:"status"`
-			Phase   string `json:"phase"`
-		}
-		if json.Unmarshal(b, &aseSt) == nil && strings.EqualFold(strings.TrimSpace(aseSt.StoryID), sid) {
-			if strings.EqualFold(aseSt.Status, "DONE") || strings.EqualFold(aseSt.Phase, "completed") {
-				return true
-			}
-		}
-	}
-
-	// 2. Check candidate docs/stories directories (root, parent, and category-inferred child hubs)
+func storyCandidateDirs(repoPath, sid string) []string {
 	candidateDirs := []string{
 		filepath.Join(repoPath, "docs", "stories"),
 		filepath.Join(filepath.Dir(repoPath), "docs", "stories"),
@@ -396,8 +376,39 @@ func IsStoryCompletedOnDisk(repoPath, storyID string) bool {
 				filepath.Join(repoPath, "autopilot-umbrella", "docs", "stories"),
 				filepath.Join(repoPath, "iazio-infra", "docs", "stories"),
 			)
+		case "eye":
+			candidateDirs = append(candidateDirs,
+				filepath.Join(repoPath, "eye-habit", "docs", "stories"),
+			)
 		}
 	}
+	return candidateDirs
+}
+
+// IsStoryCompletedOnDisk returns true if storyID is marked DONE in .autopilot/ase-state.json,
+// docs/stories/*.story.md, child family docs/stories/*.story.md, or docs/stories/index.yml.
+func IsStoryCompletedOnDisk(repoPath, storyID string) bool {
+	sid := strings.ToUpper(strings.TrimSpace(storyID))
+	if repoPath == "" || !strings.HasPrefix(sid, "STORY-") {
+		return false
+	}
+
+	// 1. Check .autopilot/ase-state.json
+	if b, err := os.ReadFile(filepath.Join(repoPath, ".autopilot", "ase-state.json")); err == nil {
+		var aseSt struct {
+			StoryID string `json:"story_id"`
+			Status  string `json:"status"`
+			Phase   string `json:"phase"`
+		}
+		if json.Unmarshal(b, &aseSt) == nil && strings.EqualFold(strings.TrimSpace(aseSt.StoryID), sid) {
+			if strings.EqualFold(aseSt.Status, "DONE") || strings.EqualFold(aseSt.Phase, "completed") {
+				return true
+			}
+		}
+	}
+
+	// 2. Check candidate docs/stories directories (root, parent, and category-inferred child hubs)
+	candidateDirs := storyCandidateDirs(repoPath, sid)
 
 	idLower := strings.ToLower(sid)
 	shortSlug := strings.TrimPrefix(idLower, "story-")
@@ -450,6 +461,49 @@ func IsStoryCompletedOnDisk(repoPath, storyID string) bool {
 							break
 						}
 					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// IsStoryExplicitlyInProgressOnDisk returns true if storyID is marked IN_PROGRESS or READY in
+// docs/stories/*.story.md, child family docs/stories/*.story.md, or docs/stories/index.yml.
+func IsStoryExplicitlyInProgressOnDisk(repoPath, storyID string) bool {
+	sid := strings.ToUpper(strings.TrimSpace(storyID))
+	if repoPath == "" || !strings.HasPrefix(sid, "STORY-") {
+		return false
+	}
+
+	candidateDirs := storyCandidateDirs(repoPath, sid)
+	idLower := strings.ToLower(sid)
+	shortSlug := strings.TrimPrefix(idLower, "story-")
+
+	for _, dir := range candidateDirs {
+		entries, err := os.ReadDir(dir)
+		if err == nil {
+			for _, e := range entries {
+				if e.IsDir() || !strings.HasSuffix(e.Name(), ".story.md") {
+					continue
+				}
+				nameLower := strings.ToLower(e.Name())
+				if !strings.Contains(nameLower, idLower) && !strings.Contains(nameLower, shortSlug) {
+					continue
+				}
+				data, rErr := os.ReadFile(filepath.Join(dir, e.Name()))
+				if rErr != nil {
+					continue
+				}
+				content := string(data)
+				if strings.Contains(strings.ToUpper(content), sid) &&
+					(strings.Contains(content, "\nstatus: IN_PROGRESS") ||
+						strings.Contains(content, "\nstatus: \"IN_PROGRESS\"") ||
+						strings.Contains(content, "\nstatus: 'IN_PROGRESS'") ||
+						strings.Contains(content, "\nstatus: READY") ||
+						strings.Contains(content, "\nstatus: \"READY\"") ||
+						strings.Contains(content, "\nstatus: 'READY'")) {
+					return true
 				}
 			}
 		}
@@ -888,7 +942,9 @@ func hasExplicitIdleStateFile(repoPath string) bool {
 }
 
 func autoRemediateCompletedOrMaintenanceBranch(ctx context.Context, cleanPath string, res *RepoFleetStatusResult) bool {
-	if res == nil || res.HasActiveGitLock || res.LockDetails != "" || res.ToolLiveness == "LIVE" || res.ASEState == "RUNNING" {
+	hasActiveSession := res != nil && (res.ASEState == "RUNNING" || res.HasActiveAgentASETurn ||
+		(res.ToolLiveness == "LIVE" && (res.ExecutionProvenance == "INDEPENDENT_USER_SESSION" || res.ExecutionProvenance == "COORDINATED_HARNESS")))
+	if res == nil || res.HasActiveGitLock || res.LockDetails != "" || hasActiveSession {
 		return false
 	}
 	if len(res.ModifiedFiles) > 0 || len(res.DirtySubmodules) > 0 {
@@ -921,6 +977,15 @@ func autoRemediateCompletedOrMaintenanceBranch(ctx context.Context, cleanPath st
 		}
 	}
 	cancelPull()
+
+	if isAutomatedMaintenanceBranch(prevBranch) {
+		_ = procutil.CommandContext(ctx, "git", "-C", cleanPath, "branch", "-D", prevBranch).Run()
+		if sirs, gErr := filepath.Glob(filepath.Join(cleanPath, "tmp", "reports", "intervention-git-update-sir-*.json")); gErr == nil {
+			for _, sir := range sirs {
+				_ = os.Remove(sir)
+			}
+		}
+	}
 
 	res.Branch = "main"
 	res.Ahead = 0
@@ -968,7 +1033,7 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 	// If ActiveStoryID was inferred or read on a completed story, .autopilot/state.json is explicitly IDLE,
 	// and no active agent process, lock, or resume file exists, clear the completed story so post-ASE branches
 	// do not stay locked in ADHOC_ASE after the agent exits.
-	if res.ActiveStoryID != "" && res.ToolLiveness != "LIVE" && res.LockDetails == "" && !hasScopedResume &&
+	if res.ActiveStoryID != "" && res.ToolLiveness != "LIVE" && !res.HasActiveAgentASETurn && res.LockDetails == "" && !hasScopedResume &&
 		IsStoryCompletedOnDisk(repoPath, res.ActiveStoryID) && hasExplicitIdleStateFile(repoPath) {
 		if autoRemediateTier1 {
 			if changed, action := cleanOrRestoreSessionStoryFile(repoPath, res.ActiveStoryID); changed {
@@ -993,10 +1058,11 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 
 	// Strict Ad-Hoc ASE Evidence Gate:
 	// An interactive agent shell (agy/cursor/opencode/claude) sitting on clean main or an automated
-	// maintenance branch (chore/governance-pointers-*) with no bound story, no locks, and no autopilot*
-	// process is an idle shell — NOT an active ad-hoc ASE execution.
+	// maintenance branch (chore/governance-pointers-*) with no bound story, no locks, no active ASE brain turn,
+	// and no autopilot* process is an idle shell — NOT an active ad-hoc ASE execution.
 	hasAffirmativeASEEvidence := res.LockDetails != "" ||
 		isAutopilotProcess ||
+		res.HasActiveAgentASETurn ||
 		(res.ToolLiveness == "LIVE" && (nonMainBranch || len(res.NonMainSubmodules) > 0) && !isAutomatedMaintenanceBranch(res.Branch)) ||
 		(res.ActiveStoryID != "" && (nonMainBranch || len(res.NonMainSubmodules) > 0 || hasScopedResume || res.ToolLiveness == "LIVE"))
 
@@ -1018,7 +1084,7 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 	// If .session_story_id set ActiveStoryID on main, but there is no non-main branch, no locks,
 	// no scoped resume file, and no live agent tool in this repo, the session story file is stale.
 	if res.ActiveStoryID != "" && res.ASEState != "RUNNING" && !nonMainBranch &&
-		len(res.NonMainSubmodules) == 0 && res.LockDetails == "" && !hasScopedResume && res.ToolLiveness != "LIVE" {
+		len(res.NonMainSubmodules) == 0 && res.LockDetails == "" && !hasScopedResume && res.ToolLiveness != "LIVE" && !res.HasActiveAgentASETurn {
 		if autoRemediateTier1 {
 			if changed, action := cleanOrRestoreSessionStoryFile(repoPath, res.ActiveStoryID); changed {
 				res.RemediationApplied = true
@@ -1142,32 +1208,49 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 		if !match && len(cmdArgs) > 1 {
 			toolName, match = isAgentTool(cmdArgs[1])
 		}
-		if match && res.AgentTool == "" {
-			res.AgentTool = toolName
-			res.AgentPID = pid
-			res.ToolLiveness = "LIVE"
-
-			// Extract conversation ID from cmdArgs if present
-			for i := 0; i < len(cmdArgs)-1; i++ {
-				if cmdArgs[i] == "--conversation" || cmdArgs[i] == "-c" || strings.HasPrefix(cmdArgs[i], "--conversation=") {
-					if strings.HasPrefix(cmdArgs[i], "--conversation=") {
-						res.ActiveConversationID = strings.TrimPrefix(cmdArgs[i], "--conversation=")
-					} else {
-						res.ActiveConversationID = cmdArgs[i+1]
-					}
-					break
-				}
+		if match {
+			fdPaths := readProcOpenFDLinks(pid)
+			fdConvID, _, fdActiveASE, fdStoryID := inspectOpenAgentPathsForBrainAndASE(fdPaths, time.Now())
+			argConvID := extractConversationIDFromArgs(cmdArgs)
+			if argConvID == "" {
+				argConvID = fdConvID
 			}
 
-			// Read environ for execution provenance
-			environBytes, _ := os.ReadFile(filepath.Join("/proc", name, "environ"))
-			environStr := string(environBytes)
-			if strings.Contains(environStr, "IAZIO_MANAGED_BY=harness") ||
-				strings.Contains(environStr, "IAZIO_HARNESS_JOB_ID") ||
-				strings.Contains(environStr, "IAZIO_AGENT_MANAGED=1") {
-				res.ExecutionProvenance = "COORDINATED_HARNESS"
-			} else {
-				res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+			isBetterCandidate := res.AgentTool == "" ||
+				(!res.HasActiveAgentASETurn && (fdActiveASE || strings.HasPrefix(strings.ToLower(toolName), "autopilot")))
+
+			if isBetterCandidate {
+				res.AgentTool = toolName
+				res.AgentPID = pid
+				res.ToolLiveness = "LIVE"
+				if argConvID != "" {
+					res.ActiveConversationID = argConvID
+				}
+				if fdActiveASE {
+					res.HasActiveAgentASETurn = true
+				}
+				if fdStoryID != "" && res.ActiveStoryID == "" && !IsStoryCompletedOnDisk(repoPath, fdStoryID) {
+					res.ActiveStoryID = fdStoryID
+				}
+
+				// Read environ for execution provenance
+				environBytes, _ := os.ReadFile(filepath.Join("/proc", name, "environ"))
+				environStr := string(environBytes)
+				if strings.Contains(environStr, "IAZIO_MANAGED_BY=harness") ||
+					strings.Contains(environStr, "IAZIO_HARNESS_JOB_ID") ||
+					strings.Contains(environStr, "IAZIO_AGENT_MANAGED=1") {
+					res.ExecutionProvenance = "COORDINATED_HARNESS"
+				} else {
+					res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+				}
+			} else if fdActiveASE {
+				res.HasActiveAgentASETurn = true
+				if argConvID != "" && res.ActiveConversationID == "" {
+					res.ActiveConversationID = argConvID
+				}
+				if fdStoryID != "" && res.ActiveStoryID == "" && !IsStoryCompletedOnDisk(repoPath, fdStoryID) {
+					res.ActiveStoryID = fdStoryID
+				}
 			}
 		}
 
@@ -1198,6 +1281,211 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 			res.ToolLiveness = "TERMINATED"
 		}
 	}
+}
+
+func readProcOpenFDLinks(pid int) []string {
+	if pid <= 1 {
+		return nil
+	}
+	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
+	entries, err := os.ReadDir(fdDir)
+	if err != nil {
+		return nil
+	}
+	paths := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if target, err := os.Readlink(filepath.Join(fdDir, e.Name())); err == nil && target != "" {
+			paths = append(paths, target)
+		}
+	}
+	return paths
+}
+
+func extractBrainCandidateFromOpenPath(rawPath string) (appDataDir string, convID string, ok bool) {
+	p := filepath.ToSlash(strings.TrimSpace(rawPath))
+	p = strings.TrimSuffix(p, " (deleted)")
+	if p == "" {
+		return "", "", false
+	}
+
+	if idx := strings.Index(p, "/brain/"); idx >= 0 {
+		rest := p[idx+len("/brain/"):]
+		candID := rest
+		if slashIdx := strings.IndexByte(rest, '/'); slashIdx >= 0 {
+			candID = rest[:slashIdx]
+		}
+		if len(candID) >= 8 && !strings.HasPrefix(candID, ".") {
+			return filepath.FromSlash(p[:idx]), candID, true
+		}
+	}
+	if idx := strings.Index(p, "/conversations/"); idx >= 0 {
+		rest := p[idx+len("/conversations/"):]
+		base := rest
+		if slashIdx := strings.IndexByte(rest, '/'); slashIdx >= 0 {
+			base = rest[:slashIdx]
+		}
+		candID := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(base, "-wal"), "-shm"), ".db")
+		if len(candID) >= 8 && !strings.HasPrefix(candID, ".") {
+			return filepath.FromSlash(p[:idx]), candID, true
+		}
+	}
+	if idx := strings.Index(p, "/presence/"); idx >= 0 {
+		rest := p[idx+len("/presence/"):]
+		base := rest
+		if slashIdx := strings.IndexByte(rest, '/'); slashIdx >= 0 {
+			base = rest[:slashIdx]
+		}
+		candID := strings.TrimSuffix(base, ".lock")
+		if len(candID) >= 8 && !strings.HasPrefix(candID, ".") {
+			return filepath.FromSlash(p[:idx]), candID, true
+		}
+	}
+	return "", "", false
+}
+
+func containsASEWorkflowMarker(s string) bool {
+	lower := strings.ToLower(s)
+	return strings.Contains(lower, "/autonomous-story-execution") ||
+		strings.Contains(lower, "skills/autonomous-story-execution") ||
+		strings.Contains(lower, "autopilot-story") ||
+		strings.Contains(lower, "autopilot-git-flow") ||
+		strings.Contains(lower, "autopilot story begin") ||
+		strings.Contains(lower, "autopilot ase") ||
+		strings.Contains(lower, "git-flow ase-start") ||
+		strings.Contains(lower, "git-flow ase-ship") ||
+		strings.Contains(lower, ".session_story_id")
+}
+
+func hasNonEmptyJSONArray(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" || trimmed == "[]" {
+		return false
+	}
+	var arr []any
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return len(arr) > 0
+	}
+	return true
+}
+
+func isTranscriptTurnInFlight(tail []byte, modTime time.Time, now time.Time) bool {
+	if modTime.IsZero() || now.Sub(modTime) > 15*time.Minute {
+		return false
+	}
+	lines := strings.Split(string(tail), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || !strings.HasPrefix(line, "{") || !strings.HasSuffix(line, "}") {
+			continue
+		}
+		var step struct {
+			Type      string          `json:"type"`
+			Status    string          `json:"status"`
+			ToolCalls json.RawMessage `json:"tool_calls"`
+		}
+		if err := json.Unmarshal([]byte(line), &step); err != nil {
+			continue
+		}
+		if strings.EqualFold(step.Type, "PLANNER_RESPONSE") &&
+			strings.EqualFold(step.Status, "DONE") &&
+			!hasNonEmptyJSONArray(step.ToolCalls) {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func readHeadAndTailBytes(path string, headLimit, tailLimit int64) (head []byte, tail []byte, modTime time.Time, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, time.Time{}, err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, nil, time.Time{}, err
+	}
+	modTime = fi.ModTime()
+	size := fi.Size()
+	if size <= 0 {
+		return nil, nil, modTime, nil
+	}
+	if size <= headLimit+tailLimit {
+		all := make([]byte, size)
+		n, _ := f.Read(all)
+		all = all[:n]
+		return all, all, modTime, nil
+	}
+	head = make([]byte, headLimit)
+	hn, _ := f.ReadAt(head, 0)
+	head = head[:hn]
+
+	tail = make([]byte, tailLimit)
+	tn, _ := f.ReadAt(tail, size-tailLimit)
+	tail = tail[:tn]
+	return head, tail, modTime, nil
+}
+
+func inspectBrainTranscriptDir(brainDir string, now time.Time) (newestMod time.Time, hasActiveASETurn bool, inferredStoryID string) {
+	for _, rel := range []string{
+		filepath.Join(".system_generated", "logs", "transcript.jsonl"),
+		filepath.Join(".system_generated", "logs", "transcript_full.jsonl"),
+	} {
+		full := filepath.Join(brainDir, rel)
+		head, tail, modTime, err := readHeadAndTailBytes(full, 64*1024, 128*1024)
+		if err != nil {
+			continue
+		}
+		if modTime.After(newestMod) {
+			newestMod = modTime
+		}
+		if !hasActiveASETurn && (containsASEWorkflowMarker(string(head)) || containsASEWorkflowMarker(string(tail))) {
+			if isTranscriptTurnInFlight(tail, modTime, now) {
+				hasActiveASETurn = true
+				matches := transcriptBoundStoryRe.FindAllStringSubmatch(string(tail), -1)
+				if len(matches) == 0 {
+					matches = transcriptBoundStoryRe.FindAllStringSubmatch(string(head), -1)
+				}
+				if len(matches) > 0 {
+					inferredStoryID = strings.ToUpper(matches[len(matches)-1][1])
+				}
+			}
+		}
+	}
+	return newestMod, hasActiveASETurn, inferredStoryID
+}
+
+func inspectOpenAgentPathsForBrainAndASE(openPaths []string, now time.Time) (convID string, newestTranscript time.Time, hasActiveASETurn bool, inferredStoryID string) {
+	seenBrains := make(map[string]bool)
+	var fallbackConvID string
+	for _, raw := range openPaths {
+		appDataDir, candID, ok := extractBrainCandidateFromOpenPath(raw)
+		if !ok || seenBrains[candID] {
+			continue
+		}
+		seenBrains[candID] = true
+		if fallbackConvID == "" {
+			fallbackConvID = candID
+		}
+		brainDir := filepath.Join(appDataDir, "brain", candID)
+		modTime, activeASE, storyID := inspectBrainTranscriptDir(brainDir, now)
+		if activeASE {
+			hasActiveASETurn = true
+			if storyID != "" {
+				inferredStoryID = storyID
+			}
+		}
+		if !modTime.IsZero() && modTime.After(newestTranscript) {
+			newestTranscript = modTime
+			convID = candID
+		}
+	}
+	if convID == "" {
+		convID = fallbackConvID
+	}
+	return convID, newestTranscript, hasActiveASETurn, inferredStoryID
 }
 
 func extractConversationIDFromArgs(cmdArgs []string) string {
@@ -1247,48 +1535,29 @@ func parsePsElapsedDuration(etime string) time.Duration {
 // parseDarwinLsofBrainTranscripts extracts the most recently modified brain conversation ID and transcript timestamp
 // from lsof -F n output.
 func parseDarwinLsofBrainTranscripts(lsofOut string) (convID string, newestTranscript time.Time) {
-	seenBrains := make(map[string]bool)
+	convID, newestTranscript, _, _ = parseDarwinLsofBrainAndASE(lsofOut, time.Now())
+	return convID, newestTranscript
+}
+
+func parseDarwinLsofBrainAndASE(lsofOut string, now time.Time) (convID string, newestTranscript time.Time, hasActiveASETurn bool, inferredStoryID string) {
+	var paths []string
 	for _, line := range strings.Split(lsofOut, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "n") {
-			continue
-		}
-		p := strings.TrimPrefix(line, "n")
-		idx := strings.Index(p, "/brain/")
-		if idx < 0 {
-			continue
-		}
-		rest := p[idx+len("/brain/"):]
-		slashIdx := strings.IndexByte(rest, '/')
-		candID := rest
-		if slashIdx >= 0 {
-			candID = rest[:slashIdx]
-		}
-		if len(candID) < 8 || strings.HasPrefix(candID, ".") || seenBrains[candID] {
-			continue
-		}
-		seenBrains[candID] = true
-		brainDir := p[:idx+len("/brain/")+len(candID)]
-		for _, rel := range []string{
-			filepath.Join(".system_generated", "logs", "transcript.jsonl"),
-			filepath.Join(".system_generated", "logs", "transcript_full.jsonl"),
-		} {
-			if fi, stErr := os.Stat(filepath.Join(brainDir, rel)); stErr == nil {
-				if fi.ModTime().After(newestTranscript) {
-					newestTranscript = fi.ModTime()
-					if convID == "" {
-						convID = candID
-					}
-				}
-			}
+		if strings.HasPrefix(line, "n") {
+			paths = append(paths, strings.TrimPrefix(line, "n"))
 		}
 	}
-	return convID, newestTranscript
+	return inspectOpenAgentPathsForBrainAndASE(paths, now)
 }
 
 // inspectDarwinAgentProcess determines provenance, active conversation ID, and whether an interactive
 // CLI process has been sitting idle at a prompt (>15m elapsed with no recent brain transcript activity).
 func inspectDarwinAgentProcess(pid int, etime string, cmdLine string, hasRepoLock bool) (provenance string, convID string, isIdle bool) {
+	provenance, convID, isIdle, _, _ = inspectDarwinAgentProcessDetailed(pid, etime, cmdLine, hasRepoLock)
+	return provenance, convID, isIdle
+}
+
+func inspectDarwinAgentProcessDetailed(pid int, etime string, cmdLine string, hasRepoLock bool) (provenance string, convID string, isIdle bool, hasActiveASETurn bool, inferredStoryID string) {
 	provenance = "INDEPENDENT_USER_SESSION"
 	convID = extractConversationIDFromArgs(strings.Fields(cmdLine))
 
@@ -1304,7 +1573,7 @@ func inspectDarwinAgentProcess(pid int, etime string, cmdLine string, hasRepoLoc
 		}
 	}
 	if provenance == "COORDINATED_HARNESS" {
-		return provenance, convID, false
+		return provenance, convID, false, false, ""
 	}
 
 	elapsed := parsePsElapsedDuration(etime)
@@ -1313,19 +1582,21 @@ func inspectDarwinAgentProcess(pid int, etime string, cmdLine string, hasRepoLoc
 	cancelLsof()
 	var newestTranscript time.Time
 	if lsofErr == nil && len(lsofOut) > 0 {
-		lsofConv, ts := parseDarwinLsofBrainTranscripts(string(lsofOut))
+		lsofConv, ts, activeASE, storyID := parseDarwinLsofBrainAndASE(string(lsofOut), time.Now())
 		newestTranscript = ts
+		hasActiveASETurn = activeASE
+		inferredStoryID = storyID
 		if convID == "" && lsofConv != "" {
 			convID = lsofConv
 		}
 	}
 
-	if !hasRepoLock && elapsed > 15*time.Minute {
+	if !hasRepoLock && !hasActiveASETurn && elapsed > 15*time.Minute {
 		if newestTranscript.IsZero() || time.Since(newestTranscript) > 15*time.Minute {
-			return provenance, convID, true
+			return provenance, convID, true, false, ""
 		}
 	}
-	return provenance, convID, false
+	return provenance, convID, false, hasActiveASETurn, inferredStoryID
 }
 
 func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult) {
@@ -1388,7 +1659,7 @@ func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPa
 
 		// 1. Direct command-line path match with strict boundary verification
 		if LineContainsExactRepoPath(cmdLine, repoPath) {
-			prov, convID, isIdle := inspectDarwinAgentProcess(pid, etime, cmdLine, res.LockDetails != "")
+			prov, convID, isIdle, activeASE, storyID := inspectDarwinAgentProcessDetailed(pid, etime, cmdLine, res.LockDetails != "")
 			if isIdle {
 				continue
 			}
@@ -1396,6 +1667,12 @@ func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPa
 			res.AgentTool = matchedTool
 			res.ToolLiveness = "LIVE"
 			res.ExecutionProvenance = prov
+			if activeASE {
+				res.HasActiveAgentASETurn = true
+			}
+			if storyID != "" && res.ActiveStoryID == "" && !IsStoryCompletedOnDisk(repoPath, storyID) {
+				res.ActiveStoryID = storyID
+			}
 			if convID != "" && res.ActiveConversationID == "" {
 				res.ActiveConversationID = convID
 			}
@@ -1426,7 +1703,7 @@ func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPa
 					cwd := strings.TrimPrefix(line, "n")
 					if HasExactRepoPathBoundary(cwd, repoPath) {
 						cand := pidToCand[currPID]
-						prov, convID, isIdle := inspectDarwinAgentProcess(currPID, cand.etime, cand.line, res.LockDetails != "")
+						prov, convID, isIdle, activeASE, storyID := inspectDarwinAgentProcessDetailed(currPID, cand.etime, cand.line, res.LockDetails != "")
 						if isIdle {
 							continue
 						}
@@ -1434,6 +1711,12 @@ func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPa
 						res.AgentTool = cand.tool
 						res.ToolLiveness = "LIVE"
 						res.ExecutionProvenance = prov
+						if activeASE {
+							res.HasActiveAgentASETurn = true
+						}
+						if storyID != "" && res.ActiveStoryID == "" && !IsStoryCompletedOnDisk(repoPath, storyID) {
+							res.ActiveStoryID = storyID
+						}
 						if convID != "" && res.ActiveConversationID == "" {
 							res.ActiveConversationID = convID
 						}
