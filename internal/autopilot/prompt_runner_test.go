@@ -1858,4 +1858,113 @@ fi
 	}
 }
 
+func TestASECompletionGate_HardenedFailureModes_StoryGov5232(t *testing.T) {
+	tmpDir := t.TempDir()
+	repoDir := filepath.Join(tmpDir, "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	execGit := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(out))
+		}
+	}
+	execGit("init", "-b", "main")
+	execGit("config", "user.email", "test@viovy.test")
+	execGit("config", "user.name", "Test Runner")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Test Repo\n"), 0o644); err != nil {
+		t.Fatalf("write readme: %v", err)
+	}
+	execGit("add", "README.md")
+	execGit("commit", "-m", "initial commit")
+
+	// 1. Verify resolveSuperprojectRoot returns parent dir when .gitmodules exists
+	subDir := filepath.Join(repoDir, "submodule-a")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("mkdir subDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitmodules"), []byte("[submodule \"submodule-a\"]\n\tpath = submodule-a\n"), 0o644); err != nil {
+		t.Fatalf("write gitmodules: %v", err)
+	}
+	_ = exec.Command("git", "-C", repoDir, "add", ".gitmodules").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "chore: add gitmodules").Run()
+	if sp := resolveSuperprojectRoot(subDir, "git"); sp != repoDir {
+		t.Fatalf("expected resolveSuperprojectRoot(%q)=%q, got %q", subDir, repoDir, sp)
+	}
+
+	// 2. Scenario A: Direct commit on main with NO story binding during /autonomous-story-execution
+	// Must fail closed with ASE_GATE_INCOMPLETE: missing_story_binding
+	mockAgyBin := filepath.Join(tmpDir, "mock-agy-unbound")
+	scriptUnbound := `#!/bin/sh
+echo "Created conversation conv-unbound-123"
+echo "modified content" >> README.md
+git add README.md >/dev/null 2>&1
+git commit -m "feat: direct commit on main" >/dev/null 2>&1
+echo "### Implementation Summary"
+exit 0
+`
+	if err := os.WriteFile(mockAgyBin, []byte(scriptUnbound), 0o755); err != nil {
+		t.Fatalf("write mock-agy: %v", err)
+	}
+
+	runner := NewPromptRunner("autopilot")
+	runner.GracePeriod = 50 * time.Millisecond
+	resA, errA := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_unbound_ase",
+		JobID:       "job_unbound",
+		Repo:        "repo",
+		Prompt:      "/autonomous-story-execution Title: Do some work without story",
+		TargetAgent: mockAgyBin,
+		WorkingDir:  repoDir,
+		Timeout:     5 * time.Second,
+	})
+	if errA == nil {
+		t.Fatalf("expected error for unbounded story execution, got nil")
+	}
+	if resA.Status != "failed" || resA.FailureCategory != "ASE_GATE_INCOMPLETE" {
+		t.Fatalf("expected status=failed failureCategory=ASE_GATE_INCOMPLETE, got status=%s cat=%s", resA.Status, resA.FailureCategory)
+	}
+	if !strings.Contains(errA.Error(), "missing_story_binding") {
+		t.Fatalf("expected missing_story_binding error, got: %v", errA)
+	}
+
+	// 3. Scenario B: Story bound but left IN_PROGRESS and exited
+	// Must fail closed with ASE_GATE_INCOMPLETE: incomplete_ase_flow
+	mockAgyInProgress := filepath.Join(tmpDir, "mock-agy-inprogress")
+	scriptInProgress := `#!/bin/sh
+echo "Created conversation conv-inprogress-123"
+mkdir -p docs/stories
+printf -- "---\nid: STORY-TEST-9999\ntitle: Test Incomplete\nstatus: IN_PROGRESS\n---\n# Story\n" > docs/stories/2026-11-09-test.story.md
+git add docs/stories/2026-11-09-test.story.md >/dev/null 2>&1
+git commit -m "feat(test-9999): work in progress" >/dev/null 2>&1
+echo "Autonomous story execution is complete for STORY-TEST-9999"
+exit 0
+`
+	if err := os.WriteFile(mockAgyInProgress, []byte(scriptInProgress), 0o755); err != nil {
+		t.Fatalf("write mock-agy: %v", err)
+	}
+
+	resB, errB := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_inprogress_ase",
+		JobID:       "job_inprogress",
+		Repo:        "repo",
+		Prompt:      "/autonomous-story-execution Title: Test Incomplete Story",
+		TargetAgent: mockAgyInProgress,
+		WorkingDir:  repoDir,
+		Timeout:     5 * time.Second,
+	})
+	if errB == nil {
+		t.Fatalf("expected error for IN_PROGRESS story completion attempt, got nil")
+	}
+	if resB.Status != "failed" || resB.FailureCategory != "ASE_GATE_INCOMPLETE" {
+		t.Fatalf("expected status=failed failureCategory=ASE_GATE_INCOMPLETE, got status=%s cat=%s", resB.Status, resB.FailureCategory)
+	}
+	if !strings.Contains(errB.Error(), "incomplete_ase_flow") {
+		t.Fatalf("expected incomplete_ase_flow error, got: %v", errB)
+	}
+}
+
+
 

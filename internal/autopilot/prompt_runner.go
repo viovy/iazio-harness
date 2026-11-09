@@ -837,6 +837,86 @@ func isStoryDoneInWorktree(workingDir, storyID string) bool {
 	return fmStatus == "DONE" || fmStatus == "COMPLETED" || fmStatus == "COMPLETE"
 }
 
+func resolveSuperprojectRoot(dir, gitBin string) string {
+	if dir == "" {
+		return ""
+	}
+	if gitBin == "" {
+		gitBin = "git"
+	}
+	cmd := procutil.Command(gitBin, "rev-parse", "--show-superproject-working-tree")
+	cmd.Dir = dir
+	if out, err := cmd.Output(); err == nil {
+		sp := strings.TrimSpace(string(out))
+		if sp != "" {
+			return sp
+		}
+	}
+	parent := filepath.Dir(filepath.Clean(dir))
+	for parent != "" && parent != "/" && parent != "." {
+		if _, err := os.Stat(filepath.Join(parent, ".gitmodules")); err == nil {
+			return parent
+		}
+		newParent := filepath.Dir(parent)
+		if newParent == parent {
+			break
+		}
+		parent = newParent
+	}
+	return ""
+}
+
+func countUnpushedCommits(dir, gitBin string) (int, error) {
+	if dir == "" {
+		return 0, nil
+	}
+	if gitBin == "" {
+		gitBin = "git"
+	}
+	cmdUpstream := procutil.Command(gitBin, "rev-list", "--count", "@{u}..HEAD")
+	cmdUpstream.Dir = dir
+	if out, err := cmdUpstream.Output(); err == nil {
+		if c, cErr := strconv.Atoi(strings.TrimSpace(string(out))); cErr == nil {
+			return c, nil
+		}
+	}
+	cmdOriginMain := procutil.Command(gitBin, "rev-list", "--count", "origin/main..HEAD")
+	cmdOriginMain.Dir = dir
+	if out, err := cmdOriginMain.Output(); err == nil {
+		if c, cErr := strconv.Atoi(strings.TrimSpace(string(out))); cErr == nil {
+			return c, nil
+		}
+	}
+	cmdOriginMaster := procutil.Command(gitBin, "rev-list", "--count", "origin/master..HEAD")
+	cmdOriginMaster.Dir = dir
+	if out, err := cmdOriginMaster.Output(); err == nil {
+		if c, cErr := strconv.Atoi(strings.TrimSpace(string(out))); cErr == nil {
+			return c, nil
+		}
+	}
+	return 0, nil
+}
+
+func isStoryDoneAnywhere(workingDir, superprojectRoot, storyID string) bool {
+	if isStoryDoneInWorktree(workingDir, storyID) {
+		return true
+	}
+	if superprojectRoot != "" && isStoryDoneInWorktree(superprojectRoot, storyID) {
+		return true
+	}
+	return false
+}
+
+func isStoryIncompleteAnywhere(workingDir, superprojectRoot, storyID string) bool {
+	if isStoryIncompleteInWorktree(workingDir, storyID) {
+		return true
+	}
+	if superprojectRoot != "" && isStoryIncompleteInWorktree(superprojectRoot, storyID) {
+		return true
+	}
+	return false
+}
+
 func isEphemeralHarnessFile(relPath string) bool {
 	p := strings.TrimSpace(filepath.ToSlash(relPath))
 	if p == "" {
@@ -869,6 +949,7 @@ func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gi
 	if gitBin == "" {
 		gitBin = "git"
 	}
+	spRoot := resolveSuperprojectRoot(workingDir, gitBin)
 
 	var candidateStories []string
 	seenStory := make(map[string]bool)
@@ -883,6 +964,9 @@ func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gi
 	primaryFoundInWorktree := false
 	if strings.TrimSpace(primaryStoryID) != "" {
 		primaryFoundInWorktree, _ = storyFrontmatterStatus(workingDir, primaryStoryID)
+		if !primaryFoundInWorktree && spRoot != "" {
+			primaryFoundInWorktree, _ = storyFrontmatterStatus(spRoot, primaryStoryID)
+		}
 	}
 	if !primaryFoundInWorktree {
 		for _, m := range storyIDRegex.FindAllStringSubmatch(combinedOutput, -1) {
@@ -893,20 +977,20 @@ func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gi
 	}
 
 	for _, sid := range candidateStories {
-		if isStoryIncompleteInWorktree(workingDir, sid) {
+		if isStoryIncompleteAnywhere(workingDir, spRoot, sid) {
 			return false
 		}
 	}
 
 	hasCompletionEvidence := false
-	if strings.TrimSpace(primaryStoryID) != "" && isStoryDoneInWorktree(workingDir, primaryStoryID) {
+	if strings.TrimSpace(primaryStoryID) != "" && isStoryDoneAnywhere(workingDir, spRoot, primaryStoryID) {
 		hasCompletionEvidence = true
 	} else if aseCompletionRegex.MatchString(combinedOutput) {
 		if len(candidateStories) == 0 {
 			hasCompletionEvidence = true
 		} else {
 			for _, sid := range candidateStories {
-				if isStoryDoneInWorktree(workingDir, sid) {
+				if isStoryDoneAnywhere(workingDir, spRoot, sid) {
 					hasCompletionEvidence = true
 					break
 				}
@@ -915,7 +999,13 @@ func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gi
 				if strings.TrimSpace(primaryStoryID) == "" {
 					hasCompletionEvidence = true
 				} else if found, _ := storyFrontmatterStatus(workingDir, primaryStoryID); !found {
-					hasCompletionEvidence = true
+					if spRoot != "" {
+						if spFound, _ := storyFrontmatterStatus(spRoot, primaryStoryID); !spFound {
+							hasCompletionEvidence = true
+						}
+					} else {
+						hasCompletionEvidence = true
+					}
 				}
 			}
 		}
@@ -926,7 +1016,11 @@ func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gi
 
 	_, _, rawModified := captureGitSnapshot(workingDir, gitBin)
 	dirtyFiles := filterNonEphemeralModified(rawModified)
-	return len(dirtyFiles) == 0
+	if len(dirtyFiles) > 0 {
+		return false
+	}
+	unpushed, _ := countUnpushedCommits(workingDir, gitBin)
+	return unpushed == 0
 }
 
 var sdlcChildTokens = []string{
@@ -1573,6 +1667,10 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 			if tmpLogPath != "" {
 				args = append(args, "--log-file", tmpLogPath)
+			}
+			spRoot := resolveSuperprojectRoot(opts.WorkingDir, gitBin)
+			if spRoot != "" && spRoot != opts.WorkingDir {
+				args = append(args, "--add-dir", spRoot)
 			}
 		} else if storyID != "" && targetAgent == "autopilot" && strings.TrimSpace(turnPrompt) == "" {
 			args = []string{"story", "run", "--story", storyID}
@@ -2300,10 +2398,17 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 
 	nonEphemeralFinal := filterNonEphemeralModified(modified)
-	finalStoryIncomplete := isStoryIncompleteInWorktree(opts.WorkingDir, detectedStoryID)
+	superprojectRoot := resolveSuperprojectRoot(opts.WorkingDir, gitBin)
+	finalStoryIncomplete := isStoryIncompleteAnywhere(opts.WorkingDir, superprojectRoot, detectedStoryID)
+	finalStoryDone := isStoryDoneAnywhere(opts.WorkingDir, superprojectRoot, detectedStoryID)
 	finalOnNonMainBranch, finalBranchName := isNonMainWorktreeBranch(opts.WorkingDir, gitBin)
 	finalExplicitASE := strings.Contains(opts.Prompt, "/autonomous-story-execution")
-	if (isMockAgy || isDirectAgy) && isASEFlow && execStatus == "completed" {
+	if (isMockAgy || isDirectAgy) && (isASEFlow || finalExplicitASE) && execStatus == "completed" {
+		unpushedWT, _ := countUnpushedCommits(opts.WorkingDir, gitBin)
+		var unpushedSuper int
+		if superprojectRoot != "" && superprojectRoot != opts.WorkingDir {
+			unpushedSuper, _ = countUnpushedCommits(superprojectRoot, gitBin)
+		}
 		if len(nonEphemeralFinal) > 0 {
 			execStatus = "failed"
 			if exitCode == 0 {
@@ -2314,7 +2419,27 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			if waitErr == nil {
 				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: dirty_worktree_post_exit (%d uncommitted file(s) remaining: %s)", len(nonEphemeralFinal), strings.Join(nonEphemeralFinal, ", "))
 			}
-		} else if finalStoryIncomplete && (finalExplicitASE || finalOnNonMainBranch) {
+		} else if finalExplicitASE && strings.TrimSpace(detectedStoryID) == "" {
+			execStatus = "failed"
+			if exitCode == 0 {
+				exitCode = 1
+			}
+			failureCategory = "ASE_GATE_INCOMPLETE"
+			failureStage = "COMPLETION_GATE"
+			if waitErr == nil {
+				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: missing_story_binding (no canonical STORY_ID bound or created during /autonomous-story-execution)")
+			}
+		} else if finalExplicitASE && !finalStoryDone {
+			execStatus = "failed"
+			if exitCode == 0 {
+				exitCode = 1
+			}
+			failureCategory = "ASE_GATE_INCOMPLETE"
+			failureStage = "COMPLETION_GATE"
+			if waitErr == nil {
+				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: incomplete_ase_flow (story %s is not marked DONE in docs/stories/ on branch %s)", detectedStoryID, finalBranchName)
+			}
+		} else if finalStoryIncomplete && finalOnNonMainBranch {
 			execStatus = "failed"
 			if exitCode == 0 {
 				exitCode = 1
@@ -2323,6 +2448,26 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			failureStage = "COMPLETION_GATE"
 			if waitErr == nil {
 				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: incomplete_ase_flow (story %s remains IN_PROGRESS on branch %s)", detectedStoryID, finalBranchName)
+			}
+		} else if finalExplicitASE && finalOnNonMainBranch {
+			execStatus = "failed"
+			if exitCode == 0 {
+				exitCode = 1
+			}
+			failureCategory = "ASE_GATE_INCOMPLETE"
+			failureStage = "COMPLETION_GATE"
+			if waitErr == nil {
+				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: unmerged_feature_branch (worktree remains on branch %s; git-flow land not completed)", finalBranchName)
+			}
+		} else if finalExplicitASE && (unpushedWT > 0 || unpushedSuper > 0) {
+			execStatus = "failed"
+			if exitCode == 0 {
+				exitCode = 1
+			}
+			failureCategory = "ASE_GATE_INCOMPLETE"
+			failureStage = "COMPLETION_GATE"
+			if waitErr == nil {
+				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: unpushed_commits (%d unpushed commit(s) on worktree, %d on superproject; git-flow land not completed)", unpushedWT, unpushedSuper)
 			}
 		}
 	}
