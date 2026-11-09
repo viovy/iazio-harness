@@ -1163,5 +1163,68 @@ func TestStoryIazio0200_LinuxBrainFDActiveASETurnAndMaintenanceBranchHealing(t *
 	}
 }
 
+func TestStoryGov5223_StrandedInFlightSubmoduleStoryDoesNotFabricateLiveAdhocASE(t *testing.T) {
+	tmp := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(tmp, ".autopilot"), 0o755)
+	if err := os.WriteFile(filepath.Join(tmp, ".autopilot", "state.json"), []byte(`{"state":"IDLE","phase":"COMPLETED","story":"STORY-GOV-5222"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	subDocs := filepath.Join(tmp, "vigo", "docs", "stories")
+	_ = os.MkdirAll(subDocs, 0o755)
+	storyContent := "---\nid: STORY-VIGO-0289\ntitle: Security Transport Hygiene Remediation\nstatus: IN_PROGRESS\n---\n"
+	if err := os.WriteFile(filepath.Join(subDocs, "2026-11-09-vigo-0289-security-transport-hygiene-remediation.story.md"), []byte(storyContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "vigo", ".session_story_id"), []byte("STORY-VIGO-0289\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := &RepoFleetStatusResult{
+		RepoPath:            tmp,
+		Branch:              "main",
+		IsClean:             false,
+		SubmodulesClean:     false,
+		WorktreeState:       "DIRTY_TRACKED",
+		ASEState:            "IDLE",
+		ActiveStoryID:       "STORY-VIGO-0289",
+		DirtySubmodules:     []string{"vigo"},
+		NonMainSubmodules:   []string{"vigo (feat/vigo-0289-security-transport-hygiene-remediation)"},
+		ToolLiveness:        "IDLE",
+		ExecutionProvenance: "NONE",
+	}
+
+	reconcileAdhocASEState(tmp, res)
+
+	if res.ASEState != "FAILED_DIRTY" {
+		t.Fatalf("expected ASEState=FAILED_DIRTY for stranded in-flight story after agent exit, got %q", res.ASEState)
+	}
+	if res.ToolLiveness != "TERMINATED" {
+		t.Fatalf("expected ToolLiveness=TERMINATED, got %q", res.ToolLiveness)
+	}
+	if res.ExecutionProvenance != "NONE" {
+		t.Fatalf("expected ExecutionProvenance=NONE (must not fabricate INDEPENDENT_USER_SESSION), got %q", res.ExecutionProvenance)
+	}
+	if res.CurrentPhase != "" {
+		t.Fatalf("expected CurrentPhase='', got %q", res.CurrentPhase)
+	}
+	if res.AgentTool != "" {
+		t.Fatalf("expected AgentTool='', got %q", res.AgentTool)
+	}
+	if res.ActiveStoryID != "STORY-VIGO-0289" {
+		t.Fatalf("expected ActiveStoryID=STORY-VIGO-0289 to be preserved as dirty story context, got %q", res.ActiveStoryID)
+	}
+
+	// Verify pruneCompletedSubmoduleSessionStoryFiles cleans up submodule .session_story_id once story is DONE.
+	doneContent := "---\nid: STORY-VIGO-0289\ntitle: Security Transport Hygiene Remediation\nstatus: DONE\n---\n"
+	if err := os.WriteFile(filepath.Join(subDocs, "2026-11-09-vigo-0289-security-transport-hygiene-remediation.story.md"), []byte(doneContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pruneCompletedSubmoduleSessionStoryFiles(tmp, res)
+	if _, err := os.Stat(filepath.Join(tmp, "vigo", ".session_story_id")); !os.IsNotExist(err) {
+		t.Fatalf("expected completed submodule .session_story_id to be removed")
+	}
+}
+
+
 
 
