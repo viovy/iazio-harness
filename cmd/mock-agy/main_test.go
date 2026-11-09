@@ -470,4 +470,70 @@ func TestMockAgy_ScenariosUnit(t *testing.T) {
 			t.Fatalf("expected exit 0 and conversation in stdout, got code=%d out=%s", code2, stdout.String())
 		}
 	})
+
+	t.Run("Scenario21_Sch1569_FallbackNewConversationResume", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		t.Setenv("HOME", tmpDir)
+		var stdout, stderr bytes.Buffer
+
+		// Poisoned conversation rejected
+		codePoisoned := run([]string{"--conversation=287e8a2b-1e95-4aa1-b2f9-9b151134c574", "--print=run"}, "sch_1569_fallback_new_conversation_resume", &stdout, &stderr)
+		if codePoisoned != 2 {
+			t.Fatalf("expected exit 2 on poisoned conversation, got %d", codePoisoned)
+		}
+
+		// Initial fallback turn
+		stdout.Reset()
+		stderr.Reset()
+		codeInit := run([]string{"--print=run"}, "sch_1569_fallback_new_conversation_resume", &stdout, &stderr)
+		if codeInit != 0 || !strings.Contains(stdout.String(), "8d5d3c3d-1eb6-4517-a64b-df5b27cff909") {
+			t.Fatalf("expected exit 0 and targetConv in stdout, got %d: %s", codeInit, stdout.String())
+		}
+
+		// Resume turn
+		stdout.Reset()
+		stderr.Reset()
+		codeResume := run([]string{"--conversation=8d5d3c3d-1eb6-4517-a64b-df5b27cff909", "--print=resume"}, "sch_1569_fallback_new_conversation_resume", &stdout, &stderr)
+		if codeResume != 0 || !strings.Contains(stdout.String(), "Resumed conversation") {
+			t.Fatalf("expected exit 0 on resume, got %d: %s", codeResume, stdout.String())
+		}
+
+		// Wrong resume conversation
+		stdout.Reset()
+		stderr.Reset()
+		codeWrong := run([]string{"--conversation=wrong-conv", "--print=resume"}, "sch_1569_fallback_new_conversation_resume", &stdout, &stderr)
+		if codeWrong != 1 {
+			t.Fatalf("expected exit 1 on wrong conversation, got %d", codeWrong)
+		}
+	})
+
+	t.Run("Scenario22_PC1MetaRepo04AlternatesRebaseAndAdhocASEBrainFlow", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		origWd, _ := os.Getwd()
+		_ = os.Chdir(tmpDir)
+		defer func() { _ = os.Chdir(origWd) }()
+
+		t.Setenv("HOME", tmpDir)
+		t.Setenv("IAZIO_BRAIN_DIR", filepath.Join(tmpDir, "brain"))
+		t.Setenv("MOCK_AGY_REPO_PATH", tmpDir)
+
+		_ = exec.Command("git", "init").Run()
+		_ = exec.Command("git", "config", "user.email", "test@test.local").Run()
+		_ = exec.Command("git", "config", "user.name", "Tester").Run()
+
+		var stdout, stderr bytes.Buffer
+		t.Setenv("MOCK_AGY_PHASE", "in_flight_phase0")
+		code0 := run([]string{"--print=/autonomous-story-execution deep review"}, "pc1_meta_repo_04_alternates_rebase_and_adhoc_ase_brain_flow", &stdout, &stderr)
+		if code0 != 0 || !strings.Contains(stdout.String(), "Active Phase 0 brain transcript written") {
+			t.Fatalf("expected phase0 exit 0, got %d: %s", code0, stdout.String())
+		}
+
+		stdout.Reset()
+		stderr.Reset()
+		t.Setenv("MOCK_AGY_PHASE", "complete_story")
+		code1 := run([]string{"--conversation=1f2e5efc-e041-4c89-b25a-fe32389d66cd", "--print=complete"}, "pc1_meta_repo_04_alternates_rebase_and_adhoc_ase_brain_flow", &stdout, &stderr)
+		if code1 != 0 || !strings.Contains(stdout.String(), "Completed STORY-IAZIO-0201") {
+			t.Fatalf("expected complete_story exit 0, got %d: %s", code1, stdout.String())
+		}
+	})
 }

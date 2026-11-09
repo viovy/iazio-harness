@@ -17,10 +17,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
+	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/gitclean"
 )
 
@@ -312,7 +312,7 @@ func (ac *AgentWorkspaceController) AbortActiveProcess(repo string) bool {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
 	if cmd, ok := ac.activeCmd[repo]; ok && cmd != nil && cmd.Process != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		engines.KillProcessGroup(cmd)
 		delete(ac.activeCmd, repo)
 		return true
 	}
@@ -549,11 +549,9 @@ func (cp *IazioControlPlane) ExecuteNextJob(ctx context.Context, agyBin string, 
 	cmd.Stdin = nil // Guarantees /dev/null: prevents interactive stdin hangs on sch-1532!
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	cmd.Env = append(cmd.Env, extraEnv...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	engines.SetProcGroup(cmd)
 	cmd.Cancel = func() error {
-		if cmd.Process != nil {
-			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
+		engines.KillProcessGroup(cmd)
 		return nil
 	}
 

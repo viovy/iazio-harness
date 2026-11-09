@@ -1312,6 +1312,138 @@ func TestStoryIazio0200_IncompleteStoryCloseoutTruncatedToolCallsAndGitUpdateGua
 	}
 }
 
+func TestStoryIazio0201_WindowsWSLAlternatesStrandedRebaseAndBrainTranscriptDiscovery(t *testing.T) {
+	// 1. Cross-OS /mnt/c/... alternates file normalization to portable relative path
+	baseWork := t.TempDir()
+	refRepo := filepath.Join(baseWork, "meta-repo")
+	slotRepo := filepath.Join(baseWork, "meta-repo-04")
+	refObjects := filepath.Join(refRepo, ".git", "objects")
+	slotObjectsInfo := filepath.Join(slotRepo, ".git", "objects", "info")
+	_ = os.MkdirAll(refObjects, 0o755)
+	_ = os.MkdirAll(slotObjectsInfo, 0o755)
+
+	exec.Command("git", "init", "-b", "main", slotRepo).Run()
+	exec.Command("git", "-C", slotRepo, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", slotRepo, "config", "user.name", "Test User").Run()
+
+	// Write a non-portable absolute/WSL path into alternates pointing to sibling meta-repo/.git/objects
+	altPath := filepath.Join(slotObjectsInfo, "alternates")
+	wslFakeLine := "/mnt/c/work/meta-repo/.git/objects\n"
+	_ = os.WriteFile(altPath, []byte(wslFakeLine), 0o644)
+
+	changed, normErr := NormalizeGitAlternatesFile(slotRepo, altPath)
+	if normErr != nil || !changed {
+		t.Fatalf("expected NormalizeGitAlternatesFile to rewrite /mnt/c/... alternates (changed=%v err=%v)", changed, normErr)
+	}
+	normAltRaw, err := os.ReadFile(altPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normAlt := strings.TrimSpace(string(normAltRaw))
+	if normAlt != "../../../meta-repo/.git/objects" {
+		t.Fatalf("expected portable relative alternates ../../../meta-repo/.git/objects, got %q", normAlt)
+	}
+
+	// 2. Stranded chore/governance-pointers-* rebase in .git/rebase-merge auto-aborts and restores main
+	_ = os.WriteFile(filepath.Join(slotRepo, "README.md"), []byte("main-v1\n"), 0o644)
+	reviewsDir := filepath.Join(slotRepo, "docs", "reviews")
+	_ = os.MkdirAll(reviewsDir, 0o755)
+	histReview := filepath.Join(reviewsDir, "2026-10-15-review-v0-V2-52a3f2-gov-3404-vigo.md")
+	_ = os.WriteFile(histReview, []byte("# Historical Review STORY-GOV-3404\n"), 0o644)
+	exec.Command("git", "-C", slotRepo, "add", ".").Run()
+	exec.Command("git", "-C", slotRepo, "commit", "-m", "init main").Run()
+
+	// Create conflicting commit on main vs chore/governance-pointers-20261109-171414
+	exec.Command("git", "-C", slotRepo, "checkout", "-b", "chore/governance-pointers-20261109-171414").Run()
+	_ = os.WriteFile(filepath.Join(slotRepo, "README.md"), []byte("pointers-branch\n"), 0o644)
+	exec.Command("git", "-C", slotRepo, "add", ".").Run()
+	exec.Command("git", "-C", slotRepo, "commit", "-m", "chore: governance pointers").Run()
+
+	exec.Command("git", "-C", slotRepo, "checkout", "main").Run()
+	_ = os.WriteFile(filepath.Join(slotRepo, "README.md"), []byte("main-v2\n"), 0o644)
+	exec.Command("git", "-C", slotRepo, "add", ".").Run()
+	exec.Command("git", "-C", slotRepo, "commit", "-m", "main advance").Run()
+
+	exec.Command("git", "-C", slotRepo, "checkout", "chore/governance-pointers-20261109-171414").Run()
+	// Start rebase that conflicts and leaves .git/rebase-merge on detached HEAD
+	_ = exec.Command("git", "-C", slotRepo, "rebase", "main").Run()
+
+	brainRoot := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainRoot)
+
+	inspectedAfterRebaseHeal, err := InspectRepoFleetStatus(context.Background(), slotRepo)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus(slotRepo): %v", err)
+	}
+	if inspectedAfterRebaseHeal.Branch != "main" || !inspectedAfterRebaseHeal.IsClean || inspectedAfterRebaseHeal.ActiveStoryID != "" {
+		t.Fatalf("expected stranded governance-pointers rebase to auto-abort to clean main with empty ActiveStoryID, got branch=%q clean=%v story=%q state=%q",
+			inspectedAfterRebaseHeal.Branch, inspectedAfterRebaseHeal.IsClean, inspectedAfterRebaseHeal.ActiveStoryID, inspectedAfterRebaseHeal.ASEState)
+	}
+
+	// 3. TranscriptReferencesRepoPath boundary & cross-OS normalization + InspectActiveBrainASETurnForRepo
+	escapedWindowsTranscript := `{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"/autonomous-story-execution deep review"}` + "\n" +
+		fmt.Sprintf(`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`,
+			strings.ReplaceAll(filepath.Join(slotRepo, "AGENTS.md"), `\`, `\\`)) + "\n"
+	if !TranscriptReferencesRepoPath(escapedWindowsTranscript, slotRepo) {
+		t.Fatalf("expected TranscriptReferencesRepoPath=true for JSON-escaped repo path")
+	}
+	if TranscriptReferencesRepoPath(escapedWindowsTranscript, refRepo) {
+		t.Fatalf("expected TranscriptReferencesRepoPath=false for prefix sibling meta-repo vs meta-repo-04")
+	}
+
+	convID := "1f2e5efc-e041-4c89-b25a-fe32389d66cd"
+	convLogs := filepath.Join(brainRoot, convID, ".system_generated", "logs")
+	_ = os.MkdirAll(convLogs, 0o755)
+	_ = os.WriteFile(filepath.Join(convLogs, "transcript.jsonl"), []byte(escapedWindowsTranscript), 0o644)
+
+	inspectedDuringBrainASE, err := InspectRepoFleetStatus(context.Background(), slotRepo)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus(during brain ASE): %v", err)
+	}
+	if inspectedDuringBrainASE.ASEState != "RUNNING" ||
+		inspectedDuringBrainASE.ExecutionProvenance != "INDEPENDENT_USER_SESSION" ||
+		inspectedDuringBrainASE.ToolLiveness != "LIVE" ||
+		inspectedDuringBrainASE.ActiveConversationID != convID {
+		t.Fatalf("expected active brain ASE turn to report RUNNING/INDEPENDENT_USER_SESSION/LIVE, got %+v", inspectedDuringBrainASE)
+	}
+
+	// 4. Verify background task waiting turn remains in-flight until finished with result
+	bgPendingTail := escapedWindowsTranscript +
+		`{"step_index":2,"type":"TOOL_RESPONSE","content":"Tool is running as a background task with task id: 1f2e5efc-e041-4c89-b25a-fe32389d66cd/task-101"}` + "\n" +
+		`{"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting for task-101 to finish."}` + "\n"
+	if !isTranscriptTurnInFlight([]byte(bgPendingTail), time.Now(), time.Now()) {
+		t.Fatalf("expected transcript with pending background task-101 to remain in-flight")
+	}
+	bgDoneTail := bgPendingTail +
+		`{"step_index":4,"type":"USER_INPUT","content":"Task id \"1f2e5efc-e041-4c89-b25a-fe32389d66cd/task-101\" finished with result: Command exited with code 0."}` + "\n" +
+		`{"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","content":"Completed."}` + "\n"
+	if isTranscriptTurnInFlight([]byte(bgDoneTail), time.Now(), time.Now()) {
+		t.Fatalf("expected transcript after task-101 completion and terminal PLANNER_RESPONSE to be idle")
+	}
+	if !HasActiveBrainASETurnForRepo(slotRepo, time.Now()) {
+		t.Fatalf("expected HasActiveBrainASETurnForRepo(slotRepo)=true while brain transcript is in-flight")
+	}
+	if HasActiveBrainASETurnForRepo("", time.Now()) {
+		t.Fatalf("expected HasActiveBrainASETurnForRepo(\"\")=false")
+	}
+	// Verify Windows drive path normalization in NormalizeGitAlternatesFile and readRebaseHeadBranch
+	_ = os.WriteFile(altPath, []byte("# comment\nC:\\work\\meta-repo\\.git\\objects\n"), 0o644)
+	if changed2, err2 := NormalizeGitAlternatesFile(slotRepo, altPath); err2 != nil || !changed2 {
+		t.Fatalf("expected Windows path in alternates to normalize to relative path, got changed=%v err=%v", changed2, err2)
+	}
+	rebaseApplyDir := filepath.Join(slotRepo, ".git", "rebase-apply")
+	_ = os.MkdirAll(rebaseApplyDir, 0o755)
+	_ = os.WriteFile(filepath.Join(rebaseApplyDir, "head-name"), []byte("refs/heads/chore/submodule-pointers-20261109\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(rebaseApplyDir, "stopped-sha"), []byte("deadbeef\n"), 0o644)
+	if hb, _ := readRebaseHeadBranch(rebaseApplyDir); hb != "chore/submodule-pointers-20261109" {
+		t.Fatalf("expected readRebaseHeadBranch=chore/submodule-pointers-20261109, got %q", hb)
+	}
+	if _, shouldAbort := shouldAutoAbortStrandedRebase(slotRepo, rebaseApplyDir); !shouldAbort {
+		t.Fatalf("expected shouldAutoAbortStrandedRebase=true for chore/submodule-pointers-20261109")
+	}
+	_ = os.RemoveAll(rebaseApplyDir)
+}
+
 
 
 
