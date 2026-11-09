@@ -1225,6 +1225,94 @@ func TestStoryGov5223_StrandedInFlightSubmoduleStoryDoesNotFabricateLiveAdhocASE
 	}
 }
 
+func TestStoryIazio0200_IncompleteStoryCloseoutTruncatedToolCallsAndGitUpdateGuard(t *testing.T) {
+	// 1. Story with status: DONE in frontmatter but unchecked DoD, _pending_ reviews, or open SIR is NOT completed on disk
+	repoDir := t.TempDir()
+	exec.Command("git", "init", "-b", "main", repoDir).Run()
+	exec.Command("git", "-C", repoDir, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", repoDir, "config", "user.name", "Test User").Run()
+
+	storiesDir := filepath.Join(repoDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0o755)
+	storyPath := filepath.Join(storiesDir, "2026-11-09-iazio-0200-test.story.md")
+	incompleteDone := "---\nid: STORY-IAZIO-0200\nstatus: DONE\n---\n## 5. Definition of Done\n- [ ] Check 1\n## 7. Reviews\n_pending_\n"
+	_ = os.WriteFile(storyPath, []byte(incompleteDone), 0o644)
+
+	if IsStoryCompletedOnDisk(repoDir, "STORY-IAZIO-0200") {
+		t.Fatalf("expected IsStoryCompletedOnDisk=false when DoD has unchecked items and Reviews is _pending_")
+	}
+	if !IsStoryExplicitlyInProgressOnDisk(repoDir, "STORY-IAZIO-0200") {
+		t.Fatalf("expected IsStoryExplicitlyInProgressOnDisk=true when story has incomplete DoD/Reviews")
+	}
+
+	// Complete DoD and Reviews, but leave an OPEN SIR -> still incomplete
+	completeMarkdown := "---\nid: STORY-IAZIO-0200\nstatus: DONE\n---\n## 5. Definition of Done\n- [x] Check 1\n## 7. Reviews\n| Tool | Status |\n|---|---|\n| tdd | PASS |\n"
+	_ = os.WriteFile(storyPath, []byte(completeMarkdown), 0o644)
+	reportsDir := filepath.Join(repoDir, "tmp", "reports")
+	_ = os.MkdirAll(reportsDir, 0o755)
+	sirFile := filepath.Join(reportsDir, "intervention-story-iazio-0200-sir-e189f1a9051d.json")
+	_ = os.WriteFile(sirFile, []byte(`{"id":"sir-e189f1a9051d","status":"OPEN"}`), 0o644)
+
+	if IsStoryCompletedOnDisk(repoDir, "STORY-IAZIO-0200") {
+		t.Fatalf("expected IsStoryCompletedOnDisk=false while open story SIR exists in tmp/reports")
+	}
+	_ = os.Remove(sirFile)
+	if !IsStoryCompletedOnDisk(repoDir, "STORY-IAZIO-0200") {
+		t.Fatalf("expected IsStoryCompletedOnDisk=true once DoD is checked, Reviews populated, and SIRs removed")
+	}
+
+	// 2. Truncated tool_calls in compact transcript.jsonl is recognized as in-flight, and inferredStoryID is preserved between turns
+	appDataDir := t.TempDir()
+	convID := "a7c57ec1-b2dd-42c5-992c-7ee59e241e6c"
+	logsDir := filepath.Join(appDataDir, "brain", convID, ".system_generated", "logs")
+	_ = os.MkdirAll(logsDir, 0o755)
+	transcriptPath := filepath.Join(logsDir, "transcript.jsonl")
+	truncatedTurn := strings.Join([]string{
+		`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"/autonomous-story-execution STORY-IAZIO-0200"}`,
+		`{"step_index":10,"type":"PLANNER_RESPONSE","status":"DONE","truncated_fields":["tool_calls"]}`,
+	}, "\n") + "\n"
+	_ = os.WriteFile(transcriptPath, []byte(truncatedTurn), 0o644)
+
+	_, _, activeTrunc, inferredTrunc := inspectOpenAgentPathsForBrainAndASE([]string{transcriptPath}, time.Now())
+	if !activeTrunc || inferredTrunc != "STORY-IAZIO-0200" {
+		t.Fatalf("expected truncated_fields=[tool_calls] to report activeTrunc=true and story=STORY-IAZIO-0200, got active=%v story=%q", activeTrunc, inferredTrunc)
+	}
+
+	// Between turns (PLANNER_RESPONSE DONE without tool_calls), activeASE=false, but inferredStoryID is still returned within 2h
+	betweenTurns := truncatedTurn + `{"step_index":11,"type":"PLANNER_RESPONSE","status":"DONE","content":"Checking next step"}` + "\n"
+	_ = os.WriteFile(transcriptPath, []byte(betweenTurns), 0o644)
+	_, _, activeBetween, inferredBetween := inspectOpenAgentPathsForBrainAndASE([]string{transcriptPath}, time.Now())
+	if activeBetween || inferredBetween != "STORY-IAZIO-0200" {
+		t.Fatalf("expected between-turns transcript to report active=false and story=STORY-IAZIO-0200, got active=%v story=%q", activeBetween, inferredBetween)
+	}
+
+	// 3. parseASEStateWithOpts must NOT prune .session_story_id on main while HasActiveAgentASETurn=true
+	_ = os.WriteFile(filepath.Join(repoDir, ".session_story_id"), []byte("STORY-IAZIO-0200\n"), 0o644)
+	inTurnRes := &RepoFleetStatusResult{
+		RepoPath:              repoDir,
+		Branch:                "main",
+		HasActiveAgentASETurn: true,
+		ASEState:              "IDLE",
+	}
+	parseASEStateWithOpts(repoDir, true, inTurnRes)
+	if _, err := os.Stat(filepath.Join(repoDir, ".session_story_id")); err != nil {
+		t.Fatalf("expected .session_story_id NOT to be pruned while HasActiveAgentASETurn=true")
+	}
+	if inTurnRes.ASEState != "RUNNING" || inTurnRes.ActiveStoryID != "STORY-IAZIO-0200" {
+		t.Fatalf("expected RUNNING and ActiveStoryID=STORY-IAZIO-0200 during active turn on main, got state=%s story=%q", inTurnRes.ASEState, inTurnRes.ActiveStoryID)
+	}
+
+	// 4. IsWorktreeIdleForGitUpdate must return false on non-main feature branch without <cat>-<num> slug
+	_ = os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("v1\n"), 0o644)
+	exec.Command("git", "-C", repoDir, "add", ".").Run()
+	exec.Command("git", "-C", repoDir, "commit", "-m", "init").Run()
+	exec.Command("git", "-C", repoDir, "checkout", "-b", "fix/adhoc-ase-linux-brain-and-git-update-healing").Run()
+	if IsWorktreeIdleForGitUpdate(repoDir, nil) {
+		t.Fatalf("expected IsWorktreeIdleForGitUpdate=false on non-main feature branch without story slug")
+	}
+}
+
+
 
 
 
