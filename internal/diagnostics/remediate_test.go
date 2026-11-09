@@ -194,4 +194,17 @@ func TestIsWorktreeIdleForGitUpdate_StoryScopingAndBranchDetection(t *testing.T)
 	if IsWorktreeIdleForGitUpdate(tempDir, nil) {
 		t.Fatalf("expected worktree with active .session_story_id to NOT be idle, but got idle=true")
 	}
+
+	// Switch back to main while .session_story_id has an IN_PROGRESS story in iazio-infra/docs/stories -> still NOT idle!
+	if out, err := exec.Command("git", "-C", tempDir, "checkout", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git checkout main: %v (%s)", err, string(out))
+	}
+	iazioStoriesDir := filepath.Join(tempDir, "iazio-infra", "docs", "stories")
+	_ = os.MkdirAll(iazioStoriesDir, 0755)
+	_ = os.WriteFile(filepath.Join(iazioStoriesDir, "2026-11-09-iazio-0200-test.story.md"), []byte("---\nid: STORY-IAZIO-0200\nstatus: IN_PROGRESS\n---\n"), 0644)
+	_ = os.WriteFile(filepath.Join(tempDir, ".session_story_id"), []byte("STORY-IAZIO-0200\n"), 0644)
+	if IsWorktreeIdleForGitUpdate(tempDir, nil) {
+		t.Fatalf("expected worktree on main with IN_PROGRESS story in iazio-infra/docs/stories and .session_story_id to NOT be idle")
+	}
 }
+

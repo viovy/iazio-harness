@@ -578,7 +578,7 @@ func IsWorktreeIdleForGitUpdate(repoPath string, pidAliveFn func(int) bool) bool
 		return false
 	}
 
-	// 1. Check in-flight story branch directly from git HEAD
+	// 1. Check in-flight story branch directly from git HEAD or submodules
 	if brOut, brErr := procutil.Command("git", "-C", cleanPath, "symbolic-ref", "--short", "-q", "HEAD").Output(); brErr == nil {
 		br := strings.TrimSpace(string(brOut))
 		if br != "" && br != "main" && br != "master" && br != "HEAD" {
@@ -588,6 +588,9 @@ func IsWorktreeIdleForGitUpdate(repoPath string, pidAliveFn func(int) bool) bool
 				}
 			}
 		}
+	}
+	if hasActiveNonMainSubmoduleStory(cleanPath) {
+		return false
 	}
 
 	// 2. Check active ASE state from .autopilot/ase-state.json
@@ -630,6 +633,9 @@ func IsWorktreeIdleForGitUpdate(repoPath string, pidAliveFn func(int) bool) bool
 	if b, err := os.ReadFile(sessionPath); err == nil {
 		storyID := strings.TrimSpace(string(b))
 		if storyID != "" && !IsStoryCompletedOnDisk(cleanPath, storyID) {
+			if IsStoryExplicitlyInProgressOnDisk(cleanPath, storyID) {
+				return false
+			}
 			if _, rErr := os.Stat(filepath.Join(cleanPath, "tmp", "ase-resume-"+storyID+".json")); rErr == nil {
 				return false
 			}
@@ -639,10 +645,79 @@ func IsWorktreeIdleForGitUpdate(repoPath string, pidAliveFn func(int) bool) bool
 					return false
 				}
 			}
+			if hasAnyNonMainSubmodule(cleanPath) {
+				return false
+			}
 		}
 	}
 
 	return true
+}
+
+func discoverGitmodulePaths(repoPath string) []string {
+	b, err := os.ReadFile(filepath.Join(repoPath, ".gitmodules"))
+	if err != nil {
+		return nil
+	}
+	var subs []string
+	for _, line := range strings.Split(string(b), "\n") {
+		l := strings.TrimSpace(line)
+		if strings.HasPrefix(l, "path") && strings.Contains(l, "=") {
+			parts := strings.SplitN(l, "=", 2)
+			if len(parts) == 2 {
+				sub := strings.TrimSpace(parts[1])
+				if sub != "" {
+					subs = append(subs, sub)
+				}
+			}
+		}
+	}
+	return subs
+}
+
+func hasAnyNonMainSubmodule(repoPath string) bool {
+	for _, sub := range discoverGitmodulePaths(repoPath) {
+		subDir := filepath.Join(repoPath, sub)
+		if br, ok := readGitWorktreeBranch(subDir); ok && br != "main" && br != "master" && br != "detached" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasActiveNonMainSubmoduleStory(repoPath string) bool {
+	for _, sub := range discoverGitmodulePaths(repoPath) {
+		subDir := filepath.Join(repoPath, sub)
+		if br, ok := readGitWorktreeBranch(subDir); ok && br != "main" && br != "master" && br != "detached" {
+			if inferred := InferStoryIDFromBranch(br); inferred != "" && !IsStoryCompletedOnDisk(repoPath, inferred) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func healStrandedMaintenanceBranchBeforeGitUpdate(ctx context.Context, cleanPath string) {
+	brOut, brErr := procutil.CommandContext(ctx, "git", "-C", cleanPath, "symbolic-ref", "--short", "-q", "HEAD").Output()
+	if brErr != nil {
+		return
+	}
+	br := strings.TrimSpace(string(brOut))
+	if !isAutomatedMaintenanceBranch(br) {
+		return
+	}
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanPath, "checkout", "main").Run()
+	fetchCmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "fetch", "origin", "main")
+	fetchCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if fetchCmd.Run() == nil {
+		_ = procutil.CommandContext(ctx, "git", "-C", cleanPath, "reset", "--hard", "origin/main").Run()
+	}
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanPath, "branch", "-D", br).Run()
+	if sirs, gErr := filepath.Glob(filepath.Join(cleanPath, "tmp", "reports", "intervention-git-update-sir-*.json")); gErr == nil {
+		for _, sir := range sirs {
+			_ = os.Remove(sir)
+		}
+	}
 }
 
 func cleanOrRestoreArtifactInDir(ctx context.Context, dir, relPath string) bool {
@@ -870,6 +945,8 @@ func (r *TwoStageGitUpdateRemediator) Execute(ctx context.Context, repoPath stri
 		}
 	}
 	defer releaseLock()
+
+	healStrandedMaintenanceBranchBeforeGitUpdate(ctx, cleanPath)
 
 	res.Stage1Executed = true
 	var step1Out string
