@@ -44,13 +44,13 @@ var (
 
 func isASEExecutionPrompt(prompt string) bool {
 	trimmed := strings.TrimSpace(prompt)
-	return strings.Contains(prompt, "/autonomous-story-execution") ||
+	return strings.HasPrefix(trimmed, "/autonomous-story-execution") ||
 		strings.HasPrefix(trimmed, "autopilot ase") ||
-		strings.Contains(prompt, "story.execute") ||
-		strings.Contains(prompt, "story.create_and_execute") ||
-		strings.Contains(prompt, "story_execute") ||
-		strings.Contains(prompt, "story_create_and_execute") ||
-		strings.Contains(prompt, "execute_story")
+		strings.HasPrefix(trimmed, "story.execute") ||
+		strings.HasPrefix(trimmed, "story.create_and_execute") ||
+		strings.HasPrefix(trimmed, "story_execute") ||
+		strings.HasPrefix(trimmed, "story_create_and_execute") ||
+		strings.HasPrefix(trimmed, "execute_story")
 }
 
 func isPointerStoryID(sid string) bool {
@@ -1048,8 +1048,11 @@ func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gi
 	if len(dirtyFiles) > 0 {
 		return false
 	}
-	unpushed, _ := countUnpushedCommits(workingDir, gitBin)
-	return unpushed == 0
+	unpushed, unpushedErr := countUnpushedCommits(workingDir, gitBin)
+	if unpushedErr != nil || unpushed > 0 {
+		return false
+	}
+	return true
 }
 
 var sdlcChildTokens = []string{
