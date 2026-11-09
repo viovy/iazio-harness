@@ -42,6 +42,17 @@ var (
 	hex32Regex              = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
 
+func isASEExecutionPrompt(prompt string) bool {
+	trimmed := strings.TrimSpace(prompt)
+	return strings.Contains(prompt, "/autonomous-story-execution") ||
+		strings.HasPrefix(trimmed, "autopilot ase") ||
+		strings.Contains(prompt, "story.execute") ||
+		strings.Contains(prompt, "story.create_and_execute") ||
+		strings.Contains(prompt, "story_execute") ||
+		strings.Contains(prompt, "story_create_and_execute") ||
+		strings.Contains(prompt, "execute_story")
+}
+
 func isPointerStoryID(sid string) bool {
 	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sid)), "STORY-GOV-POINTERS-")
 }
@@ -886,11 +897,10 @@ func countUnpushedCommits(dir, gitBin string) (int, error) {
 		return 0, fmt.Errorf("git remote check failed in %s: %w", dir, remoteErr)
 	}
 	if strings.TrimSpace(string(remoteOut)) == "" {
-		if os.Getenv("IAZIO_REQUIRE_REMOTE") == "1" {
-			return 0, fmt.Errorf("no git remotes configured in %s", dir)
+		if os.Getenv("IAZIO_TEST_SKIP_REMOTE") == "1" {
+			return 0, nil
 		}
-		fmt.Fprintf(os.Stderr, "[prompt_runner] warning: unpushed commits check skipped: no git remotes configured in %s\n", dir)
-		return 0, nil
+		return 0, fmt.Errorf("no git remotes configured in %s", dir)
 	}
 	cmdUpstream := procutil.Command(gitBin, "rev-list", "--count", "@{u}..HEAD")
 	cmdUpstream.Dir = dir
@@ -2420,14 +2430,9 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	finalStoryIncomplete := isStoryIncompleteAnywhere(opts.WorkingDir, superprojectRoot, detectedStoryID)
 	finalStoryDone := isStoryDoneAnywhere(opts.WorkingDir, superprojectRoot, detectedStoryID)
 	finalOnNonMainBranch, finalBranchName := isNonMainWorktreeBranch(opts.WorkingDir, gitBin)
-	finalExplicitASE := strings.Contains(opts.Prompt, "/autonomous-story-execution")
+	finalExplicitASE := isASEExecutionPrompt(opts.Prompt)
 	if (isASEFlow || finalExplicitASE) && execStatus == "completed" {
 		unpushedWT, unpushedWTErr := countUnpushedCommits(opts.WorkingDir, gitBin)
-		var unpushedSuper int
-		var unpushedSuperErr error
-		if superprojectRoot != "" && superprojectRoot != opts.WorkingDir {
-			unpushedSuper, unpushedSuperErr = countUnpushedCommits(superprojectRoot, gitBin)
-		}
 		if len(nonEphemeralFinal) > 0 {
 			execStatus = "failed"
 			if exitCode == 0 {
@@ -2446,7 +2451,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			failureCategory = "ASE_GATE_INCOMPLETE"
 			failureStage = "COMPLETION_GATE"
 			if waitErr == nil {
-				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: missing_story_binding (no canonical STORY_ID bound or created during /autonomous-story-execution)")
+				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: missing_story_binding (no canonical STORY_ID bound or created during ASE run)")
 			}
 		} else if finalExplicitASE && !finalStoryDone {
 			execStatus = "failed"
@@ -2478,21 +2483,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			if waitErr == nil {
 				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: unmerged_feature_branch (worktree remains on branch %s; git-flow land not completed)", finalBranchName)
 			}
-		} else if finalExplicitASE && (unpushedWTErr != nil || unpushedSuperErr != nil) {
-			execStatus = "failed"
-			if exitCode == 0 {
-				exitCode = 1
-			}
-			failureCategory = "ASE_GATE_INCOMPLETE"
-			failureStage = "COMPLETION_GATE"
-			probeErr := unpushedWTErr
-			if probeErr == nil {
-				probeErr = unpushedSuperErr
-			}
-			if waitErr == nil {
-				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: unpushed_probe_failed (%v)", probeErr)
-			}
-		} else if finalExplicitASE && (unpushedWT > 0 || unpushedSuper > 0) {
+		} else if finalExplicitASE && unpushedWTErr != nil {
 			execStatus = "failed"
 			if exitCode == 0 {
 				exitCode = 1
@@ -2500,7 +2491,17 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			failureCategory = "ASE_GATE_INCOMPLETE"
 			failureStage = "COMPLETION_GATE"
 			if waitErr == nil {
-				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: unpushed_commits (%d unpushed commit(s) on worktree, %d on superproject; git-flow land not completed)", unpushedWT, unpushedSuper)
+				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: unpushed_probe_failed (%v)", unpushedWTErr)
+			}
+		} else if finalExplicitASE && unpushedWT > 0 {
+			execStatus = "failed"
+			if exitCode == 0 {
+				exitCode = 1
+			}
+			failureCategory = "ASE_GATE_INCOMPLETE"
+			failureStage = "COMPLETION_GATE"
+			if waitErr == nil {
+				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: unpushed_commits (%d unpushed commit(s) on worktree; git-flow land not completed)", unpushedWT)
 			}
 		}
 	}

@@ -113,6 +113,7 @@ func makeFakeAutopilot(t *testing.T) string {
 
 func initTestGitRepo(t *testing.T) string {
 	t.Helper()
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
 	dir := t.TempDir()
 
 	run := func(args ...string) {
@@ -756,6 +757,7 @@ func TestBackgroundDrainPIDLivenessAndAutoResume_Unit(t *testing.T) {
 	}
 	t.Setenv("IAZIO_BG_DRAIN_GRACE_SECONDS", "")
 	t.Setenv("MOCK_AGY_FAST", "1")
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
 	if d := r.resolveBackgroundDrainGracePeriod(RunPromptOptions{}); d != 150*time.Millisecond {
 		t.Fatalf("unexpected MOCK_AGY_FAST grace: %v", d)
 	}
@@ -1198,6 +1200,7 @@ func TestJobCbbb1363993215f9_PulledDoneStoryNeverShadowsNewlyAllocatedSessionSto
 	t.Setenv("HOME", homeDir)
 	t.Setenv("MOCK_AGY_SCENARIO", "job_cbbb1363993215f9_wave4_pulled_done_story_override")
 	t.Setenv("MOCK_AGY_UNIT", "1")
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
 
 	repoDir := t.TempDir()
 	_ = exec.Command("git", "-C", repoDir, "init").Run()
@@ -1267,6 +1270,7 @@ func TestJob38eeeb536a5a7130_AgyCrashAutoResumeAndNewConversationFallback(t *tes
 	t.Setenv("HOME", homeDir)
 	t.Setenv("MOCK_AGY_SCENARIO", "job_38eeeb536a5a7130_crash_resume_and_new_conv_fallback")
 	t.Setenv("MOCK_AGY_STATE_MARKER", filepath.Join(homeDir, "mock_agy_38eeeb53_turn.tmp"))
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
 
 	repoDir := t.TempDir()
 	_ = exec.Command("git", "-C", repoDir, "init").Run()
@@ -1311,6 +1315,7 @@ func TestStory0190_RealTimeConversationDiscoveryAndHeartbeat(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
 	t.Setenv("MOCK_AGY_FAST", "1")
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
 
 	repoDir := t.TempDir()
 	_ = exec.Command("git", "-C", repoDir, "init").Run()
@@ -1984,7 +1989,7 @@ exit 0
 
 	// 4. Scenario C: Story DONE on main but NO remote upstream exists
 	// Must fail closed with ASE_GATE_INCOMPLETE: unpushed_probe_failed
-	t.Setenv("IAZIO_REQUIRE_REMOTE", "1")
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "")
 	_ = exec.Command("git", "-C", repoDir, "rm", "-f", "docs/stories/2026-11-09-test.story.md").Run()
 	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "chore: remove previous story").Run()
 	mockAgyNoRemote := filepath.Join(tmpDir, "mock-agy-noremote")
