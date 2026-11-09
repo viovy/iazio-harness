@@ -31,17 +31,47 @@ import (
 )
 
 var (
-	storyIDRegex       = regexp.MustCompile(`\b(STORY-[A-Za-z0-9_-]+)\b`)
-	convIDRegex        = regexp.MustCompile(`(?i)(?:created|resumed|resuming|loaded|active|using|streaming)\s+conversation\s+([A-Za-z0-9_-]{12,64})`)
-	bgDrainIdleRegex   = regexp.MustCompile(`(?i)root agent idle;\s*waiting up to\s*[0-9hms.]+\s*for\s*(\d+)\s*background task`)
-	printTimeoutRegex  = regexp.MustCompile(`(?i)print timeout after\s*[0-9hms.]+\s*with turn in progress`)
-	aseCompletionRegex = regexp.MustCompile(`(?i)(?:autonomous story execution is complete|\[story_completed\]|story[_\s-]+completed\s+successfully|all acceptance criteria[^\n]*(?:met|verified|complete)|"ase_complete"\s*:\s*true)`)
-	hex16Regex         = regexp.MustCompile(`^[0-9a-f]{16}$`)
-	hex32Regex         = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	storyIDRegex            = regexp.MustCompile(`\b(STORY-[A-Za-z0-9_-]+)\b`)
+	canonicalStoryIDRegex   = regexp.MustCompile(`(?i)\b(STORY-(?:GOV-POINTERS-[0-9-]+|[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]+))\b`)
+	reviewArtifactPathRegex = regexp.MustCompile(`(?i)\S*docs/reviews/\S*`)
+	convIDRegex             = regexp.MustCompile(`(?i)(?:created|resumed|resuming|loaded|active|using|streaming)\s+conversation\s+([A-Za-z0-9_-]{12,64})`)
+	bgDrainIdleRegex        = regexp.MustCompile(`(?i)root agent idle;\s*waiting up to\s*[0-9hms.]+\s*for\s*(\d+)\s*background task`)
+	printTimeoutRegex       = regexp.MustCompile(`(?i)print timeout after\s*[0-9hms.]+\s*with turn in progress`)
+	aseCompletionRegex      = regexp.MustCompile(`(?i)(?:autonomous story execution is complete|\[story_completed\]|story[_\s-]+completed\s+successfully|all acceptance criteria[^\n]*(?:met|verified|complete)|"ase_complete"\s*:\s*true)`)
+	hex16Regex              = regexp.MustCompile(`^[0-9a-f]{16}$`)
+	hex32Regex              = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
 
 func isPointerStoryID(sid string) bool {
 	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sid)), "STORY-GOV-POINTERS-")
+}
+
+func extractTargetStoryIDFromText(text string) string {
+	cleaned := reviewArtifactPathRegex.ReplaceAllString(text, " ")
+	if m := canonicalStoryIDRegex.FindStringSubmatch(cleaned); len(m) > 1 {
+		return strings.ToUpper(strings.TrimSpace(m[1]))
+	}
+	return ""
+}
+
+func isNonMainWorktreeBranch(workingDir, gitBin string) (bool, string) {
+	if strings.TrimSpace(workingDir) == "" {
+		return false, ""
+	}
+	if gitBin == "" {
+		gitBin = "git"
+	}
+	cmd := procutil.Command(gitBin, "rev-parse", "--abbrev-ref", "HEAD")
+	cmd.Dir = workingDir
+	out, err := cmd.Output()
+	if err != nil {
+		return false, ""
+	}
+	br := strings.TrimSpace(string(out))
+	if br == "" || br == "main" || br == "master" || br == "HEAD" {
+		return false, br
+	}
+	return true, br
 }
 
 const (
@@ -409,6 +439,7 @@ func discoverStoryFromASEStateWithSource(workingDir string, after time.Time, all
 			storyID = bestActiveSID
 			storyTitle = bestActiveTitle
 			storyPath = bestActivePath
+			fromSessionFile = true
 		} else if bestDoneSID != "" {
 			storyID = bestDoneSID
 			storyTitle = bestDoneTitle
@@ -1270,14 +1301,10 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 
 	storyID := strings.TrimSpace(opts.StoryID)
 	if storyID == "" {
-		if m := storyIDRegex.FindStringSubmatch(opts.Title); len(m) > 1 {
-			storyID = m[1]
-		}
+		storyID = extractTargetStoryIDFromText(opts.Title)
 	}
 	if storyID == "" {
-		if m := storyIDRegex.FindStringSubmatch(opts.Prompt); len(m) > 1 {
-			storyID = m[1]
-		}
+		storyID = extractTargetStoryIDFromText(opts.Prompt)
 	}
 
 	pfHook := r.PreFlightHook
@@ -2049,9 +2076,9 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			rawCombined := stdoutBuf.String() + "\n" + transcriptBuf.String() + "\n" + stderrBuf.String()
 			streamMu.Unlock()
 
-			if curStory == "" || isPointerStoryID(curStory) {
+			if curStory == "" || isPointerStoryID(curStory) || (!isStoryIncompleteInWorktree(opts.WorkingDir, curStory) && !isStoryDoneInWorktree(opts.WorkingDir, curStory)) {
 				if sid, _, _ := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second)); sid != "" {
-					if curStory == "" || (isPointerStoryID(curStory) && !isPointerStoryID(sid)) {
+					if curStory == "" || (isPointerStoryID(curStory) && !isPointerStoryID(sid)) || isStoryIncompleteInWorktree(opts.WorkingDir, sid) {
 						curStory = sid
 						streamMu.Lock()
 						boundStoryID = sid
@@ -2077,6 +2104,9 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			nonEphemeralModified := filterNonEphemeralModified(curModified)
 			hasDirtyWorktree := len(nonEphemeralModified) > 0
 			storyIncomplete := isStoryIncompleteInWorktree(opts.WorkingDir, curStory)
+			isExplicitASEPrompt := strings.Contains(opts.Prompt, "/autonomous-story-execution")
+			onNonMainBranch, _ := isNonMainWorktreeBranch(opts.WorkingDir, gitBin)
+			aseBranchIncomplete := isASEFlow && storyIncomplete && (isExplicitASEPrompt || onNonMainBranch)
 			aseDirtyIncomplete := isASEFlow && hasDirtyWorktree
 
 			lowerCombined := strings.ToLower(rawCombined)
@@ -2087,7 +2117,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 			aseCrashOrIncomplete := isASEFlow && (execStatus != "completed" || exitCode != 0) && !isFatalQuota
 			needsResume := !hasHeadlessPermissionDenial(rawCombined) && !isFatalQuota &&
-				((curConv != "" && (bgDrainReaped || printTimedOut || aseDirtyIncomplete || (storyIncomplete && (execStatus != "completed" || hasDirtyWorktree || bgDrainIdleRegex.MatchString(rawCombined))))) ||
+				((curConv != "" && (bgDrainReaped || printTimedOut || aseDirtyIncomplete || aseBranchIncomplete || (storyIncomplete && (execStatus != "completed" || hasDirtyWorktree || bgDrainIdleRegex.MatchString(rawCombined))))) ||
 					aseCrashOrIncomplete)
 
 			if !needsResume {
@@ -2270,15 +2300,30 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 
 	nonEphemeralFinal := filterNonEphemeralModified(modified)
-	if (isMockAgy || isDirectAgy) && isASEFlow && execStatus == "completed" && len(nonEphemeralFinal) > 0 {
-		execStatus = "failed"
-		if exitCode == 0 {
-			exitCode = 1
-		}
-		failureCategory = "ASE_GATE_INCOMPLETE"
-		failureStage = "COMPLETION_GATE"
-		if waitErr == nil {
-			waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: dirty_worktree_post_exit (%d uncommitted file(s) remaining: %s)", len(nonEphemeralFinal), strings.Join(nonEphemeralFinal, ", "))
+	finalStoryIncomplete := isStoryIncompleteInWorktree(opts.WorkingDir, detectedStoryID)
+	finalOnNonMainBranch, finalBranchName := isNonMainWorktreeBranch(opts.WorkingDir, gitBin)
+	finalExplicitASE := strings.Contains(opts.Prompt, "/autonomous-story-execution")
+	if (isMockAgy || isDirectAgy) && isASEFlow && execStatus == "completed" {
+		if len(nonEphemeralFinal) > 0 {
+			execStatus = "failed"
+			if exitCode == 0 {
+				exitCode = 1
+			}
+			failureCategory = "ASE_GATE_INCOMPLETE"
+			failureStage = "COMPLETION_GATE"
+			if waitErr == nil {
+				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: dirty_worktree_post_exit (%d uncommitted file(s) remaining: %s)", len(nonEphemeralFinal), strings.Join(nonEphemeralFinal, ", "))
+			}
+		} else if finalStoryIncomplete && (finalExplicitASE || finalOnNonMainBranch) {
+			execStatus = "failed"
+			if exitCode == 0 {
+				exitCode = 1
+			}
+			failureCategory = "ASE_GATE_INCOMPLETE"
+			failureStage = "COMPLETION_GATE"
+			if waitErr == nil {
+				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: incomplete_ase_flow (story %s remains IN_PROGRESS on branch %s)", detectedStoryID, finalBranchName)
+			}
 		}
 	}
 

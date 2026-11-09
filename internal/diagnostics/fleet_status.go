@@ -726,6 +726,9 @@ func parseASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFl
 
 	// 4. Check .session_story_id and scoped tmp/ase-resume-<storyID>.json for interactive / ad-hoc ASE sessions
 	sessionPath := filepath.Join(repoPath, ".session_story_id")
+	if autoRemediateTier1 && len(locks) == 0 && canPruneCompletedStory {
+		pruneCompletedSubmoduleSessionStoryFiles(repoPath, res)
+	}
 	if autoRemediateTier1 && len(locks) == 0 && isMainBranch {
 		if _, statErr := os.Stat(sessionPath); os.IsNotExist(statErr) && isGitTrackedFile(repoPath, ".session_story_id") {
 			if procutil.Command("git", "-C", repoPath, "checkout", "HEAD", "--", ".session_story_id").Run() == nil {
@@ -815,6 +818,44 @@ func cleanOrRestoreSessionStoryFile(repoPath, storyID string) (bool, string) {
 		return true, fmt.Sprintf("removed completed .session_story_id (%s)", storyID)
 	}
 	return false, ""
+}
+
+func hasSessionStoryFile(repoPath string) bool {
+	if strings.TrimSpace(repoPath) == "" {
+		return false
+	}
+	b, err := os.ReadFile(filepath.Join(repoPath, ".session_story_id"))
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(string(b))), "STORY-")
+}
+
+func pruneCompletedSubmoduleSessionStoryFiles(repoPath string, res *RepoFleetStatusResult) {
+	if strings.TrimSpace(repoPath) == "" {
+		return
+	}
+	matches, err := filepath.Glob(filepath.Join(repoPath, "*", ".session_story_id"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		b, errR := os.ReadFile(m)
+		if errR != nil {
+			continue
+		}
+		subSID := strings.TrimSpace(string(b))
+		if !strings.HasPrefix(strings.ToUpper(subSID), "STORY-") {
+			continue
+		}
+		subDir := filepath.Dir(m)
+		if IsStoryCompletedOnDisk(repoPath, subSID) || IsStoryCompletedOnDisk(subDir, subSID) {
+			if changed, action := cleanOrRestoreSessionStoryFile(subDir, subSID); changed && res != nil {
+				res.RemediationApplied = true
+				res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("%s in %s", action, filepath.Base(subDir)))
+			}
+		}
+	}
 }
 
 func removeModifiedFileFromStatus(res *RepoFleetStatusResult, relFile string) {
@@ -1033,27 +1074,42 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 	// If ActiveStoryID was inferred or read on a completed story, .autopilot/state.json is explicitly IDLE,
 	// and no active agent process, lock, or resume file exists, clear the completed story so post-ASE branches
 	// do not stay locked in ADHOC_ASE after the agent exits.
-	if res.ActiveStoryID != "" && res.ToolLiveness != "LIVE" && !res.HasActiveAgentASETurn && res.LockDetails == "" && !hasScopedResume &&
-		IsStoryCompletedOnDisk(repoPath, res.ActiveStoryID) && hasExplicitIdleStateFile(repoPath) {
-		if autoRemediateTier1 {
-			if changed, action := cleanOrRestoreSessionStoryFile(repoPath, res.ActiveStoryID); changed {
-				res.RemediationApplied = true
-				res.RemediationActions = append(res.RemediationActions, action)
-				removeModifiedFileFromStatus(res, ".session_story_id")
+	// Conversely, if the story is still incomplete on disk (IN_PROGRESS) on a branch/submodule with no live
+	// agent process, no lock, and either an explicit IDLE/DONE state file or no root .session_story_id,
+	// classify it as FAILED_DIRTY / TERMINATED (preserving ActiveStoryID for in-flight detection) rather than ADHOC_ASE.
+	if res.ActiveStoryID != "" && res.ToolLiveness != "LIVE" && !res.HasActiveAgentASETurn && res.LockDetails == "" && !hasScopedResume {
+		storyCompleted := IsStoryCompletedOnDisk(repoPath, res.ActiveStoryID)
+		explicitIdle := hasExplicitIdleStateFile(repoPath)
+		hasRootSessionFile := hasSessionStoryFile(repoPath)
+		if storyCompleted && explicitIdle {
+			if autoRemediateTier1 {
+				if changed, action := cleanOrRestoreSessionStoryFile(repoPath, res.ActiveStoryID); changed {
+					res.RemediationApplied = true
+					res.RemediationActions = append(res.RemediationActions, action)
+					removeModifiedFileFromStatus(res, ".session_story_id")
+				}
 			}
-		}
-		res.ActiveStoryID = ""
-		if res.CurrentPhase == "ADHOC_ASE" {
-			res.CurrentPhase = ""
-		}
-		if res.ASEState == "RUNNING" {
-			if res.WorktreeState == "DIRTY_MODIFIED" {
-				res.ASEState = "FAILED_DIRTY"
-			} else {
-				res.ASEState = "IDLE"
+			res.ActiveStoryID = ""
+			if res.CurrentPhase == "ADHOC_ASE" {
+				res.CurrentPhase = ""
 			}
+			if res.ASEState == "RUNNING" {
+				if res.WorktreeState == "DIRTY_MODIFIED" {
+					res.ASEState = "FAILED_DIRTY"
+				} else {
+					res.ASEState = "IDLE"
+				}
+			}
+			res.ExecutionProvenance = "NONE"
+		} else if !storyCompleted && (explicitIdle || (!hasRootSessionFile && (res.CurrentPhase == "ADHOC_ASE" || nonMainBranch || len(res.NonMainSubmodules) > 0))) {
+			if res.CurrentPhase == "ADHOC_ASE" {
+				res.CurrentPhase = ""
+			}
+			res.ASEState = "FAILED_DIRTY"
+			res.ToolLiveness = "TERMINATED"
+			res.ExecutionProvenance = "NONE"
+			res.AgentTool = ""
 		}
-		res.ExecutionProvenance = "NONE"
 	}
 
 	// Strict Ad-Hoc ASE Evidence Gate:
@@ -1083,7 +1139,7 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 
 	// If .session_story_id set ActiveStoryID on main, but there is no non-main branch, no locks,
 	// no scoped resume file, and no live agent tool in this repo, the session story file is stale.
-	if res.ActiveStoryID != "" && res.ASEState != "RUNNING" && !nonMainBranch &&
+	if res.ActiveStoryID != "" && res.ASEState != "RUNNING" && res.ASEState != "IN_PROGRESS" && !nonMainBranch &&
 		len(res.NonMainSubmodules) == 0 && res.LockDetails == "" && !hasScopedResume && res.ToolLiveness != "LIVE" && !res.HasActiveAgentASETurn {
 		if autoRemediateTier1 {
 			if changed, action := cleanOrRestoreSessionStoryFile(repoPath, res.ActiveStoryID); changed {

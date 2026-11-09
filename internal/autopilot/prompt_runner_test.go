@@ -1779,3 +1779,83 @@ func TestIsSDLCChildCommandLine_DetectsSDLCInMCPNamedPaths(t *testing.T) {
 	}
 }
 
+func TestStoryGov5223_ReviewPathStoryIDExclusionAndCommittedFeatureBranchAutoResume(t *testing.T) {
+	// 1. Verify extractTargetStoryIDFromText ignores review artifact filenames and non-canonical underscored tokens
+	promptWithReviewPath := "/autonomous-story-execution clean up dummy FSM-bypass review artifacts (model: dummy in vigo/docs/reviews/2026-08-03-review-V2-STORY-AUTO-GOV_2251_HOOK_MINING_AUDIT_STORIES.md)"
+	if got := extractTargetStoryIDFromText(promptWithReviewPath); got != "" {
+		t.Fatalf("expected empty target story ID when prompt only references a review artifact path, got %q", got)
+	}
+	if got := extractTargetStoryIDFromText("/autonomous-story-execution implement STORY-VIGO-0289 and check docs/reviews/2026-08-03-review-STORY-OLD-1111.md"); got != "STORY-VIGO-0289" {
+		t.Fatalf("expected STORY-VIGO-0289, got %q", got)
+	}
+
+	// 2. Verify RunPrompt auto-resumes when Turn 1 commits an IN_PROGRESS story to a feature branch and exits 0 (e.g. after invoke_subagent)
+	repoDir := initTestGitRepo(t)
+	if onNonMain, br := isNonMainWorktreeBranch(repoDir, "git"); onNonMain {
+		t.Fatalf("expected initial repo branch %q to be main/master", br)
+	}
+
+	convID := "8e0e4af9-2263-4afb-9794-3863bf9b97b9"
+	binDir := t.TempDir()
+	stateMarker := filepath.Join(binDir, "turn_marker")
+	mockAgyBin := filepath.Join(binDir, "mock-agy")
+	script := fmt.Sprintf(`#!/bin/sh
+CONV_ARG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --conversation=*) CONV_ARG="${1#*=}" ;;
+    --conversation) shift; CONV_ARG="$1" ;;
+  esac
+  shift
+done
+
+if [ ! -f "%s" ]; then
+  echo "1" > "%s"
+  echo "Created conversation %s"
+  git checkout -b feat/vigo-0289-security-transport-hygiene-remediation >/dev/null 2>&1 || true
+  mkdir -p docs/stories
+  printf -- "---\nid: STORY-VIGO-0289\ntitle: Security Transport Hygiene\nstatus: IN_PROGRESS\n---\n# Story\n" > docs/stories/2026-11-09-vigo-0289.story.md
+  git add docs/stories/2026-11-09-vigo-0289.story.md >/dev/null 2>&1 || true
+  git commit -m "feat(vigo-0289): commit phase 3 and invoke review subagent" >/dev/null 2>&1 || true
+  echo "Launched review subagent; ending turn."
+  exit 0
+else
+  printf -- "---\nid: STORY-VIGO-0289\ntitle: Security Transport Hygiene\nstatus: DONE\n---\n# Story\n" > docs/stories/2026-11-09-vigo-0289.story.md
+  git add docs/stories/2026-11-09-vigo-0289.story.md >/dev/null 2>&1 || true
+  git commit -m "chore(vigo-0289): complete story" >/dev/null 2>&1 || true
+  git checkout main >/dev/null 2>&1 || git checkout master >/dev/null 2>&1 || true
+  git merge --ff-only feat/vigo-0289-security-transport-hygiene-remediation >/dev/null 2>&1 || true
+  echo "Autonomous story execution is complete for STORY-VIGO-0289 on $CONV_ARG"
+  exit 0
+fi
+`, stateMarker, stateMarker, convID)
+	if err := os.WriteFile(mockAgyBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock-agy: %v", err)
+	}
+
+	runner := NewPromptRunner("autopilot")
+	runner.GracePeriod = 50 * time.Millisecond
+	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_gov_5223",
+		JobID:       "job_ed03faa8f7094f29",
+		Repo:        "vigo",
+		Prompt:      promptWithReviewPath,
+		TargetAgent: mockAgyBin,
+		WorkingDir:  repoDir,
+		Timeout:     5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("expected RunPrompt to auto-resume and complete STORY-VIGO-0289, got err=%v", err)
+	}
+	if res.StoryID != "STORY-VIGO-0289" {
+		t.Fatalf("expected StoryID=STORY-VIGO-0289 (not review path artifact), got %q", res.StoryID)
+	}
+	if res.ResumeAttempts != 1 {
+		t.Fatalf("expected 1 auto-resume attempt when Turn 1 exited on committed IN_PROGRESS feature branch, got %d", res.ResumeAttempts)
+	}
+	if res.Status != "completed" || res.ExitCode != 0 {
+		t.Fatalf("expected completed ExitCode=0, got status=%s exit=%d", res.Status, res.ExitCode)
+	}
+}
+
+
