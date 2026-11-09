@@ -578,18 +578,18 @@ func IsWorktreeIdleForGitUpdate(repoPath string, pidAliveFn func(int) bool) bool
 		return false
 	}
 
-	// 1. Check in-flight story branch directly from git HEAD or submodules
+	// 1. Check in-flight branch directly from git HEAD or submodules:
+	// Any non-main, non-maintenance feature/fix/chore branch is considered in-flight unless its inferred story is completely DONE.
 	if brOut, brErr := procutil.Command("git", "-C", cleanPath, "symbolic-ref", "--short", "-q", "HEAD").Output(); brErr == nil {
 		br := strings.TrimSpace(string(brOut))
-		if br != "" && br != "main" && br != "master" && br != "HEAD" {
-			if inferred := InferStoryIDFromBranch(br); inferred != "" {
-				if !IsStoryCompletedOnDisk(cleanPath, inferred) {
-					return false
-				}
+		if br != "" && br != "main" && br != "master" && br != "HEAD" && !isAutomatedMaintenanceBranch(br) {
+			inferred := InferStoryIDFromBranch(br)
+			if inferred == "" || !IsStoryCompletedOnDisk(cleanPath, inferred) {
+				return false
 			}
 		}
 	}
-	if hasActiveNonMainSubmoduleStory(cleanPath) {
+	if hasAnyNonMainSubmodule(cleanPath) || hasActiveNonMainSubmoduleStory(cleanPath) {
 		return false
 	}
 
@@ -633,7 +633,7 @@ func IsWorktreeIdleForGitUpdate(repoPath string, pidAliveFn func(int) bool) bool
 	if b, err := os.ReadFile(sessionPath); err == nil {
 		storyID := strings.TrimSpace(string(b))
 		if storyID != "" && !IsStoryCompletedOnDisk(cleanPath, storyID) {
-			if IsStoryExplicitlyInProgressOnDisk(cleanPath, storyID) {
+			if IsStoryExplicitlyInProgressOnDisk(cleanPath, storyID) || hasUnresolvedStorySIROnDisk(cleanPath, storyID) {
 				return false
 			}
 			if _, rErr := os.Stat(filepath.Join(cleanPath, "tmp", "ase-resume-"+storyID+".json")); rErr == nil {
@@ -649,6 +649,14 @@ func IsWorktreeIdleForGitUpdate(repoPath string, pidAliveFn func(int) bool) bool
 				return false
 			}
 		}
+	}
+
+	// 5. Check live agent processes bound to this worktree
+	var probeRes RepoFleetStatusResult
+	discoverAgentProcesses(cleanPath, &probeRes)
+	if probeRes.ToolLiveness == "LIVE" &&
+		(probeRes.HasActiveAgentASETurn || probeRes.ActiveStoryID != "" || strings.HasPrefix(strings.ToLower(probeRes.AgentTool), "autopilot")) {
+		return false
 	}
 
 	return true

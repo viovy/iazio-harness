@@ -21,7 +21,7 @@ import (
 var (
 	branchExplicitStoryRe  = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+-[0-9]+)\b`)
 	branchSlugStoryRe      = regexp.MustCompile(`(?i)^(?:chore|feat|fix|refactor|docs|test|ci|perf|build)/(?:story-)?([a-z]{2,10})-([0-9]{2,6})(?:[-/]|$)`)
-	transcriptBoundStoryRe = regexp.MustCompile(`(?i)(?:--story[=\s\\"']+|session_story_id[^\n]{0,80}?)(STORY-[A-Z0-9]+-[0-9]+)`)
+	transcriptBoundStoryRe = regexp.MustCompile(`(?i)(?:--story(?:-id)?[=\s\\"']+|story\s+begin\s+|/autonomous-story-execution[^\n]{0,120}?|story_id[\\"\s:=]+|session_story_id[^\n]{0,80}?)(STORY-[A-Z0-9]+-[0-9]+)`)
 )
 
 // InferStoryIDFromBranch extracts a canonical STORY-<CAT>-<NUM> identifier from a story branch name
@@ -183,11 +183,18 @@ func InspectRepoFleetStatusWithOptions(ctx context.Context, repoPath string, opt
 	}
 	res.SubmodulesClean = (len(res.DirtySubmodules) == 0 && len(res.NonMainSubmodules) == 0)
 
-	// 3. ASE State & Autopilot locks (with Tier 1 completed-ASE artifact cleanup)
-	parseASEStateWithOpts(cleanPath, opts.AutoRemediateTier1, res)
-
-	// 4. Process Discovery & Provenance
+	// 3. Process Discovery & Provenance (run before ASE state pruning so active brain ASE turns are never pruned mid-turn)
 	discoverAgentProcesses(cleanPath, res)
+	inferredBrainStoryID := res.ActiveStoryID
+
+	// 4. ASE State & Autopilot locks (with Tier 1 completed-ASE artifact cleanup when no active ASE turn is in flight)
+	parseASEStateWithOpts(cleanPath, opts.AutoRemediateTier1, res)
+	if res.ActiveStoryID == "" && inferredBrainStoryID != "" {
+		if res.HasActiveAgentASETurn || !IsStoryCompletedOnDisk(cleanPath, inferredBrainStoryID) {
+			res.ActiveStoryID = inferredBrainStoryID
+		}
+	}
+	applyNoAgentFallbackState(res)
 
 	// 4b. Reconcile ad-hoc ASE session state and provenance (strict evidence gate)
 	reconcileAdhocASEStateWithOpts(cleanPath, opts.AutoRemediateTier1, res)
@@ -385,11 +392,97 @@ func storyCandidateDirs(repoPath, sid string) []string {
 	return candidateDirs
 }
 
+func extractMarkdownSection(content string, sectionHeaders ...string) string {
+	lines := strings.Split(content, "\n")
+	inSection := false
+	var sb strings.Builder
+	for _, rawLine := range lines {
+		trimmed := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(trimmed, "## ") {
+			if inSection {
+				break
+			}
+			lowerHeader := strings.ToLower(trimmed)
+			for _, h := range sectionHeaders {
+				if strings.HasPrefix(lowerHeader, strings.ToLower(h)) {
+					inSection = true
+					break
+				}
+			}
+			continue
+		}
+		if inSection {
+			sb.WriteString(trimmed)
+			sb.WriteByte('\n')
+		}
+	}
+	return sb.String()
+}
+
+func hasUnresolvedStorySIROnDisk(repoPath, sid string) bool {
+	if repoPath == "" || sid == "" {
+		return false
+	}
+	lowerSID := strings.ToLower(sid)
+	shortSlug := strings.TrimPrefix(lowerSID, "story-")
+	reportsDir := filepath.Join(repoPath, "tmp", "reports")
+	entries, err := os.ReadDir(reportsDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		nameLower := strings.ToLower(e.Name())
+		if !strings.HasPrefix(nameLower, "intervention-") || !strings.HasSuffix(nameLower, ".json") {
+			continue
+		}
+		if !strings.Contains(nameLower, lowerSID) && !strings.Contains(nameLower, shortSlug) {
+			continue
+		}
+		b, rErr := os.ReadFile(filepath.Join(reportsDir, e.Name()))
+		if rErr != nil {
+			continue
+		}
+		var payload struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal(b, &payload) == nil {
+			st := strings.ToUpper(strings.TrimSpace(payload.Status))
+			if st == "RESOLVED" || st == "CLOSED" || st == "DONE" {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func isStoryMarkdownIncomplete(repoPath, sid, content string) bool {
+	if hasUnresolvedStorySIROnDisk(repoPath, sid) {
+		return true
+	}
+	reviewsSec := extractMarkdownSection(content, "## 7. reviews", "## reviews")
+	if reviewsSec != "" && strings.Contains(strings.ToLower(reviewsSec), "_pending_") {
+		return true
+	}
+	dodSec := extractMarkdownSection(content, "## 5. definition of done", "## definition of done")
+	if dodSec != "" && strings.Contains(dodSec, "- [ ]") {
+		return true
+	}
+	return false
+}
+
 // IsStoryCompletedOnDisk returns true if storyID is marked DONE in .autopilot/ase-state.json,
-// docs/stories/*.story.md, child family docs/stories/*.story.md, or docs/stories/index.yml.
+// docs/stories/*.story.md, child family docs/stories/*.story.md, or docs/stories/index.yml,
+// and does not have pending reviews, unchecked DoD items, or unresolved story SIRs.
 func IsStoryCompletedOnDisk(repoPath, storyID string) bool {
 	sid := strings.ToUpper(strings.TrimSpace(storyID))
 	if repoPath == "" || !strings.HasPrefix(sid, "STORY-") {
+		return false
+	}
+	if hasUnresolvedStorySIROnDisk(repoPath, sid) {
 		return false
 	}
 
@@ -429,12 +522,16 @@ func IsStoryCompletedOnDisk(repoPath, storyID string) bool {
 					continue
 				}
 				content := string(data)
-				if strings.Contains(strings.ToUpper(content), sid) &&
-					(strings.Contains(content, "\nstatus: DONE\n") ||
+				if strings.Contains(strings.ToUpper(content), sid) {
+					if isStoryMarkdownIncomplete(repoPath, sid, content) {
+						return false
+					}
+					if strings.Contains(content, "\nstatus: DONE\n") ||
 						strings.Contains(content, "\nstatus: DONE\r\n") ||
 						strings.Contains(content, "\nstatus: \"DONE\"\n") ||
-						strings.Contains(content, "\nstatus: 'DONE'\n")) {
-					return true
+						strings.Contains(content, "\nstatus: 'DONE'\n") {
+						return true
+					}
 				}
 			}
 		}
@@ -469,7 +566,8 @@ func IsStoryCompletedOnDisk(repoPath, storyID string) bool {
 }
 
 // IsStoryExplicitlyInProgressOnDisk returns true if storyID is marked IN_PROGRESS or READY in
-// docs/stories/*.story.md, child family docs/stories/*.story.md, or docs/stories/index.yml.
+// docs/stories/*.story.md, child family docs/stories/*.story.md, or docs/stories/index.yml,
+// or if its story markdown has incomplete DoD/reviews or open SIRs.
 func IsStoryExplicitlyInProgressOnDisk(repoPath, storyID string) bool {
 	sid := strings.ToUpper(strings.TrimSpace(storyID))
 	if repoPath == "" || !strings.HasPrefix(sid, "STORY-") {
@@ -496,14 +594,16 @@ func IsStoryExplicitlyInProgressOnDisk(repoPath, storyID string) bool {
 					continue
 				}
 				content := string(data)
-				if strings.Contains(strings.ToUpper(content), sid) &&
-					(strings.Contains(content, "\nstatus: IN_PROGRESS") ||
+				if strings.Contains(strings.ToUpper(content), sid) {
+					if strings.Contains(content, "\nstatus: IN_PROGRESS") ||
 						strings.Contains(content, "\nstatus: \"IN_PROGRESS\"") ||
 						strings.Contains(content, "\nstatus: 'IN_PROGRESS'") ||
 						strings.Contains(content, "\nstatus: READY") ||
 						strings.Contains(content, "\nstatus: \"READY\"") ||
-						strings.Contains(content, "\nstatus: 'READY'")) {
-					return true
+						strings.Contains(content, "\nstatus: 'READY'") ||
+						isStoryMarkdownIncomplete(repoPath, sid, content) {
+						return true
+					}
 				}
 			}
 		}
@@ -667,7 +767,7 @@ func parseASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFl
 	}
 
 	isMainBranch := res.Branch == "" || res.Branch == "main" || res.Branch == "master"
-	canPruneCompletedStory := isMainBranch && len(res.NonMainSubmodules) == 0
+	canPruneCompletedStory := isMainBranch && len(res.NonMainSubmodules) == 0 && !res.HasActiveAgentASETurn
 
 	// 2. Inspect .autopilot/state.json (and auto-remediate stale state when story is DONE and repo is back on main)
 	stateFile := filepath.Join(repoPath, ".autopilot", "state.json")
@@ -693,8 +793,10 @@ func parseASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFl
 				if s.State != "" {
 					res.ASEState = s.State
 				}
-				res.ActiveStoryID = s.StoryID
-				if !staleIdlePhase {
+				if s.StoryID != "" {
+					res.ActiveStoryID = s.StoryID
+				}
+				if !staleIdlePhase && s.CurrentPhase != "" {
 					res.CurrentPhase = s.CurrentPhase
 				}
 			}
@@ -756,7 +858,7 @@ func parseASEStateWithOpts(repoPath string, autoRemediateTier1 bool, res *RepoFl
 				}
 				nonMainBranch := res.Branch != "" && res.Branch != "main" && res.Branch != "master" && res.Branch != "HEAD"
 				hasResumeFile := hasActiveScopedResumeFile(repoPath, storyID)
-				if nonMainBranch || len(res.NonMainSubmodules) > 0 || hasResumeFile {
+				if nonMainBranch || len(res.NonMainSubmodules) > 0 || hasResumeFile || IsStoryExplicitlyInProgressOnDisk(repoPath, storyID) || res.HasActiveAgentASETurn {
 					if res.ASEState == "IDLE" || res.ASEState == "FAILED_DIRTY" {
 						res.ASEState = "RUNNING"
 					}
@@ -1230,11 +1332,11 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 	}
 
 	selfPID := os.Getpid()
-	parentPID := os.Getppid()
+	nonMainBranch := res.Branch != "" && res.Branch != "main" && res.Branch != "master" && res.Branch != "HEAD" && !isAutomatedMaintenanceBranch(res.Branch)
 
 	for _, name := range entries {
 		pid, err := strconv.Atoi(name)
-		if err != nil || pid <= 1 || pid == selfPID || pid == parentPID {
+		if err != nil || pid <= 1 || pid == selfPID {
 			continue
 		}
 
@@ -1271,6 +1373,8 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 			if argConvID == "" {
 				argConvID = fdConvID
 			}
+			canBindFDStory := fdStoryID != "" && !IsStoryCompletedOnDisk(repoPath, fdStoryID) &&
+				(fdActiveASE || IsStoryExplicitlyInProgressOnDisk(repoPath, fdStoryID) || nonMainBranch || len(res.NonMainSubmodules) > 0)
 
 			isBetterCandidate := res.AgentTool == "" ||
 				(!res.HasActiveAgentASETurn && (fdActiveASE || strings.HasPrefix(strings.ToLower(toolName), "autopilot")))
@@ -1285,7 +1389,7 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 				if fdActiveASE {
 					res.HasActiveAgentASETurn = true
 				}
-				if fdStoryID != "" && res.ActiveStoryID == "" && !IsStoryCompletedOnDisk(repoPath, fdStoryID) {
+				if canBindFDStory && res.ActiveStoryID == "" {
 					res.ActiveStoryID = fdStoryID
 				}
 
@@ -1299,12 +1403,14 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 				} else {
 					res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
 				}
-			} else if fdActiveASE {
-				res.HasActiveAgentASETurn = true
+			} else if fdActiveASE || canBindFDStory {
+				if fdActiveASE {
+					res.HasActiveAgentASETurn = true
+				}
 				if argConvID != "" && res.ActiveConversationID == "" {
 					res.ActiveConversationID = argConvID
 				}
-				if fdStoryID != "" && res.ActiveStoryID == "" && !IsStoryCompletedOnDisk(repoPath, fdStoryID) {
+				if canBindFDStory && res.ActiveStoryID == "" {
 					res.ActiveStoryID = fdStoryID
 				}
 			}
@@ -1323,19 +1429,21 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 			}
 		}
 	}
+}
 
-	// If no running agent tool PID was found
-	if res.AgentTool == "" {
-		if res.LockDetails != "" {
-			res.ToolLiveness = "KILLED"
-			res.ASEState = "ORPHANED"
-			res.ExecutionProvenance = "COORDINATED_HARNESS_FAILED"
-		} else if res.WorktreeState == "DIRTY_MODIFIED" && res.ASEState == "IDLE" {
-			res.ASEState = "FAILED_DIRTY"
-			res.ToolLiveness = "TERMINATED"
-		} else if !res.IsClean && res.ASEState != "RUNNING" {
-			res.ToolLiveness = "TERMINATED"
-		}
+func applyNoAgentFallbackState(res *RepoFleetStatusResult) {
+	if res == nil || res.AgentTool != "" {
+		return
+	}
+	if res.LockDetails != "" {
+		res.ToolLiveness = "KILLED"
+		res.ASEState = "ORPHANED"
+		res.ExecutionProvenance = "COORDINATED_HARNESS_FAILED"
+	} else if res.WorktreeState == "DIRTY_MODIFIED" && res.ASEState == "IDLE" {
+		res.ASEState = "FAILED_DIRTY"
+		res.ToolLiveness = "TERMINATED"
+	} else if !res.IsClean && res.ASEState != "RUNNING" {
+		res.ToolLiveness = "TERMINATED"
 	}
 }
 
@@ -1425,7 +1533,7 @@ func hasNonEmptyJSONArray(raw json.RawMessage) bool {
 }
 
 func isTranscriptTurnInFlight(tail []byte, modTime time.Time, now time.Time) bool {
-	if modTime.IsZero() || now.Sub(modTime) > 15*time.Minute {
+	if modTime.IsZero() || now.Sub(modTime) > 45*time.Minute {
 		return false
 	}
 	lines := strings.Split(string(tail), "\n")
@@ -1435,16 +1543,26 @@ func isTranscriptTurnInFlight(tail []byte, modTime time.Time, now time.Time) boo
 			continue
 		}
 		var step struct {
-			Type      string          `json:"type"`
-			Status    string          `json:"status"`
-			ToolCalls json.RawMessage `json:"tool_calls"`
+			Type            string          `json:"type"`
+			Status          string          `json:"status"`
+			ToolCalls       json.RawMessage `json:"tool_calls"`
+			TruncatedFields []string        `json:"truncated_fields"`
 		}
 		if err := json.Unmarshal([]byte(line), &step); err != nil {
 			continue
 		}
+		hasTools := hasNonEmptyJSONArray(step.ToolCalls)
+		if !hasTools {
+			for _, tf := range step.TruncatedFields {
+				if strings.EqualFold(strings.TrimSpace(tf), "tool_calls") {
+					hasTools = true
+					break
+				}
+			}
+		}
 		if strings.EqualFold(step.Type, "PLANNER_RESPONSE") &&
 			strings.EqualFold(step.Status, "DONE") &&
-			!hasNonEmptyJSONArray(step.ToolCalls) {
+			!hasTools {
 			return false
 		}
 		return true
@@ -1497,9 +1615,8 @@ func inspectBrainTranscriptDir(brainDir string, now time.Time) (newestMod time.T
 		if modTime.After(newestMod) {
 			newestMod = modTime
 		}
-		if !hasActiveASETurn && (containsASEWorkflowMarker(string(head)) || containsASEWorkflowMarker(string(tail))) {
-			if isTranscriptTurnInFlight(tail, modTime, now) {
-				hasActiveASETurn = true
+		if containsASEWorkflowMarker(string(head)) || containsASEWorkflowMarker(string(tail)) {
+			if inferredStoryID == "" && !modTime.IsZero() && now.Sub(modTime) <= 2*time.Hour {
 				matches := transcriptBoundStoryRe.FindAllStringSubmatch(string(tail), -1)
 				if len(matches) == 0 {
 					matches = transcriptBoundStoryRe.FindAllStringSubmatch(string(head), -1)
@@ -1507,6 +1624,9 @@ func inspectBrainTranscriptDir(brainDir string, now time.Time) (newestMod time.T
 				if len(matches) > 0 {
 					inferredStoryID = strings.ToUpper(matches[len(matches)-1][1])
 				}
+			}
+			if !hasActiveASETurn && isTranscriptTurnInFlight(tail, modTime, now) {
+				hasActiveASETurn = true
 			}
 		}
 	}
@@ -1527,6 +1647,9 @@ func inspectOpenAgentPathsForBrainAndASE(openPaths []string, now time.Time) (con
 		}
 		brainDir := filepath.Join(appDataDir, "brain", candID)
 		modTime, activeASE, storyID := inspectBrainTranscriptDir(brainDir, now)
+		if storyID != "" && inferredStoryID == "" {
+			inferredStoryID = storyID
+		}
 		if activeASE {
 			hasActiveASETurn = true
 			if storyID != "" {
@@ -1696,7 +1819,7 @@ func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPa
 			continue
 		}
 		pid, err := strconv.Atoi(fields[0])
-		if err != nil || pid <= 1 || pid == selfPID || pid == parentPID {
+		if err != nil || pid <= 1 || pid == selfPID {
 			continue
 		}
 		etime := fields[2]
