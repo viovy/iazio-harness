@@ -852,16 +852,22 @@ func resolveSuperprojectRoot(dir, gitBin string) string {
 			return sp
 		}
 	}
-	parent := filepath.Dir(filepath.Clean(dir))
-	for parent != "" && parent != "/" && parent != "." {
-		if _, err := os.Stat(filepath.Join(parent, ".gitmodules")); err == nil {
-			return parent
+	// Only use .gitmodules ancestor walk if dir/.git is a gitlink file (submodule),
+	// avoiding false positives for standalone repos located in child/temporary directories.
+	gitPath := filepath.Join(dir, ".git")
+	gitEntry, err := os.Stat(gitPath)
+	if err == nil && !gitEntry.IsDir() {
+		parent := filepath.Dir(filepath.Clean(dir))
+		for parent != "" && parent != "/" && parent != "." {
+			if _, err := os.Stat(filepath.Join(parent, ".gitmodules")); err == nil {
+				return parent
+			}
+			newParent := filepath.Dir(parent)
+			if newParent == parent {
+				break
+			}
+			parent = newParent
 		}
-		newParent := filepath.Dir(parent)
-		if newParent == parent {
-			break
-		}
-		parent = newParent
 	}
 	return ""
 }
@@ -872,6 +878,19 @@ func countUnpushedCommits(dir, gitBin string) (int, error) {
 	}
 	if gitBin == "" {
 		gitBin = "git"
+	}
+	cmdRemote := procutil.Command(gitBin, "remote")
+	cmdRemote.Dir = dir
+	remoteOut, remoteErr := cmdRemote.Output()
+	if remoteErr != nil {
+		return 0, fmt.Errorf("git remote check failed in %s: %w", dir, remoteErr)
+	}
+	if strings.TrimSpace(string(remoteOut)) == "" {
+		if os.Getenv("IAZIO_REQUIRE_REMOTE") == "1" {
+			return 0, fmt.Errorf("no git remotes configured in %s", dir)
+		}
+		fmt.Fprintf(os.Stderr, "[prompt_runner] warning: unpushed commits check skipped: no git remotes configured in %s\n", dir)
+		return 0, nil
 	}
 	cmdUpstream := procutil.Command(gitBin, "rev-list", "--count", "@{u}..HEAD")
 	cmdUpstream.Dir = dir
@@ -894,7 +913,7 @@ func countUnpushedCommits(dir, gitBin string) (int, error) {
 			return c, nil
 		}
 	}
-	return 0, nil
+	return 0, fmt.Errorf("no upstream tracking ref or remote origin branch found in %s", dir)
 }
 
 func isStoryDoneAnywhere(workingDir, superprojectRoot, storyID string) bool {
@@ -1494,6 +1513,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	var storyTitle, storyPath string
 	postedStoryID := ""
 	seenTranscriptSteps := make(map[int]bool)
+	superprojectRoot := resolveSuperprojectRoot(opts.WorkingDir, gitBin)
 
 	if detectedConvID != "" {
 		_, _ = fmt.Fprintf(os.Stderr, "CONVERSATION_ID: %s\nACTIVE_CONVERSATION_ID: %s\n", detectedConvID, detectedConvID)
@@ -1668,9 +1688,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			if tmpLogPath != "" {
 				args = append(args, "--log-file", tmpLogPath)
 			}
-			spRoot := resolveSuperprojectRoot(opts.WorkingDir, gitBin)
-			if spRoot != "" && spRoot != opts.WorkingDir {
-				args = append(args, "--add-dir", spRoot)
+			if superprojectRoot != "" && superprojectRoot != opts.WorkingDir {
+				args = append(args, "--add-dir", superprojectRoot)
 			}
 		} else if storyID != "" && targetAgent == "autopilot" && strings.TrimSpace(turnPrompt) == "" {
 			args = []string{"story", "run", "--story", storyID}
@@ -2398,16 +2417,16 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 
 	nonEphemeralFinal := filterNonEphemeralModified(modified)
-	superprojectRoot := resolveSuperprojectRoot(opts.WorkingDir, gitBin)
 	finalStoryIncomplete := isStoryIncompleteAnywhere(opts.WorkingDir, superprojectRoot, detectedStoryID)
 	finalStoryDone := isStoryDoneAnywhere(opts.WorkingDir, superprojectRoot, detectedStoryID)
 	finalOnNonMainBranch, finalBranchName := isNonMainWorktreeBranch(opts.WorkingDir, gitBin)
 	finalExplicitASE := strings.Contains(opts.Prompt, "/autonomous-story-execution")
-	if (isMockAgy || isDirectAgy) && (isASEFlow || finalExplicitASE) && execStatus == "completed" {
-		unpushedWT, _ := countUnpushedCommits(opts.WorkingDir, gitBin)
+	if (isASEFlow || finalExplicitASE) && execStatus == "completed" {
+		unpushedWT, unpushedWTErr := countUnpushedCommits(opts.WorkingDir, gitBin)
 		var unpushedSuper int
+		var unpushedSuperErr error
 		if superprojectRoot != "" && superprojectRoot != opts.WorkingDir {
-			unpushedSuper, _ = countUnpushedCommits(superprojectRoot, gitBin)
+			unpushedSuper, unpushedSuperErr = countUnpushedCommits(superprojectRoot, gitBin)
 		}
 		if len(nonEphemeralFinal) > 0 {
 			execStatus = "failed"
@@ -2458,6 +2477,20 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			failureStage = "COMPLETION_GATE"
 			if waitErr == nil {
 				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: unmerged_feature_branch (worktree remains on branch %s; git-flow land not completed)", finalBranchName)
+			}
+		} else if finalExplicitASE && (unpushedWTErr != nil || unpushedSuperErr != nil) {
+			execStatus = "failed"
+			if exitCode == 0 {
+				exitCode = 1
+			}
+			failureCategory = "ASE_GATE_INCOMPLETE"
+			failureStage = "COMPLETION_GATE"
+			probeErr := unpushedWTErr
+			if probeErr == nil {
+				probeErr = unpushedSuperErr
+			}
+			if waitErr == nil {
+				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: unpushed_probe_failed (%v)", probeErr)
 			}
 		} else if finalExplicitASE && (unpushedWT > 0 || unpushedSuper > 0) {
 			execStatus = "failed"
