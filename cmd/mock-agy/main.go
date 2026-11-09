@@ -883,6 +883,39 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		time.Sleep(hangSleep)
 		return 0
 
+	case "sch_1569_fallback_new_conversation_resume":
+		// Reproduces sch-1569 / job-1570 (STORY-GOV-5206):
+		// 1. Rejects poisoned conversation 287e8a2b-1e95-4aa1-b2f9-9b151134c574 from stale job-1408 checkpoint.
+		// 2. On initial fallback_new_conversation run (conversationID == ""), creates 8d5d3c3d-1eb6-4517-a64b-df5b27cff909.
+		// 3. On auto-resume run, requires conversationID == "8d5d3c3d-1eb6-4517-a64b-df5b27cff909" (from job.ActiveConversationID).
+		if conversationID == "287e8a2b-1e95-4aa1-b2f9-9b151134c574" {
+			fmt.Fprintln(stderr, "[mock-agy] FATAL: poisoned conversation 287e8a2b-1e95-4aa1-b2f9-9b151134c574 from job-1408 leaked into job-1570")
+			return 2
+		}
+		targetConv := "8d5d3c3d-1eb6-4517-a64b-df5b27cff909"
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+			_ = os.MkdirAll(convDir, 0755)
+			_ = os.WriteFile(filepath.Join(convDir, targetConv+".db"), []byte("mock-db"), 0644)
+			logsDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain", targetConv, ".system_generated", "logs")
+			_ = os.MkdirAll(logsDir, 0755)
+			transcriptPath := filepath.Join(logsDir, "transcript.jsonl")
+			step := `{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":"Executing STORY-ROOT-45276 on fallback conversation"}` + "\n"
+			_ = os.WriteFile(transcriptPath, []byte(step), 0644)
+		}
+		if conversationID == "" {
+			fmt.Fprintf(stdout, "Created conversation %s\n", targetConv)
+			fmt.Fprintln(stdout, "[mock-agy] Initial fallback_new_conversation turn started")
+			return 0
+		}
+		if conversationID != targetConv {
+			fmt.Fprintf(stderr, "[mock-agy] unexpected resume conversation %q, want %q\n", conversationID, targetConv)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Resumed conversation %s\n", targetConv)
+		fmt.Fprintln(stdout, "[mock-agy] Resumed fallback conversation cleanly for job-1570")
+		return 0
+
 	default:
 		// Default simple execution
 		if conversationID != "" {

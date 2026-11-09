@@ -1097,11 +1097,14 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 	}
 	if resumeConvOverride != "" {
 		if isControlPlaneResume {
+			cpResumeID := job.ResumeConversationID
+			if cpResumeID == "" {
+				cpResumeID = job.ActiveConversationID
+			}
 			// For Control Plane resumes, the control plane job record is authoritative (Finding L1)
-			if (job.ResumeConversationID != "" && resumeConvOverride != job.ResumeConversationID) ||
-				(job.ActiveConversationID != "" && resumeConvOverride != job.ActiveConversationID) {
-				log.Printf("[harness] [job.resume.identity_mismatch] ignoring argv override %s, adhering to control plane resume identity %s", resumeConvOverride, job.ResumeConversationID)
-			} else if job.ResumeConversationID == "" && job.ActiveConversationID == "" {
+			if cpResumeID != "" && resumeConvOverride != cpResumeID {
+				log.Printf("[harness] [job.resume.identity_mismatch] ignoring argv override %s, adhering to control plane resume identity %s", resumeConvOverride, cpResumeID)
+			} else if cpResumeID == "" {
 				log.Printf("[harness] ignoring --resume-conversation=%s override for control plane resume with empty parent conversation", resumeConvOverride)
 			} else {
 				job.ResumeConversationID = resumeConvOverride
@@ -1290,6 +1293,9 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		if resumeConvID == "" && len(job.ConversationIDs) > 0 {
 			resumeConvID = job.ConversationIDs[0]
 		}
+	} else if job.ActiveConversationID != "" {
+		// In-place auto-resume of a fallback_new_conversation job after Attempt #1 already created and registered its fallback conversation.
+		resumeConvID = job.ActiveConversationID
 	}
 	if job.ResumeMode == "fallback_new_conversation" && job.ActiveConversationID == "" {
 		isPreflightFallback = true
@@ -1326,6 +1332,19 @@ func executeJob(ctx context.Context, api, jobID, worktree, docsHub string, overr
 		return fmt.Errorf("repolock: %w", lockErr)
 	}
 	defer lockHandle.Release()
+
+	// Immediately overwrite any stale checkpoint from a prior job on this worktree once the lock is held.
+	_ = checkpoint.Save(worktree, spool.DefaultDir(), checkpoint.State{
+		JobID:          job.ID,
+		ScheduleID:     job.ScheduleID,
+		Engine:         engineName,
+		WorktreePath:   worktree,
+		ConversationID: resumeConvID,
+		StoryID:        job.StoryID,
+		StepIndex:      0,
+		StartedAt:      time.Now().UTC().Format(time.RFC3339),
+		Status:         "RUNNING",
+	})
 
 	if attachToolPID <= 0 && lockHandle.Info().ToolPID > 0 && watchdog.IsProcessAlive(lockHandle.Info().ToolPID) {
 		attachToolPID = lockHandle.Info().ToolPID

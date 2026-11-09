@@ -1893,3 +1893,117 @@ func TestMockAgy_Scenario19b_TerminalPlannerResponseWithMCPChildSettles(t *testi
 	}
 }
 
+// Scenario 20 (STORY-GOV-5206): sch-1569 / job-1570 fallback_new_conversation + stale job-1408 checkpoint isolation + auto-resume with ActiveConversationID
+func TestMockAgy_Scenario20_StoryGov5206_Sch1569_FallbackNewConversationAutoResumeAndCheckpointIsolation(t *testing.T) {
+	buildMockAgy(t)
+	t.Setenv("MOCK_AGY_SCENARIO", "sch_1569_fallback_new_conversation_resume")
+
+	worktree := initTestGitWorktree(t)
+	_ = os.WriteFile(filepath.Join(worktree, "README.md"), []byte("# meta-repo\n"), 0o644)
+	_ = exec.Command("git", "-C", worktree, "add", "README.md").Run()
+	_ = exec.Command("git", "-C", worktree, "commit", "-m", "chore: initial").Run()
+
+	// Seed stale .iazio/execution-checkpoint.json from prior job-1408 with conversation 287e8a2b-1e95-4aa1-b2f9-9b151134c574
+	iazioDir := filepath.Join(worktree, ".iazio")
+	_ = os.MkdirAll(iazioDir, 0o755)
+	staleCP := `{"job_id":"job-1408","schedule_id":"sch-1407","conversation_id":"287e8a2b-1e95-4aa1-b2f9-9b151134c574","status":"FAILED"}`
+	_ = os.WriteFile(filepath.Join(iazioDir, "execution-checkpoint.json"), []byte(staleCP), 0o644)
+
+	var mu sync.Mutex
+	var activeConvID string
+	var postedChunks []string
+	var postedExitCode = -1
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/job-1570"):
+			_ = json.NewEncoder(w).Encode(controlplane.JobDetail{
+				ID:                   "job-1570",
+				ScheduleID:           "sch-1569",
+				ParentJobID:          "job-1098",
+				RootJobID:            "job-1098",
+				Prompt:               "deep review and fix in canonical AI",
+				Kind:                 "resume",
+				Engine:               "mock-agy",
+				Agent:                "mock-agy",
+				StoryID:              "STORY-ROOT-45276",
+				Status:               "RUNNING",
+				ResumeMode:           "fallback_new_conversation",
+				ResumeFallbackReason: "cross-engine resume not supported: parent used autopilot, final engine is agy",
+				ActiveConversationID: activeConvID,
+			})
+		case r.Method == http.MethodPost && (strings.HasSuffix(r.URL.Path, "/conversations") || strings.HasSuffix(r.URL.Path, "/conversation-lineage")):
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if cid, _ := body["conversation_id"].(string); strings.TrimSpace(cid) != "" {
+				activeConvID = strings.TrimSpace(cid)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chunks"):
+			var body struct {
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedChunks = append(postedChunks, body.Text)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+			var body struct {
+				ExitCode int `json:"exit_code"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedExitCode = body.ExitCode
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// 1. Attempt #1 of job-1570: starts with ActiveConversationID == "" and ResumeMode == "fallback_new_conversation".
+	// Must overwrite job-1408's checkpoint immediately and create fallback conversation 8d5d3c3d-1eb6-4517-a64b-df5b27cff909.
+	if err := executeJob(ctx, srv.URL, "job-1570", worktree, "", "resume", "", ""); err != nil {
+		t.Fatalf("Attempt #1 executeJob failed: %v", err)
+	}
+	mu.Lock()
+	gotConv := activeConvID
+	mu.Unlock()
+	if gotConv != "8d5d3c3d-1eb6-4517-a64b-df5b27cff909" {
+		t.Fatalf("expected Attempt #1 to register fallback conversation 8d5d3c3d-1eb6-4517-a64b-df5b27cff909, got %q", gotConv)
+	}
+
+	cpBytes, err := os.ReadFile(filepath.Join(iazioDir, "execution-checkpoint.json"))
+	if err != nil {
+		t.Fatalf("failed to read execution-checkpoint.json after Attempt #1: %v", err)
+	}
+	if strings.Contains(string(cpBytes), "job-1408") || strings.Contains(string(cpBytes), "287e8a2b-1e95-4aa1-b2f9-9b151134c574") {
+		t.Fatalf("expected stale job-1408 checkpoint to be overwritten by job-1570, got: %s", string(cpBytes))
+	}
+
+	// 2. Attempt #2 (watchdog auto-resume of job-1570): even if a stale caller passes --resume-conversation=287e8a2b-1e95-4aa1-b2f9-9b151134c574,
+	// executeJob must ignore the poisoned argv override and resume job.ActiveConversationID (8d5d3c3d-1eb6-4517-a64b-df5b27cff909) despite ResumeMode == "fallback_new_conversation".
+	mu.Lock()
+	postedExitCode = -1
+	postedChunks = nil
+	mu.Unlock()
+	if err := executeJob(ctx, srv.URL, "job-1570", worktree, "", "resume", "287e8a2b-1e95-4aa1-b2f9-9b151134c574"); err != nil {
+		t.Fatalf("Attempt #2 auto-resume executeJob failed: %v", err)
+	}
+
+	mu.Lock()
+	exit2 := postedExitCode
+	chunks2 := strings.Join(postedChunks, "\n")
+	mu.Unlock()
+	if exit2 != 0 {
+		t.Fatalf("expected Attempt #2 auto-resume exit code 0, got %d (chunks:\n%s)", exit2, chunks2)
+	}
+	if !strings.Contains(chunks2, "Resumed fallback conversation cleanly for job-1570") {
+		t.Fatalf("expected Attempt #2 to resume fallback conversation 8d5d3c3d-1eb6-4517-a64b-df5b27cff909, got chunks:\n%s", chunks2)
+	}
+}
+
+
