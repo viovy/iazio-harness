@@ -467,7 +467,20 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 		}
 
 		// If sibling iazio-agent and iazio-harvester repos are present in the workspace,
-		// compile them into ~/.local/bin and verify single-home LaunchAgent reconciliation + .next cleanup!
+		// compile them into ~/.local/bin and verify single-home LaunchAgent reconciliation + .next cleanup
+		// while strictly isolating host launchctl/systemctl/schtasks from temp-HOME test executions!
+		fakeSvcDir := t.TempDir()
+		svcMarker := filepath.Join(fakeSvcDir, "host-service-control.log")
+		if runtime.GOOS != "windows" {
+			for _, svcCmd := range []string{"launchctl", "systemctl", "schtasks"} {
+				script := fmt.Sprintf("#!/bin/sh\necho \"%s $*\" >> %q\nexit 0\n", svcCmd, svcMarker)
+				if err := os.WriteFile(filepath.Join(fakeSvcDir, svcCmd), []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		isolatedPath := fakeSvcDir + string(os.PathListSeparator) + os.Getenv("PATH")
+
 		agentMainDir := filepath.Clean(filepath.Join("..", "..", "iazio-agent", "cmd", "iazio-agent"))
 		harvesterMainDir := filepath.Clean(filepath.Join("..", "..", "iazio-harvester", "cmd", "iazio-harvester"))
 		if _, err := os.Stat(agentMainDir); err == nil {
@@ -494,7 +507,13 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 			_ = os.WriteFile(legacyHarnessUnit, []byte("[Unit]\nDescription=legacy harness\n"), 0o644)
 
 			cmdVer := exec.Command(agentBin, "version")
-			cmdVer.Env = append(os.Environ(), "HOME="+homeDir, "XPC_SERVICE_NAME=io.iazio.iazio-agent")
+			cmdVer.Env = append(os.Environ(),
+				"HOME="+homeDir,
+				"PATH="+isolatedPath,
+				"XPC_SERVICE_NAME=io.iazio.iazio-agent",
+				"IAZIO_TEST_MODE=1",
+				"IAZIO_DISABLE_SERVICE_CONTROL=1",
+			)
 			if out, err := cmdVer.CombinedOutput(); err != nil {
 				t.Fatalf("iazio-agent version failed: %v (%s)", err, string(out))
 			}
@@ -508,6 +527,12 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 				plistBytes, _ := os.ReadFile(plistPath)
 				if strings.Contains(string(plistBytes), ".iazio/bin/iazio-agent") {
 					t.Fatalf("expected LaunchAgent plist to be rewritten to ~/.local/bin/iazio-agent before shadow binary removal, got:\n%s", string(plistBytes))
+				}
+				for _, resLabel := range []string{"io.iazio.iazio-agent-watcher.plist", "io.iazio.iazio-agent-watchdog.plist"} {
+					resBytes, rErr := os.ReadFile(filepath.Join(launchAgentsDir, resLabel))
+					if rErr != nil || !strings.Contains(string(resBytes), agentBin) {
+						t.Fatalf("expected %s to reference %s, err=%v", resLabel, agentBin, rErr)
+					}
 				}
 			} else if runtime.GOOS == "linux" {
 				unitBytes, _ := os.ReadFile(filepath.Join(systemdUserDir, "iazio-agent.service"))
@@ -530,11 +555,22 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 			_ = os.WriteFile(legacyHarvester, []byte("#!/bin/sh\nexit 0\n"), 0o755)
 
 			cmdVer := exec.Command(harvesterBin, "once")
-			cmdVer.Env = append(os.Environ(), "HOME="+homeDir, "IAZIO_WORKSPACE_STORAGE="+homeDir, "XPC_SERVICE_NAME=io.iazio.iazio-harvester")
+			cmdVer.Env = append(os.Environ(),
+				"HOME="+homeDir,
+				"PATH="+isolatedPath,
+				"IAZIO_WORKSPACE_STORAGE="+homeDir,
+				"XPC_SERVICE_NAME=io.iazio.iazio-harvester",
+				"IAZIO_HARVESTER_NONINTERACTIVE=1",
+				"IAZIO_TEST_MODE=1",
+				"IAZIO_DISABLE_SERVICE_CONTROL=1",
+			)
 			_, _ = cmdVer.CombinedOutput()
 			if _, err := os.Stat(legacyHarvester); !os.IsNotExist(err) {
 				t.Fatalf("expected legacy shadow binary %s to be removed after single-home reconciliation", legacyHarvester)
 			}
+		}
+		if invokedBytes, err := os.ReadFile(svcMarker); err == nil && len(invokedBytes) > 0 {
+			t.Fatalf("expected E2E temp-HOME reconciliation to NEVER invoke host service control, got:\n%s", string(invokedBytes))
 		}
 	})
 
