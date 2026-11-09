@@ -146,3 +146,52 @@ func TestTwoStageGitUpdateRemediator_Step0Step1Step2CooldownAndResume(t *testing
 		t.Fatalf("expected Stage 2 to succeed and resume queue after cooldown, got %+v (agyCalls=%d resumed=%d)", r3, agyCalls, resumed)
 	}
 }
+
+func TestIsWorktreeIdleForGitUpdate_StoryScopingAndBranchDetection(t *testing.T) {
+	tempDir := t.TempDir()
+	initTestDiagnosticGitRepo(t, tempDir)
+
+	// Case 1: On main, no stories -> idle
+	if !IsWorktreeIdleForGitUpdate(tempDir, nil) {
+		t.Fatalf("expected clean main to be idle")
+	}
+
+	// Case 2: .autopilot/ase-state.json has an old completed story STORY-GOV-5169,
+	// but active branch is feat/gov-5209-... with IN_PROGRESS story.
+	dotAutopilot := filepath.Join(tempDir, ".autopilot")
+	if err := os.MkdirAll(dotAutopilot, 0755); err != nil {
+		t.Fatalf("mkdir .autopilot: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dotAutopilot, "ase-state.json"), []byte(`{"phase":"completed","status":"DONE","story_id":"STORY-GOV-5169"}`), 0644); err != nil {
+		t.Fatalf("write ase-state: %v", err)
+	}
+
+	// Create docs/stories directory with IN_PROGRESS story STORY-GOV-5209
+	storiesDir := filepath.Join(tempDir, "docs", "stories")
+	if err := os.MkdirAll(storiesDir, 0755); err != nil {
+		t.Fatalf("mkdir docs/stories: %v", err)
+	}
+	storyContent := "---\nid: STORY-GOV-5209\nstatus: IN_PROGRESS\n---\n"
+	if err := os.WriteFile(filepath.Join(storiesDir, "2026-11-09-gov-5209.story.md"), []byte(storyContent), 0644); err != nil {
+		t.Fatalf("write story file: %v", err)
+	}
+
+	// Switch git HEAD to feat/gov-5209-pointer-pr-rebase-rollback-and-fleet-healing
+	cmd := exec.Command("git", "-C", tempDir, "checkout", "-b", "feat/gov-5209-pointer-pr-rebase-rollback-and-fleet-healing")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git checkout -b failed: %v (%s)", err, string(out))
+	}
+
+	// Active story branch must prevent worktree from being idle
+	if IsWorktreeIdleForGitUpdate(tempDir, nil) {
+		t.Fatalf("expected active story branch with IN_PROGRESS story to NOT be idle, but got idle=true")
+	}
+
+	// With .session_story_id present, it must also NOT be idle
+	if err := os.WriteFile(filepath.Join(tempDir, ".session_story_id"), []byte("STORY-GOV-5209\n"), 0644); err != nil {
+		t.Fatalf("write .session_story_id: %v", err)
+	}
+	if IsWorktreeIdleForGitUpdate(tempDir, nil) {
+		t.Fatalf("expected worktree with active .session_story_id to NOT be idle, but got idle=true")
+	}
+}

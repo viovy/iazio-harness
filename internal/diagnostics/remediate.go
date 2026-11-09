@@ -552,7 +552,7 @@ func (r *RemediateResult) JSON() ([]byte, error) {
 }
 
 // IsWorktreeIdleForGitUpdate returns true when repolock is idle and there is no active IN_PROGRESS ASE story
-// in .autopilot/ase-state.json (or the referenced story in .session_story_id / ase-state.json is already DONE).
+// in .autopilot/ase-state.json, git HEAD story branch, or .session_story_id (or the referenced story is already DONE).
 func IsWorktreeIdleForGitUpdate(repoPath string, pidAliveFn func(int) bool) bool {
 	cleanPath := filepath.Clean(strings.TrimSpace(repoPath))
 	if cleanPath == "" {
@@ -578,7 +578,19 @@ func IsWorktreeIdleForGitUpdate(repoPath string, pidAliveFn func(int) bool) bool
 		return false
 	}
 
-	aseStateDone := false
+	// 1. Check in-flight story branch directly from git HEAD
+	if brOut, brErr := procutil.Command("git", "-C", cleanPath, "symbolic-ref", "--short", "-q", "HEAD").Output(); brErr == nil {
+		br := strings.TrimSpace(string(brOut))
+		if br != "" && br != "main" && br != "master" && br != "HEAD" {
+			if inferred := InferStoryIDFromBranch(br); inferred != "" {
+				if !IsStoryCompletedOnDisk(cleanPath, inferred) {
+					return false
+				}
+			}
+		}
+	}
+
+	// 2. Check active ASE state from .autopilot/ase-state.json
 	aseStatePath := filepath.Join(cleanPath, ".autopilot", "ase-state.json")
 	if b, err := os.ReadFile(aseStatePath); err == nil {
 		var as struct {
@@ -588,19 +600,15 @@ func IsWorktreeIdleForGitUpdate(repoPath string, pidAliveFn func(int) bool) bool
 		}
 		if json.Unmarshal(b, &as) == nil {
 			status := strings.ToUpper(strings.TrimSpace(as.Status))
-			phase := strings.ToLower(strings.TrimSpace(as.Phase))
-			if status == "DONE" || status == "COMPLETED" || phase == "completed" {
-				aseStateDone = true
-			} else if status == "IN_PROGRESS" || status == "RUNNING" {
-				if as.StoryID != "" && IsStoryCompletedOnDisk(cleanPath, as.StoryID) {
-					aseStateDone = true
-				} else {
+			if status == "IN_PROGRESS" || status == "RUNNING" {
+				if as.StoryID == "" || !IsStoryCompletedOnDisk(cleanPath, as.StoryID) {
 					return false
 				}
 			}
 		}
 	}
 
+	// 3. Check active state from .autopilot/state.json
 	statePath := filepath.Join(cleanPath, ".autopilot", "state.json")
 	if b, err := os.ReadFile(statePath); err == nil {
 		var s struct {
@@ -609,8 +617,25 @@ func IsWorktreeIdleForGitUpdate(repoPath string, pidAliveFn func(int) bool) bool
 		}
 		if json.Unmarshal(b, &s) == nil {
 			st := strings.ToUpper(strings.TrimSpace(s.State))
-			if (st == "IN_PROGRESS" || st == "RUNNING") && !aseStateDone {
+			if st == "IN_PROGRESS" || st == "RUNNING" {
 				if s.StoryID == "" || !IsStoryCompletedOnDisk(cleanPath, s.StoryID) {
+					return false
+				}
+			}
+		}
+	}
+
+	// 4. Check active session story from .session_story_id
+	sessionPath := filepath.Join(cleanPath, ".session_story_id")
+	if b, err := os.ReadFile(sessionPath); err == nil {
+		storyID := strings.TrimSpace(string(b))
+		if storyID != "" && !IsStoryCompletedOnDisk(cleanPath, storyID) {
+			if _, rErr := os.Stat(filepath.Join(cleanPath, "tmp", "ase-resume-"+storyID+".json")); rErr == nil {
+				return false
+			}
+			if brOut, brErr := procutil.Command("git", "-C", cleanPath, "symbolic-ref", "--short", "-q", "HEAD").Output(); brErr == nil {
+				br := strings.TrimSpace(string(brOut))
+				if br != "" && br != "main" && br != "master" && br != "HEAD" {
 					return false
 				}
 			}
