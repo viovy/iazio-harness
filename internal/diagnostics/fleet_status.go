@@ -1101,7 +1101,7 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 				}
 			}
 			res.ExecutionProvenance = "NONE"
-		} else if !storyCompleted && (explicitIdle || !hasRootSessionFile) {
+		} else if !storyCompleted && (explicitIdle || (!hasRootSessionFile && (res.CurrentPhase == "ADHOC_ASE" || nonMainBranch || len(res.NonMainSubmodules) > 0))) {
 			if res.CurrentPhase == "ADHOC_ASE" {
 				res.CurrentPhase = ""
 			}
@@ -1139,7 +1139,7 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 
 	// If .session_story_id set ActiveStoryID on main, but there is no non-main branch, no locks,
 	// no scoped resume file, and no live agent tool in this repo, the session story file is stale.
-	if res.ActiveStoryID != "" && res.ASEState != "RUNNING" && !nonMainBranch &&
+	if res.ActiveStoryID != "" && res.ASEState != "RUNNING" && res.ASEState != "IN_PROGRESS" && !nonMainBranch &&
 		len(res.NonMainSubmodules) == 0 && res.LockDetails == "" && !hasScopedResume && res.ToolLiveness != "LIVE" && !res.HasActiveAgentASETurn {
 		if autoRemediateTier1 {
 			if changed, action := cleanOrRestoreSessionStoryFile(repoPath, res.ActiveStoryID); changed {
