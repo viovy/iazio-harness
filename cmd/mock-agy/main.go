@@ -922,6 +922,59 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "[mock-agy] Resumed fallback conversation cleanly for job-1570")
 		return 0
 
+	case "pc1_meta_repo_04_alternates_rebase_and_adhoc_ase_brain_flow":
+		// Reproduces STORY-IAZIO-0201 (D1-D5):
+		// Phase "in_flight_phase0": writes a realistic agy brain transcript.jsonl with JSON-escaped Windows
+		// workspace path ("C:\\\\...\\\\meta-repo-04\\\\AGENTS.md") and an active PLANNER_RESPONSE tool_call
+		// before .session_story_id or story branch exists.
+		// Phase "complete_story": marks STORY-IAZIO-0201 DONE with full DoD/Reviews, commits it on main,
+		// and appends a terminal PLANNER_RESPONSE without tool_calls.
+		cid := conversationID
+		if cid == "" {
+			cid = "1f2e5efc-e041-4c89-b25a-fe32389d66cd"
+		}
+		brainRoot := strings.TrimSpace(os.Getenv("IAZIO_BRAIN_DIR"))
+		if brainRoot == "" {
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				brainRoot = filepath.Join(home, ".gemini", "antigravity-cli", "brain")
+			}
+		}
+		repoPath := strings.TrimSpace(os.Getenv("MOCK_AGY_REPO_PATH"))
+		if repoPath == "" {
+			if wd, err := os.Getwd(); err == nil {
+				repoPath = wd
+			}
+		}
+		logsDir := filepath.Join(brainRoot, cid, ".system_generated", "logs")
+		_ = os.MkdirAll(logsDir, 0o755)
+		transcriptPath := filepath.Join(logsDir, "transcript.jsonl")
+
+		escapedAgentsPath := strings.ReplaceAll(filepath.Join(repoPath, "AGENTS.md"), `\`, `\\`)
+		step0 := `{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>/autonomous-story-execution deep review and fix reason why this repo reports in iazio-web \"Detected In-Flight Story: STORY-GOV-3404\" and 0 adhoc ASE.</USER_REQUEST>"}` + "\n"
+		step1 := fmt.Sprintf(`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`, escapedAgentsPath) + "\n"
+
+		phase := strings.TrimSpace(os.Getenv("MOCK_AGY_PHASE"))
+		if phase == "complete_story" {
+			storiesDir := filepath.Join(repoPath, "docs", "stories")
+			_ = os.MkdirAll(storiesDir, 0o755)
+			storyPath := filepath.Join(storiesDir, "2026-11-09-iazio-0201-windows-wsl-alternates-rebase-and-adhoc-ase-detection.story.md")
+			storyMarkdown := "---\nid: STORY-IAZIO-0201\ntitle: Fix Windows/WSL Alternates, Stranded Maintenance Rebase, and Ad-Hoc ASE Detection\nstatus: DONE\n---\n## 5. Definition of Done\n- [x] All D1-D5 discoveries remediated and verified\n## 7. Reviews\n| Tool | Status |\n|---|---|\n| tdd | PASS |\n"
+			_ = os.WriteFile(storyPath, []byte(storyMarkdown), 0o644)
+			_ = os.WriteFile(filepath.Join(repoPath, ".session_story_id"), []byte("STORY-IAZIO-0201\n"), 0o644)
+			_ = procutil.Command("git", "-C", repoPath, "add", "docs").Run()
+			_ = procutil.Command("git", "-C", repoPath, "commit", "-m", "fix(iazio-0201): remediate D1-D5 discoveries [STORY-IAZIO-0201]").Run()
+
+			step2 := `{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","content":"## CRAFT Closeout\nAll D1-D5 discoveries fixed and verified for STORY-IAZIO-0201."}` + "\n"
+			_ = os.WriteFile(transcriptPath, []byte(step0+step1+step2), 0o644)
+			fmt.Fprintf(stdout, "[mock-agy] Completed STORY-IAZIO-0201 and wrote terminal PLANNER_RESPONSE for %s\n", cid)
+			return 0
+		}
+
+		_ = os.WriteFile(transcriptPath, []byte(step0+step1), 0o644)
+		fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+		fmt.Fprintf(stdout, "[mock-agy] Active Phase 0 brain transcript written for conversation %s\n", cid)
+		return 0
+
 	default:
 		// Default simple execution
 		if conversationID != "" {

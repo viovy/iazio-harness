@@ -14,20 +14,30 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/viovy/iazio-harness/internal/diagnostics"
 )
 
 // buildCompiledMockAgy builds the canonical mock-agy from cmd/mock-agy for full CLI argument fidelity
 func buildCompiledMockAgy(t *testing.T) string {
 	t.Helper()
 	tempDir := t.TempDir()
-	binPath := filepath.Join(tempDir, "mock-agy")
-	agyPath := filepath.Join(tempDir, "agy")
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	binPath := filepath.Join(tempDir, "mock-agy"+ext)
+	agyPath := filepath.Join(tempDir, "agy"+ext)
 
 	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", binPath, "../cmd/mock-agy")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to compile mock-agy: %v\noutput: %s", err, string(out))
 	}
-	_ = os.Symlink(binPath, agyPath)
+	if err := os.Symlink(binPath, agyPath); err != nil {
+		if b, rErr := os.ReadFile(binPath); rErr == nil {
+			_ = os.WriteFile(agyPath, b, 0o755)
+		}
+	}
 	t.Setenv("PATH", tempDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return binPath
 }
@@ -753,4 +763,144 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 			t.Fatalf("expected at least 2 harvested conversation attachments, got %d", len(harvestedConvs))
 		}
 	})
+}
+
+// TestE2E_Iazio0201_WindowsWSLAlternates_StrandedRebase_And_AdhocASEBrainDiscovery verifies end-to-end
+// with compiled mock-agy that all discoveries (D1-D5) from STORY-IAZIO-0201 are remediated:
+//  1. Cross-OS /mnt/c/... .git/objects/info/alternates is rewritten to portable relative "../../../meta-repo/.git/objects".
+//  2. Stranded chore/governance-pointers-* rebase in .git/rebase-merge is automatically aborted, restoring clean main
+//     and never fabricating "Detected In-Flight Story: STORY-GOV-3404" from historical review files.
+//  3. Active mock-agy /autonomous-story-execution turn writing a brain transcript with JSON-escaped Windows paths
+//     is detected as ASEState="RUNNING", ExecutionProvenance="INDEPENDENT_USER_SESSION", ToolLiveness="LIVE",
+//     and AgentTool="agy" before .session_story_id exists, while sibling prefix repo "meta-repo" remains IDLE.
+//  4. Once mock-agy completes STORY-IAZIO-0201 and writes a terminal PLANNER_RESPONSE without tool_calls,
+//     the repository transitions cleanly back to IDLE / clean.
+func TestE2E_Iazio0201_WindowsWSLAlternates_StrandedRebase_And_AdhocASEBrainDiscovery(t *testing.T) {
+	mockAgy := buildCompiledMockAgy(t)
+	baseWork := t.TempDir()
+	refRepo := filepath.Join(baseWork, "meta-repo")
+	slotRepo := filepath.Join(baseWork, "meta-repo-04")
+	_ = os.MkdirAll(refRepo, 0o755)
+	_ = os.MkdirAll(slotRepo, 0o755)
+
+	for _, r := range []string{refRepo, slotRepo} {
+		_ = exec.Command("git", "init", "-b", "main", r).Run()
+		_ = exec.Command("git", "-C", r, "config", "user.email", "e2e@iazio.local").Run()
+		_ = exec.Command("git", "-C", r, "config", "user.name", "Iazio E2E").Run()
+		_ = os.WriteFile(filepath.Join(r, ".gitignore"), []byte(".session_story_id\n.autopilot/\n"), 0o644)
+		_ = os.WriteFile(filepath.Join(r, "AGENTS.md"), []byte("# Agent Execution Router\n"), 0o644)
+		_ = os.WriteFile(filepath.Join(r, "README.md"), []byte("main-v1\n"), 0o644)
+		reviewsDir := filepath.Join(r, "docs", "reviews")
+		_ = os.MkdirAll(reviewsDir, 0o755)
+		_ = os.WriteFile(
+			filepath.Join(reviewsDir, "2026-10-15-review-v0-V2-52a3f2-gov-3404-vigo-k8s-fleet-enterprise-architecture-alignment.md"),
+			[]byte("# Historical Review STORY-GOV-3404\n"),
+			0o644,
+		)
+		_ = exec.Command("git", "-C", r, "add", ".").Run()
+		_ = exec.Command("git", "-C", r, "commit", "-m", "init main").Run()
+	}
+
+	// Seed D1: cross-OS WSL /mnt/c/... alternates file in meta-repo-04
+	altFile := filepath.Join(slotRepo, ".git", "objects", "info", "alternates")
+	_ = os.MkdirAll(filepath.Dir(altFile), 0o755)
+	_ = os.WriteFile(altFile, []byte("/mnt/c/work/meta-repo/.git/objects\n"), 0o644)
+
+	// Seed D2 & D3: conflicted rebase on chore/governance-pointers-20261109-171414
+	_ = exec.Command("git", "-C", slotRepo, "checkout", "-b", "chore/governance-pointers-20261109-171414").Run()
+	_ = os.WriteFile(filepath.Join(slotRepo, "README.md"), []byte("pointers-conflict\n"), 0o644)
+	storiesDir := filepath.Join(slotRepo, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0o755)
+	_ = os.WriteFile(
+		filepath.Join(storiesDir, "2026-11-09-governance-pointers-20261109-171414.story.md"),
+		[]byte("---\nid: STORY-GOV-9999\nstatus: DONE\n---\n"),
+		0o644,
+	)
+	_ = exec.Command("git", "-C", slotRepo, "add", ".").Run()
+	_ = exec.Command("git", "-C", slotRepo, "commit", "-m", "chore: governance pointers").Run()
+
+	_ = exec.Command("git", "-C", slotRepo, "checkout", "main").Run()
+	_ = os.WriteFile(filepath.Join(slotRepo, "README.md"), []byte("main-v2\n"), 0o644)
+	_ = exec.Command("git", "-C", slotRepo, "add", ".").Run()
+	_ = exec.Command("git", "-C", slotRepo, "commit", "-m", "advance main").Run()
+
+	_ = exec.Command("git", "-C", slotRepo, "checkout", "chore/governance-pointers-20261109-171414").Run()
+	_ = exec.Command("git", "-C", slotRepo, "rebase", "main").Run()
+
+	brainRoot := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainRoot)
+
+	// Step 1: Verify InspectRepoFleetStatus heals D1 alternates + D2 stranded rebase and does NOT report STORY-GOV-3404 (D3)
+	stHealed, err := diagnostics.InspectRepoFleetStatus(context.Background(), slotRepo)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus(slotRepo) failed: %v", err)
+	}
+	altBytes, err := os.ReadFile(altFile)
+	if err != nil {
+		t.Fatalf("read alternates: %v", err)
+	}
+	if strings.TrimSpace(string(altBytes)) != "../../../meta-repo/.git/objects" {
+		t.Fatalf("expected portable relative alternates ../../../meta-repo/.git/objects, got %q", strings.TrimSpace(string(altBytes)))
+	}
+	if stHealed.Branch != "main" || !stHealed.IsClean || stHealed.ActiveStoryID != "" {
+		t.Fatalf("expected clean main with empty ActiveStoryID after stranded rebase heal, got branch=%q clean=%v story=%q state=%q",
+			stHealed.Branch, stHealed.IsClean, stHealed.ActiveStoryID, stHealed.ASEState)
+	}
+
+	// Step 2: Run compiled mock-agy in Phase 0 ("in_flight_phase0") to emit active brain transcript
+	convID := "1f2e5efc-e041-4c89-b25a-fe32389d66cd"
+	cmdPhase0 := exec.Command(mockAgy, "--conversation="+convID, "--print", "/autonomous-story-execution deep review")
+	cmdPhase0.Dir = slotRepo
+	cmdPhase0.Env = append(os.Environ(),
+		"IAZIO_BRAIN_DIR="+brainRoot,
+		"MOCK_AGY_SCENARIO=pc1_meta_repo_04_alternates_rebase_and_adhoc_ase_brain_flow",
+		"MOCK_AGY_PHASE=in_flight_phase0",
+		"MOCK_AGY_REPO_PATH="+slotRepo,
+	)
+	if out, err := cmdPhase0.CombinedOutput(); err != nil {
+		t.Fatalf("mock-agy in_flight_phase0 failed: %v\noutput: %s", err, string(out))
+	}
+
+	stActive, err := diagnostics.InspectRepoFleetStatus(context.Background(), slotRepo)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus(slotRepo active brain ASE): %v", err)
+	}
+	if stActive.ASEState != "RUNNING" ||
+		stActive.CurrentPhase != "ADHOC_ASE" ||
+		stActive.ExecutionProvenance != "INDEPENDENT_USER_SESSION" ||
+		stActive.ToolLiveness != "LIVE" ||
+		stActive.AgentTool != "agy" ||
+		stActive.ActiveConversationID != convID {
+		t.Fatalf("expected active ad-hoc ASE detection for slotRepo, got %+v", stActive)
+	}
+
+	// Verify sibling prefix repository "meta-repo" does NOT falsely match "meta-repo-04"
+	stSibling, err := diagnostics.InspectRepoFleetStatus(context.Background(), refRepo)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus(refRepo): %v", err)
+	}
+	if stSibling.ASEState != "IDLE" || stSibling.ExecutionProvenance == "INDEPENDENT_USER_SESSION" {
+		t.Fatalf("expected sibling prefix repo meta-repo to remain IDLE, got %+v", stSibling)
+	}
+
+	// Step 3: Run compiled mock-agy in Phase 5 ("complete_story") to mark STORY-IAZIO-0201 DONE and write terminal PLANNER_RESPONSE
+	cmdComplete := exec.Command(mockAgy, "--conversation="+convID, "--print", "/autonomous-story-execution finish STORY-IAZIO-0201")
+	cmdComplete.Dir = slotRepo
+	cmdComplete.Env = append(os.Environ(),
+		"IAZIO_BRAIN_DIR="+brainRoot,
+		"MOCK_AGY_SCENARIO=pc1_meta_repo_04_alternates_rebase_and_adhoc_ase_brain_flow",
+		"MOCK_AGY_PHASE=complete_story",
+		"MOCK_AGY_REPO_PATH="+slotRepo,
+	)
+	if out, err := cmdComplete.CombinedOutput(); err != nil {
+		t.Fatalf("mock-agy complete_story failed: %v\noutput: %s", err, string(out))
+	}
+
+	stDone, err := diagnostics.InspectRepoFleetStatus(context.Background(), slotRepo)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus(slotRepo after completion): %v", err)
+	}
+	if stDone.ASEState != "IDLE" || stDone.ExecutionProvenance != "NONE" || !stDone.IsClean || stDone.ActiveStoryID != "" {
+		t.Fatalf("expected slotRepo to transition cleanly back to IDLE/NONE/Clean after story completion, got %+v", stDone)
+	}
 }

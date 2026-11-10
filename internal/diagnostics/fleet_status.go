@@ -116,8 +116,11 @@ func InspectRepoFleetStatusWithOptions(ctx context.Context, repoPath string, opt
 		CheckedAt:           time.Now().UTC().Format(time.RFC3339),
 	}
 
-	// 0. Check git lock sentinels (and prune abandoned >5m .lock files)
-	inspectGitLockSentinels(cleanPath, opts.AutoRemediateTier1, res)
+	// 0a. Normalize cross-OS WSL/Windows git object alternates to portable relative paths before git status runs
+	normalizeGitAlternatesPaths(cleanPath, opts.AutoRemediateTier1 || opts.AutoRemediateSafe, res)
+
+	// 0b. Check git lock sentinels (prune abandoned >5m .lock files and abort stranded maintenance/completed rebases)
+	inspectGitLockSentinels(cleanPath, opts.AutoRemediateTier1 || opts.AutoRemediateSafe, res)
 
 	// 1. Git Status Porcelain v2 & Branch
 	cmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "status", "--porcelain=v2", "--branch")
@@ -245,11 +248,11 @@ func hasOnlyRemediableMainNoise(res *RepoFleetStatusResult) bool {
 	return true
 }
 
-func inspectGitLockSentinels(repoPath string, autoPruneStale bool, res *RepoFleetStatusResult) {
+func resolveRepoGitDir(repoPath string) string {
 	gitDir := filepath.Join(repoPath, ".git")
 	fi, err := os.Stat(gitDir)
 	if err != nil {
-		return
+		return ""
 	}
 	if !fi.IsDir() {
 		if b, rErr := os.ReadFile(gitDir); rErr == nil {
@@ -262,6 +265,234 @@ func inspectGitLockSentinels(repoPath string, autoPruneStale bool, res *RepoFlee
 				gitDir = target
 			}
 		}
+	}
+	return filepath.Clean(gitDir)
+}
+
+// NormalizeGitAlternatesFile rewrites cross-OS WSL (/mnt/<drive>/...) or non-portable absolute paths
+// in a .git/objects/info/alternates file into portable slash-separated relative paths when the target
+// objects directory exists on disk.
+func NormalizeGitAlternatesFile(repoPath, altFile string) (bool, error) {
+	raw, err := os.ReadFile(altFile)
+	if err != nil {
+		return false, err
+	}
+	objectsDir := filepath.Clean(filepath.Dir(filepath.Dir(altFile)))
+	lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
+	changed := false
+	outLines := make([]string, 0, len(lines))
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			outLines = append(outLines, trimmed)
+			continue
+		}
+		// Already a portable relative path that resolves on disk?
+		if !strings.HasPrefix(trimmed, "/") && !strings.HasPrefix(trimmed, `\`) && !(len(trimmed) >= 2 && trimmed[1] == ':') {
+			cand := filepath.Clean(filepath.Join(objectsDir, filepath.FromSlash(trimmed)))
+			if fi, stErr := os.Stat(cand); stErr == nil && fi.IsDir() {
+				normRel := filepath.ToSlash(trimmed)
+				if normRel != trimmed {
+					changed = true
+				}
+				outLines = append(outLines, normRel)
+				continue
+			}
+		}
+
+		targetDir := resolveAlternateObjectsTarget(repoPath, objectsDir, trimmed)
+		if targetDir != "" {
+			if rel, relErr := filepath.Rel(objectsDir, targetDir); relErr == nil && rel != "" && !strings.HasPrefix(rel, "/") {
+				relSlash := filepath.ToSlash(rel)
+				if relSlash != trimmed {
+					changed = true
+				}
+				outLines = append(outLines, relSlash)
+				continue
+			}
+		}
+		outLines = append(outLines, trimmed)
+	}
+
+	if !changed {
+		return false, nil
+	}
+	newContent := strings.TrimRight(strings.Join(outLines, "\n"), "\n") + "\n"
+	if err := os.WriteFile(altFile, []byte(newContent), 0o644); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func resolveAlternateObjectsTarget(repoPath, objectsDir, rawAlt string) string {
+	slash := strings.ReplaceAll(strings.TrimSpace(rawAlt), `\`, `/`)
+	var candidates []string
+
+	// 1. Direct path as written
+	candidates = append(candidates, filepath.FromSlash(slash))
+
+	// 2. WSL /mnt/<drive>/<rest> <-> Windows <Drive>:\<rest>
+	if strings.HasPrefix(strings.ToLower(slash), "/mnt/") && len(slash) > 6 && slash[6] == '/' {
+		drive := strings.ToUpper(slash[5:6])
+		rest := slash[7:]
+		if runtime.GOOS == "windows" {
+			candidates = append([]string{drive + `:\` + strings.ReplaceAll(rest, "/", `\`)}, candidates...)
+		} else {
+			candidates = append(candidates, drive+`:/`+rest)
+		}
+	} else if len(slash) >= 3 && slash[1] == ':' && slash[2] == '/' {
+		drive := strings.ToLower(slash[0:1])
+		rest := slash[3:]
+		candidates = append([]string{"/mnt/" + drive + "/" + rest}, candidates...)
+	}
+
+	// 3. Sibling repository resolution relative to filepath.Dir(repoPath) (checked first so co-located reference repos win):
+	// e.g. /mnt/c/work/meta-repo/.git/objects or /mnt/c/work/meta-repo/.git/modules/foo/objects
+	// when repoPath is <parent>/meta-repo-04 and <parent>/meta-repo/.git/... exists.
+	if repoPath != "" {
+		parentDir := filepath.Dir(filepath.Clean(repoPath))
+		if idx := strings.Index(slash, "/.git/"); idx > 0 {
+			prefix := slash[:idx]
+			gitSuffix := slash[idx+1:] // ".git/objects" or ".git/modules/..."
+			siblingName := filepath.Base(filepath.FromSlash(prefix))
+			if siblingName != "" && siblingName != "." && siblingName != "/" {
+				candidates = append([]string{filepath.Join(parentDir, siblingName, filepath.FromSlash(gitSuffix))}, candidates...)
+			}
+		}
+	}
+
+	for _, cand := range candidates {
+		cleanCand := filepath.Clean(cand)
+		if fi, err := os.Stat(cleanCand); err == nil && fi.IsDir() {
+			return cleanCand
+		}
+	}
+	return ""
+}
+
+func normalizeGitAlternatesPaths(repoPath string, autoRemediate bool, res *RepoFleetStatusResult) {
+	if !autoRemediate || strings.TrimSpace(repoPath) == "" {
+		return
+	}
+	gitDir := resolveRepoGitDir(repoPath)
+	if gitDir == "" {
+		return
+	}
+	var altFiles []string
+	rootAlt := filepath.Join(gitDir, "objects", "info", "alternates")
+	if _, err := os.Stat(rootAlt); err == nil {
+		altFiles = append(altFiles, rootAlt)
+	}
+	for _, pattern := range []string{
+		filepath.Join(gitDir, "modules", "*", "objects", "info", "alternates"),
+		filepath.Join(gitDir, "modules", "*", "*", "objects", "info", "alternates"),
+	} {
+		if matches, err := filepath.Glob(pattern); err == nil {
+			altFiles = append(altFiles, matches...)
+		}
+	}
+	normalizedCount := 0
+	for _, f := range altFiles {
+		if ok, err := NormalizeGitAlternatesFile(repoPath, f); err == nil && ok {
+			normalizedCount++
+		}
+	}
+	if normalizedCount > 0 && res != nil {
+		res.RemediationApplied = true
+		res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("normalized %d git object alternates file(s) to portable relative paths", normalizedCount))
+	}
+}
+
+func readRebaseHeadBranch(sentinelPath string) (branch string, latestMod time.Time) {
+	fi, err := os.Stat(sentinelPath)
+	if err != nil {
+		return "", time.Time{}
+	}
+	latestMod = fi.ModTime()
+	for _, name := range []string{"head-name", "done", "git-rebase-todo", "stopped-sha", "orig-head"} {
+		p := filepath.Join(sentinelPath, name)
+		if sfi, sErr := os.Stat(p); sErr == nil && sfi.ModTime().After(latestMod) {
+			latestMod = sfi.ModTime()
+		}
+	}
+	if b, rErr := os.ReadFile(filepath.Join(sentinelPath, "head-name")); rErr == nil {
+		raw := strings.TrimSpace(string(b))
+		raw = strings.TrimPrefix(raw, "refs/heads/")
+		branch = raw
+	}
+	return branch, latestMod
+}
+
+func shouldAutoAbortStrandedRebase(repoPath, sentinelPath string) (string, bool) {
+	if lockInfo, err := repolock.Read(repoPath); err == nil && lockInfo.PID > 0 && isPIDAlive(lockInfo.PID) {
+		return "", false
+	}
+	if _, err := os.Stat(filepath.Join(repoPath, ".autopilot", "lock")); err == nil {
+		return "", false
+	}
+	if _, err := os.Stat(filepath.Join(repoPath, ".ase", "active.lock")); err == nil {
+		return "", false
+	}
+	branch, modTime := readRebaseHeadBranch(sentinelPath)
+	if branch == "" {
+		return "", false
+	}
+	age := time.Since(modTime)
+	_, hasIndexLock := os.Stat(filepath.Join(filepath.Dir(sentinelPath), "index.lock"))
+	_, hasStoppedSHA := os.Stat(filepath.Join(sentinelPath, "stopped-sha"))
+	conflictHalted := hasStoppedSHA == nil && os.IsNotExist(hasIndexLock)
+	if isAutomatedMaintenanceBranch(branch) && (age > 2*time.Minute || conflictHalted) {
+		return branch, true
+	}
+	if inferred := InferStoryIDFromBranch(branch); inferred != "" && IsStoryCompletedOnDisk(repoPath, inferred) && (age > 5*time.Minute || conflictHalted) {
+		return branch, true
+	}
+	return "", false
+}
+
+func abortStrandedRebaseAndCheckoutMain(repoPath, sentinelPath, rebaseBranch string, res *RepoFleetStatusResult) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	abortCmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "rebase", "--abort")
+	if abortCmd.Run() != nil {
+		_ = os.RemoveAll(sentinelPath)
+		_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "reset", "--hard", "HEAD").Run()
+	}
+	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "checkout", "-f", "main").Run()
+
+	pullCmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "pull", "--ff-only", "--no-recurse-submodules", "origin", "main")
+	pullCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if pullCmd.Run() != nil && isAutomatedMaintenanceBranch(rebaseBranch) {
+		fetchCmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "fetch", "origin", "main")
+		fetchCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		if fetchCmd.Run() == nil {
+			_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "reset", "--hard", "origin/main").Run()
+		}
+	}
+	if isAutomatedMaintenanceBranch(rebaseBranch) {
+		_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "branch", "-D", rebaseBranch).Run()
+		if sirs, gErr := filepath.Glob(filepath.Join(repoPath, "tmp", "reports", "intervention-git-update-sir-*.json")); gErr == nil {
+			for _, sir := range sirs {
+				_ = os.Remove(sir)
+			}
+		}
+	}
+	if _, err := os.Stat(sentinelPath); os.IsNotExist(err) {
+		if res != nil {
+			res.RemediationApplied = true
+			res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("aborted stranded rebase on %s and checked out main", rebaseBranch))
+		}
+		return true
+	}
+	return false
+}
+
+func inspectGitLockSentinels(repoPath string, autoPruneStale bool, res *RepoFleetStatusResult) {
+	gitDir := resolveRepoGitDir(repoPath)
+	if gitDir == "" {
+		return
 	}
 	sentinels := []string{
 		filepath.Join(gitDir, "index.lock"),
@@ -281,6 +512,13 @@ func inspectGitLockSentinels(repoPath string, autoPruneStale bool, res *RepoFlee
 					res.RemediationApplied = true
 					res.RemediationActions = append(res.RemediationActions, fmt.Sprintf("removed stale git lock %s", base))
 					continue
+				}
+			}
+			if autoPruneStale && (base == "rebase-merge" || base == "rebase-apply") {
+				if rebaseBranch, ok := shouldAutoAbortStrandedRebase(repoPath, s); ok {
+					if abortStrandedRebaseAndCheckoutMain(repoPath, s, rebaseBranch, res) {
+						continue
+					}
 				}
 			}
 			res.HasActiveGitLock = true
@@ -1090,11 +1328,12 @@ func autoRemediateCompletedOrMaintenanceBranch(ctx context.Context, cleanPath st
 	if res == nil || res.HasActiveGitLock || res.LockDetails != "" || hasActiveSession {
 		return false
 	}
-	if len(res.ModifiedFiles) > 0 || len(res.DirtySubmodules) > 0 {
+	isMaint := isAutomatedMaintenanceBranch(res.Branch)
+	if !isMaint && (len(res.ModifiedFiles) > 0 || len(res.DirtySubmodules) > 0 || len(res.NonMainSubmodules) > 0 || len(res.SubmoduleDrift) > 0) {
 		return false
 	}
 	inferredStory := InferStoryIDFromBranch(res.Branch)
-	eligible := isAutomatedMaintenanceBranch(res.Branch) ||
+	eligible := isMaint ||
 		(inferredStory != "" && IsStoryCompletedOnDisk(cleanPath, inferredStory) && hasExplicitIdleStateFile(cleanPath))
 	if !eligible {
 		return false
@@ -1104,7 +1343,11 @@ func autoRemediateCompletedOrMaintenanceBranch(ctx context.Context, cleanPath st
 	}
 	prevBranch := res.Branch
 	checkoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	checkoutErr := procutil.CommandContext(checkoutCtx, "git", "-C", cleanPath, "checkout", "main").Run()
+	checkoutArgs := []string{"-C", cleanPath, "checkout", "main"}
+	if isMaint {
+		checkoutArgs = []string{"-C", cleanPath, "checkout", "-f", "main"}
+	}
+	checkoutErr := procutil.CommandContext(checkoutCtx, "git", checkoutArgs...).Run()
 	cancel()
 	if checkoutErr != nil {
 		return false
@@ -1429,6 +1672,10 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 			}
 		}
 	}
+
+	if !res.HasActiveAgentASETurn {
+		discoverActiveBrainTranscriptForRepo(repoPath, time.Now(), res)
+	}
 }
 
 func applyNoAgentFallbackState(res *RepoFleetStatusResult) {
@@ -1532,11 +1779,30 @@ func hasNonEmptyJSONArray(raw json.RawMessage) bool {
 	return true
 }
 
+var bgTaskStartRe = regexp.MustCompile(`Tool is running as a background task with task id:\s*([a-zA-Z0-9_-]+/task-[0-9]+)`)
+
+func hasPendingBackgroundTask(tail string) bool {
+	matches := bgTaskStartRe.FindAllStringSubmatchIndex(tail, -1)
+	for _, m := range matches {
+		if len(m) < 4 {
+			continue
+		}
+		taskID := tail[m[2]:m[3]]
+		rest := tail[m[1]:]
+		if !strings.Contains(rest, taskID+`" finished with result:`) &&
+			!strings.Contains(rest, taskID+`\" finished with result:`) {
+			return true
+		}
+	}
+	return false
+}
+
 func isTranscriptTurnInFlight(tail []byte, modTime time.Time, now time.Time) bool {
 	if modTime.IsZero() || now.Sub(modTime) > 45*time.Minute {
 		return false
 	}
-	lines := strings.Split(string(tail), "\n")
+	tailStr := string(tail)
+	lines := strings.Split(tailStr, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" || !strings.HasPrefix(line, "{") || !strings.HasSuffix(line, "}") {
@@ -1563,6 +1829,9 @@ func isTranscriptTurnInFlight(tail []byte, modTime time.Time, now time.Time) boo
 		if strings.EqualFold(step.Type, "PLANNER_RESPONSE") &&
 			strings.EqualFold(step.Status, "DONE") &&
 			!hasTools {
+			if now.Sub(modTime) <= 15*time.Minute && hasPendingBackgroundTask(tailStr) {
+				return true
+			}
 			return false
 		}
 		return true
@@ -1778,18 +2047,278 @@ func inspectDarwinAgentProcessDetailed(pid int, etime string, cmdLine string, ha
 	return provenance, convID, false, hasActiveASETurn, inferredStoryID
 }
 
+func canonicalizeTranscriptPathText(s string) string {
+	lower := strings.ToLower(s)
+	norm := strings.ReplaceAll(lower, `\\`, `/`)
+	norm = strings.ReplaceAll(norm, `\`, `/`)
+	for strings.Contains(norm, "//") {
+		norm = strings.ReplaceAll(norm, "//", "/")
+	}
+	// Normalize WSL /mnt/<drive>/ to <drive>:/ so Windows C:\... and WSL /mnt/c/... match identically.
+	for i := 0; i < 26; i++ {
+		ch := string(rune('a' + i))
+		wslPrefix := "/mnt/" + ch + "/"
+		winPrefix := ch + ":/"
+		if strings.Contains(norm, wslPrefix) {
+			norm = strings.ReplaceAll(norm, wslPrefix, winPrefix)
+		}
+	}
+	return norm
+}
+
+// TranscriptReferencesRepoPath returns true if transcript text references repoPath (across Windows C:\...,
+// JSON-escaped C:\\..., C:/..., or WSL /mnt/c/... representations) with a strict path boundary (never matching
+// a sibling suffix like "-04" when repoPath is "meta-repo", ignoring .git/objects or .git/modules alternate references,
+// and rejecting incidental prose mentions when a numbered sibling worktree has dominant occurrences in the transcript).
+func TranscriptReferencesRepoPath(text, repoPath string) bool {
+	cleanRepo := strings.TrimRight(canonicalizeTranscriptPathText(strings.TrimSpace(repoPath)), "/")
+	if cleanRepo == "" || cleanRepo == "." {
+		return false
+	}
+	searchAll := canonicalizeTranscriptPathText(text)
+	if cwdMarker := "command working directory: "; strings.Contains(searchAll, cwdMarker) {
+		idx := strings.Index(searchAll, cwdMarker)
+		rest := searchAll[idx+len(cwdMarker):]
+		if nl := strings.IndexAny(rest, "\r\n\""); nl >= 0 {
+			rest = rest[:nl]
+		}
+		declaredCWD := strings.TrimRight(strings.TrimSpace(rest), "/")
+		if declaredCWD != "" {
+			return declaredCWD == cleanRepo
+		}
+	}
+
+	selfCount := 0
+	siblingDashCount := 0
+	search := searchAll
+	for {
+		idx := strings.Index(search, cleanRepo)
+		if idx < 0 {
+			break
+		}
+		afterIdx := idx + len(cleanRepo)
+		validBefore := true
+		if idx > 0 && !strings.HasPrefix(cleanRepo, "/") {
+			prev := search[idx-1]
+			if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || prev == '_' || prev == '-' {
+				validBefore = false
+			}
+		}
+		if validBefore {
+			if afterIdx >= len(search) {
+				selfCount++
+			} else {
+				rest := search[afterIdx:]
+				nextCh := search[afterIdx]
+				if nextCh == '-' {
+					siblingDashCount++
+				} else if !strings.HasPrefix(rest, "/.git/objects") && !strings.HasPrefix(rest, "/.git/modules") {
+					if nextCh == '/' || nextCh == ' ' || nextCh == '\t' || nextCh == '\n' || nextCh == '\r' ||
+						nextCh == '"' || nextCh == '\'' || nextCh == ':' || nextCh == ';' ||
+						nextCh == ',' || nextCh == ')' || nextCh == ']' || nextCh == '}' || nextCh == '>' {
+						selfCount++
+					}
+				}
+			}
+		}
+		search = search[afterIdx:]
+	}
+	if selfCount == 0 {
+		return false
+	}
+	if siblingDashCount > selfCount {
+		return false
+	}
+	return true
+}
+
+func isTempTestHomeDir(p string) bool {
+	slash := strings.ToLower(filepath.ToSlash(strings.TrimSpace(p)))
+	if slash == "" {
+		return false
+	}
+	return strings.Contains(slash, "/tmp/") ||
+		strings.Contains(slash, "/var/folders/") ||
+		strings.Contains(slash, "/appdata/local/temp/") ||
+		strings.Contains(slash, "teste2e_") ||
+		strings.Contains(slash, "go-build")
+}
+
+func candidateBrainRootDirs() []string {
+	if custom := strings.TrimSpace(os.Getenv("IAZIO_BRAIN_DIR")); custom != "" {
+		dirs := []string{filepath.Clean(custom)}
+		if filepath.Base(filepath.Clean(custom)) != "brain" {
+			sub := filepath.Join(filepath.Clean(custom), "brain")
+			if fi, err := os.Stat(sub); err == nil && fi.IsDir() {
+				dirs = append([]string{sub}, dirs...)
+			}
+		}
+		return dirs
+	}
+
+	seen := make(map[string]bool)
+	var dirs []string
+	addDir := func(d string) {
+		clean := filepath.Clean(strings.TrimSpace(d))
+		if clean == "" || seen[clean] {
+			return
+		}
+		if fi, err := os.Stat(clean); err == nil && fi.IsDir() {
+			seen[clean] = true
+			dirs = append(dirs, clean)
+		}
+	}
+
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		addDir(filepath.Join(home, ".gemini", "antigravity-cli", "brain"))
+		if isTempTestHomeDir(home) {
+			return dirs
+		}
+	}
+	if up := strings.TrimSpace(os.Getenv("USERPROFILE")); up != "" {
+		addDir(filepath.Join(up, ".gemini", "antigravity-cli", "brain"))
+		if isTempTestHomeDir(up) {
+			return dirs
+		}
+	}
+	if runtime.GOOS == "linux" {
+		if matches, err := filepath.Glob("/mnt/c/Users/*/.gemini/antigravity-cli/brain"); err == nil {
+			for _, m := range matches {
+				addDir(m)
+			}
+		}
+	}
+	return dirs
+}
+
+// InspectActiveBrainASETurnForRepo scans candidate Antigravity brain directories for an in-flight
+// /autonomous-story-execution turn targeting repoPath (modified within the last 15 minutes).
+func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bool, convID string, storyID string, newestMod time.Time) {
+	if strings.TrimSpace(repoPath) == "" {
+		return false, "", "", time.Time{}
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	for _, brainRoot := range candidateBrainRootDirs() {
+		entries, err := os.ReadDir(brainRoot)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || len(e.Name()) < 8 {
+				continue
+			}
+			candID := e.Name()
+			convBrainDir := filepath.Join(brainRoot, candID)
+			for _, rel := range []string{
+				filepath.Join(".system_generated", "logs", "transcript.jsonl"),
+				filepath.Join(".system_generated", "logs", "transcript_full.jsonl"),
+			} {
+				full := filepath.Join(convBrainDir, rel)
+				fi, stErr := os.Stat(full)
+				if stErr != nil || fi.IsDir() {
+					continue
+				}
+				modTime := fi.ModTime()
+				if modTime.IsZero() || now.Sub(modTime) > 15*time.Minute {
+					continue
+				}
+				head, tail, _, rErr := readHeadAndTailBytes(full, 96*1024, 128*1024)
+				if rErr != nil {
+					continue
+				}
+				headStr := string(head)
+				tailStr := string(tail)
+				if !TranscriptReferencesRepoPath(headStr+"\n"+tailStr, repoPath) {
+					continue
+				}
+				if !containsASEWorkflowMarker(headStr) && !containsASEWorkflowMarker(tailStr) {
+					continue
+				}
+				if !isTranscriptTurnInFlight(tail, modTime, now) {
+					continue
+				}
+				var candStory string
+				matches := transcriptBoundStoryRe.FindAllStringSubmatch(tailStr, -1)
+				if len(matches) == 0 {
+					matches = transcriptBoundStoryRe.FindAllStringSubmatch(headStr, -1)
+				}
+				for i := len(matches) - 1; i >= 0; i-- {
+					sid := strings.ToUpper(matches[i][1])
+					if !IsStoryCompletedOnDisk(repoPath, sid) {
+						candStory = sid
+						break
+					}
+				}
+				if modTime.After(newestMod) {
+					active = true
+					convID = candID
+					storyID = candStory
+					newestMod = modTime
+				}
+			}
+		}
+	}
+	return active, convID, storyID, newestMod
+}
+
+// HasActiveBrainASETurnForRepo returns true if an Antigravity brain transcript has an in-flight
+// /autonomous-story-execution turn targeting repoPath.
+func HasActiveBrainASETurnForRepo(repoPath string, now time.Time) bool {
+	active, _, _, _ := InspectActiveBrainASETurnForRepo(repoPath, now)
+	return active
+}
+
+func discoverActiveBrainTranscriptForRepo(repoPath string, now time.Time, res *RepoFleetStatusResult) bool {
+	if res == nil {
+		return false
+	}
+	active, convID, storyID, _ := InspectActiveBrainASETurnForRepo(repoPath, now)
+	if !active {
+		return false
+	}
+	res.HasActiveAgentASETurn = true
+	if res.ActiveConversationID == "" && convID != "" {
+		res.ActiveConversationID = convID
+	}
+	if res.ActiveStoryID == "" && storyID != "" && !IsStoryCompletedOnDisk(repoPath, storyID) {
+		res.ActiveStoryID = storyID
+	}
+	if res.AgentTool == "" {
+		res.AgentTool = "agy"
+	}
+	res.ToolLiveness = "LIVE"
+	if res.ExecutionProvenance == "" || res.ExecutionProvenance == "NONE" {
+		if lockInfo, err := repolock.Read(repoPath); err == nil &&
+			strings.EqualFold(strings.TrimSpace(lockInfo.Status), "RUNNING") &&
+			((lockInfo.PID > 0 && isPIDAlive(lockInfo.PID)) || (lockInfo.HarnessPID > 0 && isPIDAlive(lockInfo.HarnessPID))) {
+			res.ExecutionProvenance = "COORDINATED_HARNESS"
+		} else {
+			res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+		}
+	}
+	return true
+}
+
 func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult) {
 	if runtime.GOOS != "windows" {
 		selfPID := os.Getpid()
 		parentPID := os.Getppid()
 		cmd := procutil.Command("ps", "-axo", "pid=,ppid=,etime=,args=")
 		out, err := cmd.CombinedOutput()
-		if err != nil {
-			return
+		if err == nil {
+			if parsePsOutputForAgentProcesses(string(out), selfPID, parentPID, repoPath, res) {
+				if !res.HasActiveAgentASETurn {
+					discoverActiveBrainTranscriptForRepo(repoPath, time.Now(), res)
+				}
+				return
+			}
 		}
-		if parsePsOutputForAgentProcesses(string(out), selfPID, parentPID, repoPath, res) {
-			return
-		}
+	}
+	if discoverActiveBrainTranscriptForRepo(repoPath, time.Now(), res) {
+		return
 	}
 	if res.LockDetails != "" {
 		res.ToolLiveness = "KILLED"
