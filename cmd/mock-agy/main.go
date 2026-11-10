@@ -17,7 +17,13 @@ func main() {
 		time.Sleep(30 * time.Second)
 		os.Exit(0)
 	}
-	os.Exit(run(os.Args[1:], strings.TrimSpace(os.Getenv("MOCK_AGY_SCENARIO")), os.Stdout, os.Stderr))
+	code := run(os.Args[1:], strings.TrimSpace(os.Getenv("MOCK_AGY_SCENARIO")), os.Stdout, os.Stderr)
+	if code == 0 {
+		if out, err := procutil.Command("git", "remote").Output(); err == nil && strings.Contains(string(out), "origin") {
+			_ = procutil.Command("git", "push").Run()
+		}
+	}
+	os.Exit(code)
 }
 
 func run(args []string, scenario string, stdout, stderr io.Writer) int {

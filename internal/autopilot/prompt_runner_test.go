@@ -113,6 +113,7 @@ func makeFakeAutopilot(t *testing.T) string {
 
 func initTestGitRepo(t *testing.T) string {
 	t.Helper()
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
 	dir := t.TempDir()
 
 	run := func(args ...string) {
@@ -646,6 +647,11 @@ func TestTailBrainTranscriptSteps_And_StartupBanner(t *testing.T) {
 
 	wrapper := makeFakeAutopilot(t)
 	repoDir := initTestGitRepo(t)
+	storyDir := filepath.Join(repoDir, "docs", "stories")
+	_ = os.MkdirAll(storyDir, 0o755)
+	_ = os.WriteFile(filepath.Join(storyDir, "2026-11-09-gov-3850.story.md"), []byte("---\nid: STORY-GOV-3850\nstatus: DONE\n---\n"), 0o644)
+	_ = exec.Command("git", "-C", repoDir, "add", ".").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "chore: add completed story").Run()
 	runner := NewPromptRunner(wrapper)
 	_, err := runner.RunPrompt(context.Background(), RunPromptOptions{
 		PromptID:    "prompt_banner_test",
@@ -751,6 +757,7 @@ func TestBackgroundDrainPIDLivenessAndAutoResume_Unit(t *testing.T) {
 	}
 	t.Setenv("IAZIO_BG_DRAIN_GRACE_SECONDS", "")
 	t.Setenv("MOCK_AGY_FAST", "1")
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
 	if d := r.resolveBackgroundDrainGracePeriod(RunPromptOptions{}); d != 150*time.Millisecond {
 		t.Fatalf("unexpected MOCK_AGY_FAST grace: %v", d)
 	}
@@ -1193,6 +1200,7 @@ func TestJobCbbb1363993215f9_PulledDoneStoryNeverShadowsNewlyAllocatedSessionSto
 	t.Setenv("HOME", homeDir)
 	t.Setenv("MOCK_AGY_SCENARIO", "job_cbbb1363993215f9_wave4_pulled_done_story_override")
 	t.Setenv("MOCK_AGY_UNIT", "1")
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
 
 	repoDir := t.TempDir()
 	_ = exec.Command("git", "-C", repoDir, "init").Run()
@@ -1262,6 +1270,7 @@ func TestJob38eeeb536a5a7130_AgyCrashAutoResumeAndNewConversationFallback(t *tes
 	t.Setenv("HOME", homeDir)
 	t.Setenv("MOCK_AGY_SCENARIO", "job_38eeeb536a5a7130_crash_resume_and_new_conv_fallback")
 	t.Setenv("MOCK_AGY_STATE_MARKER", filepath.Join(homeDir, "mock_agy_38eeeb53_turn.tmp"))
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
 
 	repoDir := t.TempDir()
 	_ = exec.Command("git", "-C", repoDir, "init").Run()
@@ -1306,6 +1315,7 @@ func TestStory0190_RealTimeConversationDiscoveryAndHeartbeat(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
 	t.Setenv("MOCK_AGY_FAST", "1")
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
 
 	repoDir := t.TempDir()
 	_ = exec.Command("git", "-C", repoDir, "init").Run()
@@ -1857,5 +1867,267 @@ fi
 		t.Fatalf("expected completed ExitCode=0, got status=%s exit=%d", res.Status, res.ExitCode)
 	}
 }
+
+func TestASECompletionGate_HardenedFailureModes_StoryGov5232(t *testing.T) {
+	tmpDir := t.TempDir()
+	repoDir := filepath.Join(tmpDir, "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	execGit := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(out))
+		}
+	}
+	execGit("init", "-b", "main")
+	execGit("config", "user.email", "test@viovy.test")
+	execGit("config", "user.name", "Test Runner")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Test Repo\n"), 0o644); err != nil {
+		t.Fatalf("write readme: %v", err)
+	}
+	execGit("add", "README.md")
+	execGit("commit", "-m", "initial commit")
+
+	// 1. Verify resolveSuperprojectRoot returns parent dir when .git is a gitlink file and .gitmodules exists
+	subDir := filepath.Join(repoDir, "submodule-a")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("mkdir subDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitmodules"), []byte("[submodule \"submodule-a\"]\n\tpath = submodule-a\n"), 0o644); err != nil {
+		t.Fatalf("write gitmodules: %v", err)
+	}
+	_ = exec.Command("git", "-C", repoDir, "add", ".gitmodules").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "chore: add gitmodules").Run()
+	// Mock gitlink in submodule-a
+	if err := os.WriteFile(filepath.Join(subDir, ".git"), []byte("gitdir: ../.git/modules/submodule-a\n"), 0o644); err != nil {
+		t.Fatalf("write submodule gitlink: %v", err)
+	}
+	if sp := resolveSuperprojectRoot(subDir, "git"); sp != repoDir {
+		t.Fatalf("expected resolveSuperprojectRoot(%q)=%q, got %q", subDir, repoDir, sp)
+	}
+	// Verify standalone clone under tmp/ (with .git as a directory) does NOT resolve superproject
+	standaloneDir := filepath.Join(repoDir, "tmp", "standalone")
+	if err := os.MkdirAll(filepath.Join(standaloneDir, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir standalone .git: %v", err)
+	}
+	if sp := resolveSuperprojectRoot(standaloneDir, "git"); sp != "" {
+		t.Fatalf("expected resolveSuperprojectRoot for standalone clone to be empty, got %q", sp)
+	}
+
+	// 2. Scenario A: Direct commit on main with NO story binding during /autonomous-story-execution
+	// Must fail closed with ASE_GATE_INCOMPLETE: missing_story_binding
+	mockAgyBin := filepath.Join(tmpDir, "mock-agy-unbound")
+	scriptUnbound := `#!/bin/sh
+echo "Created conversation conv-unbound-123"
+echo "modified content" >> README.md
+git add README.md >/dev/null 2>&1
+git commit -m "feat: direct commit on main" >/dev/null 2>&1
+echo "### Implementation Summary"
+exit 0
+`
+	if err := os.WriteFile(mockAgyBin, []byte(scriptUnbound), 0o755); err != nil {
+		t.Fatalf("write mock-agy: %v", err)
+	}
+
+	runner := NewPromptRunner("autopilot")
+	runner.GracePeriod = 50 * time.Millisecond
+	resA, errA := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_unbound_ase",
+		JobID:       "job_unbound",
+		Repo:        "repo",
+		Prompt:      "/autonomous-story-execution Title: Do some work without story",
+		TargetAgent: mockAgyBin,
+		WorkingDir:  repoDir,
+		Timeout:     5 * time.Second,
+	})
+	if errA == nil {
+		t.Fatalf("expected error for unbounded story execution, got nil")
+	}
+	if resA.Status != "failed" || resA.FailureCategory != "ASE_GATE_INCOMPLETE" {
+		t.Fatalf("expected status=failed failureCategory=ASE_GATE_INCOMPLETE, got status=%s cat=%s", resA.Status, resA.FailureCategory)
+	}
+	if !strings.Contains(errA.Error(), "missing_story_binding") {
+		t.Fatalf("expected missing_story_binding error, got: %v", errA)
+	}
+
+	// 3. Scenario B: Story bound but left IN_PROGRESS and exited
+	// Must fail closed with ASE_GATE_INCOMPLETE: incomplete_ase_flow
+	mockAgyInProgress := filepath.Join(tmpDir, "mock-agy-inprogress")
+	scriptInProgress := `#!/bin/sh
+echo "Created conversation conv-inprogress-123"
+mkdir -p docs/stories
+printf -- "---\nid: STORY-TEST-9999\ntitle: Test Incomplete\nstatus: IN_PROGRESS\n---\n# Story\n" > docs/stories/2026-11-09-test.story.md
+git add docs/stories/2026-11-09-test.story.md >/dev/null 2>&1
+git commit -m "feat(test-9999): work in progress" >/dev/null 2>&1
+echo "Autonomous story execution is complete for STORY-TEST-9999"
+exit 0
+`
+	if err := os.WriteFile(mockAgyInProgress, []byte(scriptInProgress), 0o755); err != nil {
+		t.Fatalf("write mock-agy: %v", err)
+	}
+
+	resB, errB := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_inprogress_ase",
+		JobID:       "job_inprogress",
+		Repo:        "repo",
+		Prompt:      "/autonomous-story-execution Title: Test Incomplete Story",
+		TargetAgent: mockAgyInProgress,
+		WorkingDir:  repoDir,
+		Timeout:     5 * time.Second,
+	})
+	if errB == nil {
+		t.Fatalf("expected error for IN_PROGRESS story completion attempt, got nil")
+	}
+	if resB.Status != "failed" || resB.FailureCategory != "ASE_GATE_INCOMPLETE" {
+		t.Fatalf("expected status=failed failureCategory=ASE_GATE_INCOMPLETE, got status=%s cat=%s", resB.Status, resB.FailureCategory)
+	}
+	if !strings.Contains(errB.Error(), "incomplete_ase_flow") {
+		t.Fatalf("expected incomplete_ase_flow error, got: %v", errB)
+	}
+
+	// 4. Scenario C: Story DONE on main but NO remote upstream exists
+	// Must fail closed with ASE_GATE_INCOMPLETE: unpushed_probe_failed
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "")
+	_ = exec.Command("git", "-C", repoDir, "rm", "-f", "docs/stories/2026-11-09-test.story.md").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "chore: remove previous story").Run()
+	mockAgyNoRemote := filepath.Join(tmpDir, "mock-agy-noremote")
+	scriptNoRemote := `#!/bin/sh
+echo "Created conversation conv-noremote-123"
+mkdir -p docs/stories
+printf -- "---\nid: STORY-TEST-8888\ntitle: Test No Remote\nstatus: DONE\n---\n# Story\n" > docs/stories/2026-11-09-noremote.story.md
+git add docs/stories/2026-11-09-noremote.story.md >/dev/null 2>&1
+git commit -m "feat(test-8888): complete story without remote" >/dev/null 2>&1
+echo "Autonomous story execution is complete for STORY-TEST-8888"
+exit 0
+`
+	if err := os.WriteFile(mockAgyNoRemote, []byte(scriptNoRemote), 0o755); err != nil {
+		t.Fatalf("write mock-agy: %v", err)
+	}
+	resC, errC := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_noremote_ase",
+		JobID:       "job_noremote",
+		Repo:        "repo",
+		Prompt:      "/autonomous-story-execution Title: Test No Remote",
+		TargetAgent: mockAgyNoRemote,
+		WorkingDir:  repoDir,
+		Timeout:     5 * time.Second,
+	})
+	if errC == nil {
+		t.Fatalf("expected error for no-remote story execution, got nil")
+	}
+	if resC.Status != "failed" || resC.FailureCategory != "ASE_GATE_INCOMPLETE" {
+		t.Fatalf("expected status=failed failureCategory=ASE_GATE_INCOMPLETE, got status=%s cat=%s", resC.Status, resC.FailureCategory)
+	}
+	if !strings.Contains(errC.Error(), "unpushed_probe_failed") {
+		t.Fatalf("expected unpushed_probe_failed error, got: %v", errC)
+	}
+
+	// 5. Scenario D: Worktree left on unmerged feature branch
+	// Must fail closed with ASE_GATE_INCOMPLETE: unmerged_feature_branch
+	_ = exec.Command("git", "-C", repoDir, "rm", "-f", "docs/stories/2026-11-09-noremote.story.md").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "chore: remove previous story").Run()
+	_ = exec.Command("git", "-C", repoDir, "checkout", "-b", "feat/STORY-TEST-7777-unmerged").Run()
+	mockAgyUnmerged := filepath.Join(tmpDir, "mock-agy-unmerged")
+	scriptUnmerged := `#!/bin/sh
+echo "Created conversation conv-unmerged-123"
+mkdir -p docs/stories
+printf -- "---\nid: STORY-TEST-7777\ntitle: Test Unmerged Branch\nstatus: DONE\n---\n# Story\n" > docs/stories/2026-11-09-unmerged.story.md
+git add docs/stories/2026-11-09-unmerged.story.md >/dev/null 2>&1
+git commit -m "feat(test-7777): done on feature branch" >/dev/null 2>&1
+echo "Autonomous story execution is complete for STORY-TEST-7777"
+exit 0
+`
+	if err := os.WriteFile(mockAgyUnmerged, []byte(scriptUnmerged), 0o755); err != nil {
+		t.Fatalf("write mock-agy: %v", err)
+	}
+	resD, errD := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_unmerged_branch_ase",
+		JobID:       "job_unmerged",
+		Repo:        "repo",
+		Prompt:      "/autonomous-story-execution Title: Test Unmerged Branch",
+		TargetAgent: mockAgyUnmerged,
+		WorkingDir:  repoDir,
+		Timeout:     5 * time.Second,
+	})
+	if errD == nil {
+		t.Fatalf("expected error for unmerged branch story execution, got nil")
+	}
+	if resD.Status != "failed" || resD.FailureCategory != "ASE_GATE_INCOMPLETE" {
+		t.Fatalf("expected status=failed failureCategory=ASE_GATE_INCOMPLETE, got status=%s cat=%s", resD.Status, resD.FailureCategory)
+	}
+	if !strings.Contains(errD.Error(), "unmerged_feature_branch") {
+		t.Fatalf("expected unmerged_feature_branch error, got: %v", errD)
+	}
+	_ = exec.Command("git", "-C", repoDir, "checkout", "main").Run()
+
+	// 6. Scenario E: Bare remote configured, local commits unpushed
+	// Must fail closed with ASE_GATE_INCOMPLETE: unpushed_commits
+	bareRemoteDir := filepath.Join(tmpDir, "bare-origin.git")
+	_ = exec.Command("git", "init", "--bare", bareRemoteDir).Run()
+	_ = exec.Command("git", "-C", repoDir, "remote", "add", "origin", bareRemoteDir).Run()
+	_ = exec.Command("git", "-C", repoDir, "push", "-u", "origin", "main").Run()
+
+	mockAgyUnpushed := filepath.Join(tmpDir, "mock-agy-unpushed")
+	scriptUnpushed := `#!/bin/sh
+echo "Created conversation conv-unpushed-123"
+mkdir -p docs/stories
+printf -- "---\nid: STORY-TEST-6666\ntitle: Test Unpushed Commits\nstatus: DONE\n---\n# Story\n" > docs/stories/2026-11-09-unpushed.story.md
+git add docs/stories/2026-11-09-unpushed.story.md >/dev/null 2>&1
+git commit -m "feat(test-6666): completed but not pushed" >/dev/null 2>&1
+echo "Autonomous story execution is complete for STORY-TEST-6666"
+exit 0
+`
+	if err := os.WriteFile(mockAgyUnpushed, []byte(scriptUnpushed), 0o755); err != nil {
+		t.Fatalf("write mock-agy: %v", err)
+	}
+	resE, errE := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_unpushed_ase",
+		JobID:       "job_unpushed",
+		Repo:        "repo",
+		Prompt:      "/autonomous-story-execution Title: Test Unpushed Commits",
+		TargetAgent: mockAgyUnpushed,
+		WorkingDir:  repoDir,
+		Timeout:     5 * time.Second,
+	})
+	if errE == nil {
+		t.Fatalf("expected error for unpushed commits story execution, got nil")
+	}
+	if resE.Status != "failed" || resE.FailureCategory != "ASE_GATE_INCOMPLETE" {
+		t.Fatalf("expected status=failed failureCategory=ASE_GATE_INCOMPLETE, got status=%s cat=%s", resE.Status, resE.FailureCategory)
+	}
+	if !strings.Contains(errE.Error(), "unpushed_commits") {
+		t.Fatalf("expected unpushed_commits error, got: %v", errE)
+	}
+
+	// 7. Scenario F: Submodule --add-dir argument injection verification (AC2)
+	argsOutFile := filepath.Join(tmpDir, "args.out")
+	mockAgyArgsCheck := filepath.Join(tmpDir, "mock-agy-args")
+	scriptArgsCheck := fmt.Sprintf(`#!/bin/sh
+echo "$@" > %s
+exit 0
+`, argsOutFile)
+	if err := os.WriteFile(mockAgyArgsCheck, []byte(scriptArgsCheck), 0o755); err != nil {
+		t.Fatalf("write mock-agy: %v", err)
+	}
+	_, errF := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_submodule_args",
+		JobID:       "job_submodule_args",
+		Repo:        "submodule-a",
+		Prompt:      "simple test prompt",
+		TargetAgent: mockAgyArgsCheck,
+		WorkingDir:  subDir,
+		Timeout:     5 * time.Second,
+	})
+	if errF != nil {
+		t.Fatalf("RunPrompt failed: %v", errF)
+	}
+	argsData, _ := os.ReadFile(argsOutFile)
+	if !strings.Contains(string(argsData), "--add-dir "+repoDir) {
+		t.Fatalf("expected mock agent to receive '--add-dir %s' in args, got output: %s", repoDir, string(argsData))
+	}
+}
+
 
 

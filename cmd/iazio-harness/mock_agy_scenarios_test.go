@@ -75,6 +75,7 @@ func buildMockAgy(t *testing.T) string {
 
 func initTestGitWorktree(t *testing.T) string {
 	t.Helper()
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
 	worktree := t.TempDir()
 	_ = exec.Command("git", "init", worktree).Run()
 	_ = exec.Command("git", "-C", worktree, "config", "user.name", "Test User").Run()
