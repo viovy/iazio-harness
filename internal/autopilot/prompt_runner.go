@@ -1349,11 +1349,27 @@ func hasActiveSDLCChildProcess(toolPID int) (bool, string) {
 	return false, ""
 }
 
+func stripTranscriptStepLinesForClassification(s string) string {
+	if s == "" || !strings.Contains(s, "[agy step #") {
+		return s
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[agy step #") {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 // ClassifyPromptFailure classifies upstream, downstream, and local execution failures.
 func ClassifyPromptFailure(execStatus, failureCategory, failureStage, combinedOutput string, waitErr error) (category, stage, direction, service string) {
 	category = strings.TrimSpace(failureCategory)
 	stage = strings.TrimSpace(failureStage)
-	errText := combinedOutput
+	errText := stripTranscriptStepLinesForClassification(combinedOutput)
 	if waitErr != nil {
 		errText += " " + waitErr.Error()
 	}
@@ -1364,6 +1380,8 @@ func ClassifyPromptFailure(execStatus, failureCategory, failureStage, combinedOu
 		return "PERMISSION_DENIED", "TOOL_EXECUTION", "LOCAL_EXECUTION", "iazio-harness/sandbox"
 	case category == "BACKGROUND_DRAIN_TIMEOUT" || strings.Contains(lower, "background_drain_timeout"):
 		return "BACKGROUND_DRAIN_TIMEOUT", "BACKGROUND_DRAIN", "LOCAL_EXECUTION", "agy-cli"
+	case category == "ASE_GATE_INCOMPLETE" || strings.Contains(lower, "ase_gate_incomplete") || strings.Contains(lower, "dirty_worktree_post_exit") || strings.Contains(lower, "incomplete_ase_flow") || strings.Contains(lower, "unmerged_feature_branch") || strings.Contains(lower, "unpushed_commits") || strings.Contains(lower, "missing_story_binding"):
+		return "ASE_GATE_INCOMPLETE", "COMPLETION_GATE", "LOCAL_EXECUTION", "autopilot/ase-gate"
 	case category == "UPSTREAM_MODEL_UNAVAILABLE" || category == "TOOL_QUOTA_OR_AUTH" || strings.Contains(lower, "429") || strings.Contains(lower, "resourceexhausted") || strings.Contains(lower, "resource_exhausted") || strings.Contains(lower, "quota") || strings.Contains(lower, "insufficient_quota"):
 		return "UPSTREAM_MODEL_UNAVAILABLE", "LLM_INFERENCE", "UPSTREAM", "antigravity-llm-provider"
 	case category == "UPSTREAM_AUTH_PROVIDER_OUTAGE" || strings.Contains(lower, "hydra") || strings.Contains(lower, "oauth2") || strings.Contains(lower, "bws ") || strings.Contains(lower, "bitwarden"):
@@ -1386,8 +1404,6 @@ func ClassifyPromptFailure(execStatus, failureCategory, failureStage, combinedOu
 		return "STORY_NOT_FOUND", "STORY_VALIDATION", "LOCAL_EXECUTION", "backlog"
 	case category == "WORKSPACE_PREP_ERROR" || strings.Contains(lower, "workspace_prep") || strings.Contains(lower, "stale git lock"):
 		return "WORKSPACE_PREP_ERROR", "WORKSPACE_PREP", "LOCAL_EXECUTION", "iazio-agent/workspace"
-	case category == "ASE_GATE_INCOMPLETE" || strings.Contains(lower, "dirty_worktree_post_exit") || strings.Contains(lower, "incomplete_ase_flow"):
-		return "ASE_GATE_INCOMPLETE", "COMPLETION_GATE", "LOCAL_EXECUTION", "autopilot/ase-gate"
 	default:
 		if category == "" {
 			if execStatus == "timed_out" {
@@ -2364,13 +2380,15 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			nonEphemeralModified := filterNonEphemeralModified(curModified)
 			hasDirtyWorktree := len(nonEphemeralModified) > 0
 			storyIncomplete := isStoryIncompleteAnywhere(opts.WorkingDir, spRoot, curStory)
-			isExplicitASEPrompt := strings.Contains(opts.Prompt, "/autonomous-story-execution")
-			onNonMainBranch, _ := isNonMainWorktreeBranch(opts.WorkingDir, gitBin)
-			aseBranchIncomplete := isASEFlow && storyIncomplete && (isExplicitASEPrompt || onNonMainBranch)
+			isExplicitASEPrompt := isASEExecutionPrompt(opts.Prompt)
+			onNonMainBranch, nonMainBranchName := isNonMainWorktreeBranch(opts.WorkingDir, gitBin)
+			unpushedCnt, _ := countUnpushedCommits(opts.WorkingDir, gitBin)
+			aseBranchIncomplete := isASEFlow && ((storyIncomplete && (isExplicitASEPrompt || onNonMainBranch)) || (isExplicitASEPrompt && (onNonMainBranch || unpushedCnt > 0)))
 			aseDirtyIncomplete := isASEFlow && hasDirtyWorktree
 
 			lowerCombined := strings.ToLower(rawCombined)
-			isFatalQuota := strings.Contains(lowerCombined, "resourceexhausted") || strings.Contains(lowerCombined, "429 you have exhausted")
+			lowerStd := strings.ToLower(stripTranscriptStepLinesForClassification(rawStdStreams))
+			isFatalQuota := strings.Contains(lowerStd, "resourceexhausted") || strings.Contains(lowerStd, "429 you have exhausted")
 			isCorruptedSession := strings.Contains(lowerCombined, "conversation session corrupted") || strings.Contains(lowerCombined, "database disk image is malformed")
 			if (execStatus != "completed" || exitCode != 0) && curConv != "" {
 				failedConvAttempts[curConv]++
@@ -2398,25 +2416,25 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				detectedConvID = ""
 				streamMu.Unlock()
 				resumeNote := fmt.Sprintf(
-					"[%s] [ASE-SUPERVISOR] [auto_resume.new_conversation_fallback] Previous conversation %q failed or was unresumable; starting new conversation (attempt %d/%d, Story=%s, dirty_files=%d) to complete ASE flow...\n",
-					time.Now().UTC().Format(time.RFC3339), prevConv, resumeAttempts, maxAutoResumes, storyTarget, len(nonEphemeralModified),
+					"[%s] [ASE-SUPERVISOR] [auto_resume.new_conversation_fallback] Previous conversation %q failed or was unresumable; starting new conversation (attempt %d/%d, Story=%s, branch=%s, dirty_files=%d, unpushed=%d) to complete ASE flow...\n",
+					time.Now().UTC().Format(time.RFC3339), prevConv, resumeAttempts, maxAutoResumes, storyTarget, nonMainBranchName, len(nonEphemeralModified), unpushedCnt,
 				)
 				emitSupervisorNote(resumeNote)
 				resumePrompt := fmt.Sprintf(
-					"Resume and complete /autonomous-story-execution for %s in a new conversation: inspect existing worktree state, finish remaining tasks, commit all changes cleanly, mark story status: DONE, and complete all verification and git-flow gates.",
-					storyTarget,
+					"Resume and complete /autonomous-story-execution for %s in a new conversation: inspect existing worktree state (branch=%s, dirty_files=%d, unpushed_commits=%d), finish remaining tasks, commit all changes cleanly, mark story status: DONE, run autopilot-git-flow land --story %s --status-done --record-reviews, and settle the worktree on main.",
+					storyTarget, nonMainBranchName, len(nonEphemeralModified), unpushedCnt, storyTarget,
 				)
 				execStatus, exitCode, waitErr, bgDrainReaped, printTimedOut = runSingleTurn(resumePrompt, "", false)
 			} else {
 				resumeNote := fmt.Sprintf(
-					"[%s] [ASE-SUPERVISOR] [auto_resume.triggered] Auto-resuming conversation %s (attempt %d/%d, Story=%s, dirty_files=%d) to complete job after background drain / partial turn...\n",
-					time.Now().UTC().Format(time.RFC3339), curConv, resumeAttempts, maxAutoResumes, storyTarget, len(nonEphemeralModified),
+					"[%s] [ASE-SUPERVISOR] [auto_resume.triggered] Auto-resuming conversation %s (attempt %d/%d, Story=%s, branch=%s, dirty_files=%d, unpushed=%d) to complete job after background drain / partial turn...\n",
+					time.Now().UTC().Format(time.RFC3339), curConv, resumeAttempts, maxAutoResumes, storyTarget, nonMainBranchName, len(nonEphemeralModified), unpushedCnt,
 				)
 				emitSupervisorNote(resumeNote)
 
 				resumePrompt := fmt.Sprintf(
-					"Resume and complete /autonomous-story-execution for %s on conversation %s: finish remaining tasks, commit all worktree changes cleanly, mark story status: DONE, and complete all verification gates.",
-					storyTarget, curConv,
+					"Resume and complete /autonomous-story-execution for %s on conversation %s: worktree is not yet settled on main (branch=%s, dirty_files=%d, unpushed_commits=%d). Finish remaining tasks, commit all worktree changes cleanly, mark story status: DONE, run autopilot-git-flow land --story %s --status-done --record-reviews, and settle the worktree on main.",
+					storyTarget, curConv, nonMainBranchName, len(nonEphemeralModified), unpushedCnt, storyTarget,
 				)
 				execStatus, exitCode, waitErr, bgDrainReaped, printTimedOut = runSingleTurn(resumePrompt, curConv, true)
 			}
