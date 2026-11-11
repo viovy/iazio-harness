@@ -18,7 +18,11 @@ tmp/
 
 # Runtime
 .iazio/
-
+.autopilot/
 .session_story_id
+TestResults/
 TestResults/Diagnostics/pr-closeout-proof-*.json
+scratch/
+Makefile
+metadata.yml
 cov_auth
