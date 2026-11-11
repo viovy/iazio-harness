@@ -2229,9 +2229,6 @@ func TestStoryGov5256_ClassifyPromptFailure_ASEGateNotOverriddenByTranscriptNois
 }
 
 func TestStoryGov5256_AutoResumeWhenStoryDoneOnUnmergedFeatureBranch(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skipping shell mock script test on windows")
-	}
 	repoDir := t.TempDir()
 	binDir := t.TempDir()
 
@@ -2281,12 +2278,20 @@ func TestStoryGov5256_AutoResumeWhenStoryDoneOnUnmergedFeatureBranch(t *testing.
 	}
 
 	convID := "ebd2122a-fe9f-4472-b880-b33e99199901"
-	mockBin := filepath.Join(binDir, "mock-agy-resume-land")
-	script := fmt.Sprintf(`#!/bin/sh
-echo "Conversation ID: %s"
+	var mockBin string
+	if runtime.GOOS == "windows" {
+		mockBin = filepath.Join(binDir, "mock-agy-resume-land.cmd")
+		winScript := fmt.Sprintf("@echo off\r\necho Created conversation %s\r\necho [agy step #92] thinking: earlier step saw 429 ResourceExhausted on optional lookup\r\necho %%* | findstr /C:\"%s\" >nul\r\nif %%errorlevel%%==0 (\r\n  git checkout main >nul 2>&1\r\n  git merge --no-ff feat/gov-5256-unmerged -m \"Merge feat/gov-5256-unmerged\" >nul 2>&1\r\n  echo Autonomous story execution is complete for STORY-GOV-5256.\r\n  exit /b 0\r\n)\r\necho Turn 1 exited while still on feat/gov-5256-unmerged before landing.\r\nexit /b 0\r\n", convID, convID)
+		if err := os.WriteFile(mockBin, []byte(winScript), 0o755); err != nil {
+			t.Fatalf("write windows mock script: %v", err)
+		}
+	} else {
+		mockBin = filepath.Join(binDir, "mock-agy-resume-land")
+		script := fmt.Sprintf(`#!/bin/sh
+echo "Created conversation %s"
 echo "[agy step #92] thinking: earlier step saw 429 ResourceExhausted on optional lookup"
 case "$*" in
-  *"--resume"*|*"land"*)
+  *"--conversation="*|*"land"*)
     git checkout main >/dev/null 2>&1
     git merge --no-ff feat/gov-5256-unmerged -m "Merge feat/gov-5256-unmerged" >/dev/null 2>&1
     echo "Autonomous story execution is complete for STORY-GOV-5256."
@@ -2298,12 +2303,14 @@ case "$*" in
     ;;
 esac
 `, convID)
-	if err := os.WriteFile(mockBin, []byte(script), 0o755); err != nil {
-		t.Fatalf("write mock script: %v", err)
+		if err := os.WriteFile(mockBin, []byte(script), 0o755); err != nil {
+			t.Fatalf("write mock script: %v", err)
+		}
 	}
 
 	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
-	runner := NewPromptRunner(binDir)
+	runner := NewPromptRunner("autopilot")
+	runner.GracePeriod = 50 * time.Millisecond
 	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
 		PromptID:    "prompt_gov_5256",
 		JobID:       "job_7d5cad6fd223f5a0",

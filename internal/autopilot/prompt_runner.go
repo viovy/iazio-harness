@@ -1176,6 +1176,9 @@ func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gi
 	if len(dirtyFiles) > 0 {
 		return false
 	}
+	if onNonMain, _ := isNonMainWorktreeBranch(workingDir, gitBin); onNonMain {
+		return false
+	}
 	unpushed, unpushedErr := countUnpushedCommits(workingDir, gitBin)
 	if unpushedErr != nil || unpushed > 0 {
 		return false
