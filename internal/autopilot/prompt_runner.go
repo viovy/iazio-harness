@@ -265,7 +265,78 @@ type PromptResult struct {
 	GitTreeSHA           string   `json:"git_tree_sha"`
 	ModifiedFiles        []string `json:"modified_files"`
 	Summary              string   `json:"summary"`
+	Output               string   `json:"output,omitempty"`
 	DurationMs           int64    `json:"duration_ms"`
+}
+
+// MaxPromptSummaryChars is the maximum length of PromptResult.Summary (AC2).
+const MaxPromptSummaryChars = 1000
+
+var agyStepOutputPrefixRegex = regexp.MustCompile(`^(?:\[[^\]]+\]\s*)?\[agy step #\d+\]\s*output:\s*(.+)$`)
+
+// BuildConcisePromptSummary builds a concise executive summary (<=1,000 chars)
+// stripped of [agy step #...] trace lines and [ASE-SUPERVISOR] log lines.
+func BuildConcisePromptSummary(rawOut, rawTranscript, rawErr string, waitErr error) string {
+	filterCleanLines := func(s string) string {
+		if strings.TrimSpace(s) == "" {
+			return ""
+		}
+		var kept []string
+		for _, line := range strings.Split(s, "\n") {
+			trimmed := strings.TrimRight(line, "\r")
+			if strings.TrimSpace(trimmed) == "" {
+				continue
+			}
+			if strings.Contains(trimmed, "[agy step #") || strings.Contains(trimmed, "[ASE-SUPERVISOR]") {
+				continue
+			}
+			kept = append(kept, trimmed)
+		}
+		return strings.TrimSpace(strings.Join(kept, "\n"))
+	}
+
+	var lastStepOutput string
+	for _, src := range []string{rawTranscript, rawOut} {
+		for _, line := range strings.Split(src, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if m := agyStepOutputPrefixRegex.FindStringSubmatch(trimmed); len(m) > 1 {
+				cand := strings.TrimSpace(m[1])
+				if cand != "" && !strings.Contains(cand, "[agy step #") && !strings.Contains(cand, "[ASE-SUPERVISOR]") {
+					lastStepOutput = cand
+				}
+			}
+		}
+	}
+
+	summary := filterCleanLines(rawOut)
+	if lastStepOutput != "" && !strings.Contains(summary, lastStepOutput) {
+		if summary == "" {
+			summary = lastStepOutput
+		} else {
+			summary = summary + "\n" + lastStepOutput
+		}
+	}
+	if summary == "" {
+		summary = filterCleanLines(rawErr)
+	}
+	if summary == "" && waitErr != nil {
+		summary = filterCleanLines(waitErr.Error())
+	}
+	summary = redact.Egress(strings.TrimSpace(summary))
+	if len(summary) > MaxPromptSummaryChars {
+		if lastStepOutput != "" && len(lastStepOutput) < MaxPromptSummaryChars-10 && !strings.Contains(summary[:MaxPromptSummaryChars-3], lastStepOutput) {
+			headBudget := MaxPromptSummaryChars - len(lastStepOutput) - 5
+			if headBudget > 0 {
+				summary = strings.TrimSpace(summary[:headBudget]) + "\n...\n" + lastStepOutput
+			} else {
+				summary = lastStepOutput
+			}
+		}
+		if len(summary) > MaxPromptSummaryChars {
+			summary = strings.TrimSpace(summary[:MaxPromptSummaryChars-3]) + "..."
+		}
+	}
+	return summary
 }
 
 type chunkStreamingWriter struct {
@@ -2371,22 +2442,23 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	streamMu.Unlock()
 
 	combinedOutput := rawOut + "\n" + rawTranscript + "\n" + rawErr
-	summary := rawOut
-	if trimmedTranscript := strings.TrimSpace(rawTranscript); trimmedTranscript != "" && !strings.Contains(summary, trimmedTranscript) {
-		if strings.TrimSpace(summary) == "" {
-			summary = rawTranscript
+	fullOutput := rawOut
+	if trimmedTranscript := strings.TrimSpace(rawTranscript); trimmedTranscript != "" && !strings.Contains(fullOutput, trimmedTranscript) {
+		if strings.TrimSpace(fullOutput) == "" {
+			fullOutput = rawTranscript
 		} else {
-			summary = strings.TrimRight(summary, "\n") + "\n" + rawTranscript
+			fullOutput = strings.TrimRight(fullOutput, "\n") + "\n" + rawTranscript
 		}
 	}
-	if strings.TrimSpace(summary) == "" {
+	if strings.TrimSpace(fullOutput) == "" {
 		if len(rawErr) > 0 {
-			summary = rawErr
+			fullOutput = rawErr
 		} else if waitErr != nil {
-			summary = waitErr.Error()
+			fullOutput = waitErr.Error()
 		}
 	}
-	summary = redact.Egress(strings.TrimSpace(summary))
+	fullOutput = redact.Egress(strings.TrimSpace(fullOutput))
+	summary := BuildConcisePromptSummary(rawOut, rawTranscript, rawErr, waitErr)
 
 	if hasHeadlessPermissionDenial(rawOut + "\n" + rawErr) {
 		execStatus = "failed"
@@ -2574,6 +2646,13 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		failureCategory, failureStage, failureDirection, failureService = ClassifyPromptFailure(execStatus, failureCategory, failureStage, combinedOutput, waitErr)
 	}
 
+	if summary == "" && waitErr != nil {
+		summary = BuildConcisePromptSummary(rawOut, rawTranscript, rawErr, waitErr)
+	}
+	if fullOutput == "" && waitErr != nil {
+		fullOutput = redact.Egress(strings.TrimSpace(waitErr.Error()))
+	}
+
 	if jobID != "" && apiURL != "" && summary != "" && !alreadyStreamed {
 		_ = controlplane.PostChunk(ctx, apiURL, resolveToken(), jobID, "stdout", summary+"\n")
 	}
@@ -2610,6 +2689,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		GitTreeSHA:           treeSHA,
 		ModifiedFiles:        modified,
 		Summary:              summary,
+		Output:               fullOutput,
 		DurationMs:           durationMs,
 	}
 
