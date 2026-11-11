@@ -58,7 +58,47 @@ func isPointerStoryID(sid string) bool {
 }
 
 func extractTargetStoryIDFromText(text string) string {
-	cleaned := reviewArtifactPathRegex.ReplaceAllString(text, " ")
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	cleaned := reviewArtifactPathRegex.ReplaceAllString(trimmed, " ")
+	lines := strings.Split(cleaned, "\n")
+	if len(lines) > 1 {
+		hasTitleHeaderWithoutID := false
+		for i, rawLine := range lines {
+			line := strings.TrimSpace(rawLine)
+			if line == "" {
+				continue
+			}
+			lower := strings.ToLower(line)
+			if strings.HasPrefix(lower, "story id:") || strings.HasPrefix(lower, "story_id:") || strings.HasPrefix(lower, "story:") || strings.HasPrefix(lower, "id:") {
+				if m := canonicalStoryIDRegex.FindStringSubmatch(line); len(m) > 1 {
+					return strings.ToUpper(strings.TrimSpace(m[1]))
+				}
+			}
+			if i == 0 || strings.HasPrefix(lower, "title:") {
+				if m := canonicalStoryIDRegex.FindStringSubmatch(line); len(m) > 1 {
+					return strings.ToUpper(strings.TrimSpace(m[1]))
+				}
+				if strings.HasPrefix(lower, "title:") {
+					hasTitleHeaderWithoutID = true
+				}
+			}
+			if strings.HasPrefix(lower, "context & problem statement") ||
+				strings.HasPrefix(lower, "## context") ||
+				strings.HasPrefix(lower, "upstream dependency context") ||
+				strings.HasPrefix(lower, "problem statement:") {
+				if hasTitleHeaderWithoutID {
+					return ""
+				}
+				break
+			}
+		}
+		if hasTitleHeaderWithoutID {
+			return ""
+		}
+	}
 	if m := canonicalStoryIDRegex.FindStringSubmatch(cleaned); len(m) > 1 {
 		return strings.ToUpper(strings.TrimSpace(m[1]))
 	}
@@ -179,10 +219,21 @@ func resolvePromptAuthToken(ctx context.Context, explicit string) string {
 }
 
 func hasHeadlessPermissionDenial(text string) bool {
-	lower := strings.ToLower(text)
-	return strings.Contains(lower, "jetski: no output produced") ||
-		strings.Contains(lower, "headless mode cannot prompt for") ||
-		strings.Contains(lower, "so it was auto-denied")
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, "[agy step #") {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "jetski: no output produced") ||
+			strings.Contains(lower, "headless mode cannot prompt for") ||
+			strings.Contains(lower, "so it was auto-denied") {
+			return true
+		}
+	}
+	return false
 }
 
 // PromptResult represents the structured telemetry returned after prompt execution.
@@ -937,6 +988,12 @@ func isStoryDoneAnywhere(workingDir, superprojectRoot, storyID string) bool {
 }
 
 func isStoryIncompleteAnywhere(workingDir, superprojectRoot, storyID string) bool {
+	if superprojectRoot != "" && isStoryDoneInWorktree(superprojectRoot, storyID) && !isStoryIncompleteInWorktree(superprojectRoot, storyID) {
+		onNonMain, _ := isNonMainWorktreeBranch(workingDir, "git")
+		if !onNonMain {
+			return false
+		}
+	}
 	if isStoryIncompleteInWorktree(workingDir, storyID) {
 		return true
 	}
@@ -2162,7 +2219,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 		}
 
-		if !canceled && !hasHeadlessPermissionDenial(fullOutFinal+"\n"+fullTranscriptFinal+"\n"+fullErrFinal) &&
+		if !canceled && !hasHeadlessPermissionDenial(fullOutFinal+"\n"+fullErrFinal) &&
 			(turnCompletedDuringDrain || isASEFlowCompletedInWorktree(opts.WorkingDir, curTurnStory, fullOutFinal+"\n"+fullTranscriptFinal+"\n"+fullErrFinal, gitBin)) {
 			return "completed", 0, nil, false, false
 		}
@@ -2203,12 +2260,14 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			streamMu.Lock()
 			curConv := detectedConvID
 			curStory := boundStoryID
+			rawStdStreams := stdoutBuf.String() + "\n" + stderrBuf.String()
 			rawCombined := stdoutBuf.String() + "\n" + transcriptBuf.String() + "\n" + stderrBuf.String()
 			streamMu.Unlock()
 
-			if curStory == "" || isPointerStoryID(curStory) || (!isStoryIncompleteInWorktree(opts.WorkingDir, curStory) && !isStoryDoneInWorktree(opts.WorkingDir, curStory)) {
+			spRoot := resolveSuperprojectRoot(opts.WorkingDir, gitBin)
+			if curStory == "" || isPointerStoryID(curStory) || (!isStoryIncompleteAnywhere(opts.WorkingDir, spRoot, curStory) && !isStoryDoneAnywhere(opts.WorkingDir, spRoot, curStory)) {
 				if sid, _, _ := discoverStoryFromASEState(opts.WorkingDir, startTime.Add(-2*time.Second)); sid != "" {
-					if curStory == "" || (isPointerStoryID(curStory) && !isPointerStoryID(sid)) || isStoryIncompleteInWorktree(opts.WorkingDir, sid) {
+					if curStory == "" || (isPointerStoryID(curStory) && !isPointerStoryID(sid)) || isStoryIncompleteAnywhere(opts.WorkingDir, spRoot, sid) {
 						curStory = sid
 						streamMu.Lock()
 						boundStoryID = sid
@@ -2222,7 +2281,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					maxAutoResumes = defaultASEMaxAutoResumeAttempts
 				}
 			}
-			if !hasHeadlessPermissionDenial(rawCombined) && isASEFlowCompletedInWorktree(opts.WorkingDir, curStory, rawCombined, gitBin) {
+			if !hasHeadlessPermissionDenial(rawStdStreams) && isASEFlowCompletedInWorktree(opts.WorkingDir, curStory, rawCombined, gitBin) {
 				execStatus = "completed"
 				exitCode = 0
 				waitErr = nil
@@ -2233,7 +2292,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			_, _, curModified := captureGitSnapshot(opts.WorkingDir, gitBin)
 			nonEphemeralModified := filterNonEphemeralModified(curModified)
 			hasDirtyWorktree := len(nonEphemeralModified) > 0
-			storyIncomplete := isStoryIncompleteInWorktree(opts.WorkingDir, curStory)
+			storyIncomplete := isStoryIncompleteAnywhere(opts.WorkingDir, spRoot, curStory)
 			isExplicitASEPrompt := strings.Contains(opts.Prompt, "/autonomous-story-execution")
 			onNonMainBranch, _ := isNonMainWorktreeBranch(opts.WorkingDir, gitBin)
 			aseBranchIncomplete := isASEFlow && storyIncomplete && (isExplicitASEPrompt || onNonMainBranch)
@@ -2246,7 +2305,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				failedConvAttempts[curConv]++
 			}
 			aseCrashOrIncomplete := isASEFlow && (execStatus != "completed" || exitCode != 0) && !isFatalQuota
-			needsResume := !hasHeadlessPermissionDenial(rawCombined) && !isFatalQuota &&
+			needsResume := !hasHeadlessPermissionDenial(rawStdStreams) && !isFatalQuota &&
 				((curConv != "" && (bgDrainReaped || printTimedOut || aseDirtyIncomplete || aseBranchIncomplete || (storyIncomplete && (execStatus != "completed" || hasDirtyWorktree || bgDrainIdleRegex.MatchString(rawCombined))))) ||
 					aseCrashOrIncomplete)
 
@@ -2329,7 +2388,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 	summary = redact.Egress(strings.TrimSpace(summary))
 
-	if hasHeadlessPermissionDenial(combinedOutput) {
+	if hasHeadlessPermissionDenial(rawOut + "\n" + rawErr) {
 		execStatus = "failed"
 		if exitCode == 0 {
 			exitCode = 1

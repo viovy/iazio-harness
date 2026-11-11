@@ -2836,3 +2836,13 @@ func TestRunRepo_EvaluateAndRemediate(t *testing.T) {
 		t.Fatalf("runRepoCommand failed: %v", err)
 	}
 }
+
+func TestExecuteMain_FlushesTelemetryOnErrorAndSuccess(t *testing.T) {
+	if code := executeMain([]string{"version"}); code != 0 {
+		t.Fatalf("expected executeMain(version) to return 0, got %d", code)
+	}
+	if code := executeMain(nil); code != 1 {
+		t.Fatalf("expected executeMain(nil) to return 1, got %d", code)
+	}
+}
+

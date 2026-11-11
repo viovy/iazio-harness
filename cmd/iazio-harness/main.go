@@ -54,6 +54,12 @@ var (
 )
 
 func main() {
+	if code := executeMain(os.Args[1:]); code != 0 {
+		os.Exit(code)
+	}
+}
+
+func executeMain(args []string) (exitCode int) {
 	// Ignore SIGPIPE so multi-day executions never terminate if parent iazio-agent self-restarts and closes stdout/stderr pipes.
 	signal.Ignore(syscall.SIGPIPE)
 	defer func() {
@@ -61,7 +67,7 @@ func main() {
 			buf := make([]byte, 8192)
 			n := runtime.Stack(buf, false)
 			_, _ = fmt.Fprintf(os.Stderr, "[iazio-harness] PANIC RECOVERED: %v\n%s\n", r, string(buf[:n]))
-			os.Exit(1)
+			exitCode = 1
 		}
 	}()
 
@@ -94,13 +100,14 @@ func main() {
 		slog.SetDefault(slog.New(telemetry.NewSlogHandler(sink, slog.NewTextHandler(os.Stderr, nil))))
 	}
 
-	if err := run(os.Args[1:]); err != nil {
+	if err := run(args); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
-func run(args []string) error {
+func run(args []string) (retErr error) {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: iazio-harness version|auth|run|story|prompt|codebase|status|heal-ase|discard")
 	}
@@ -115,7 +122,12 @@ func run(args []string) error {
 		}
 	}
 	ctx, span := telemetry.StartSpan(context.Background(), "harness."+args[0], spanOpts...)
-	defer span.End()
+	defer func() {
+		if retErr != nil {
+			span.SetError(retErr)
+		}
+		span.End()
+	}()
 	switch args[0] {
 	case "version", "--version", "-v":
 		for _, a := range args[1:] {

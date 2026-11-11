@@ -2129,5 +2129,52 @@ exit 0
 	}
 }
 
+func TestJob7a422318d6294d43_Regressions(t *testing.T) {
+	// 1. RC-1: Multi-line prompt with Title: without story ID must not scrape incidental STORY-* from Context & Problem Statement
+	promptWithContextMention := `/autonomous-story-execution
+Title: Wave 3 — ViGo Forensic Product Audit Remediation: CLI SQLite Parity
+
+Submodule: vigo-cli
+Backlog: vigo
+
+Context & Problem Statement:
+AC3 of STORY-VIGO-0288 claimed to replace the mock fallback in status.go.
+`
+	if got := extractTargetStoryIDFromText(promptWithContextMention); got != "" {
+		t.Fatalf("expected empty story ID for prompt with Title header and incidental context mention, got %q", got)
+	}
+	if got := extractTargetStoryIDFromText("/autonomous-story-execution\nTitle: Implement STORY-VIGO-0310\nContext: refs STORY-VIGO-0288"); got != "STORY-VIGO-0310" {
+		t.Fatalf("expected STORY-VIGO-0310 from Title header, got %q", got)
+	}
+	if got := extractTargetStoryIDFromText("/autonomous-story-execution\nTitle: Wave 3\nStory ID: STORY-VIGO-0310\nContext: refs STORY-VIGO-0288"); got != "STORY-VIGO-0310" {
+		t.Fatalf("expected STORY-VIGO-0310 from Story ID header, got %q", got)
+	}
+
+	// 2. RC-4: hasHeadlessPermissionDenial must ignore [agy step #N] transcript lines
+	transcriptLine := `[2026-11-11T04:55:21Z] [agy step #691] thinking: Wait: why did it auto-resume? Because !hasHeadlessPermissionDenial(rawCombined) checks "headless mode cannot prompt for" or "so it was auto-denied" or "jetski: no output produced"`
+	if hasHeadlessPermissionDenial(transcriptLine) {
+		t.Fatalf("expected hasHeadlessPermissionDenial to ignore [agy step #N] transcript lines")
+	}
+	realStderrLine := `ERROR: Headless mode cannot prompt for tool approval, so it was auto-denied.`
+	if !hasHeadlessPermissionDenial(realStderrLine) {
+		t.Fatalf("expected hasHeadlessPermissionDenial to detect real stderr headless denial")
+	}
+
+	// 3. RC-3: isStoryIncompleteAnywhere respects authoritative superproject DONE when submodule is on main
+	tmpDir := t.TempDir()
+	spRoot := filepath.Join(tmpDir, "meta-repo")
+	subDir := filepath.Join(spRoot, "vigo-cli")
+	_ = os.MkdirAll(filepath.Join(spRoot, "docs", "stories"), 0o755)
+	_ = os.MkdirAll(filepath.Join(subDir, "docs", "stories"), 0o755)
+	_ = exec.Command("git", "init", "-b", "main", spRoot).Run()
+	_ = exec.Command("git", "init", "-b", "main", subDir).Run()
+	_ = os.WriteFile(filepath.Join(spRoot, "docs", "stories", "2026-11-11-vigo-0310.story.md"), []byte("---\nid: STORY-VIGO-0310\nstatus: DONE\n---\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(subDir, "docs", "stories", "2026-11-11-vigo-0310.story.md"), []byte("---\nid: STORY-VIGO-0310\nstatus: IN_PROGRESS\n---\n"), 0o644)
+	if isStoryIncompleteAnywhere(subDir, spRoot, "STORY-VIGO-0310") {
+		t.Fatalf("expected isStoryIncompleteAnywhere to return false when superproject has STORY-VIGO-0310 DONE and submodule is on main")
+	}
+}
+
+
 
 
