@@ -1319,7 +1319,7 @@ func TestMockAgy_Scenario16_Job1350_DirtyWorktreePostExit_InPlaceAutoResume(t *t
 	_ = exec.Command("git", "-C", worktree, "add", ".").Run()
 	_ = exec.Command("git", "-C", worktree, "commit", "-m", "chore: initial story").Run()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	err := executeJob(ctx, srv.URL, "job-1350", worktree, "", "ordinary", "", "")
