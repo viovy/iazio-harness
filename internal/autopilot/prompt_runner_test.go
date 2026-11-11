@@ -2209,7 +2209,126 @@ func TestStoryGov5253_ConcisePromptSummaryStripsTranscriptAndSupervisorLines(t *
 	}
 }
 
+func TestStoryGov5256_ClassifyPromptFailure_ASEGateNotOverriddenByTranscriptNoise(t *testing.T) {
+	transcriptWith429 := strings.Join([]string{
+		"[agy step #92] thinking: Earlier call returned 429 ResourceExhausted quota limit on helper subagent",
+		"[agy step #950] tool run_command: autopilot-git-flow land --story STORY-GOV-5251",
+	}, "\n")
+	waitErr := fmt.Errorf("ASE_GATE_INCOMPLETE: unmerged_feature_branch (worktree remains on branch feat/gov-5251-k8s-clusters-jenkins-unification; git-flow land not completed)")
 
+	cat, stage, dir, svc := ClassifyPromptFailure("failed", "ASE_GATE_INCOMPLETE", "COMPLETION_GATE", transcriptWith429, waitErr)
+	if cat != "ASE_GATE_INCOMPLETE" || stage != "COMPLETION_GATE" || dir != "LOCAL_EXECUTION" || svc != "autopilot/ase-gate" {
+		t.Fatalf("expected ASE_GATE_INCOMPLETE classification to take precedence over transcript 429 and branch name 'jenkins', got category=%q stage=%q direction=%q service=%q", cat, stage, dir, svc)
+	}
 
+	// Even if failureCategory is initially empty and only waitErr carries the unmerged_feature_branch gate error
+	cat2, stage2, dir2, svc2 := ClassifyPromptFailure("failed", "", "", transcriptWith429, waitErr)
+	if cat2 != "ASE_GATE_INCOMPLETE" || stage2 != "COMPLETION_GATE" || dir2 != "LOCAL_EXECUTION" || svc2 != "autopilot/ase-gate" {
+		t.Fatalf("expected waitErr unmerged_feature_branch to classify as ASE_GATE_INCOMPLETE, got category=%q stage=%q direction=%q service=%q", cat2, stage2, dir2, svc2)
+	}
+}
 
+func TestStoryGov5256_AutoResumeWhenStoryDoneOnUnmergedFeatureBranch(t *testing.T) {
+	repoDir := t.TempDir()
+	binDir := t.TempDir()
+
+	for _, args := range [][]string{
+		{"init", "-b", "main"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test User"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+
+	storyDir := filepath.Join(repoDir, "docs", "stories")
+	if err := os.MkdirAll(storyDir, 0o755); err != nil {
+		t.Fatalf("mkdir stories: %v", err)
+	}
+	storyPath := filepath.Join(storyDir, "2026-11-11-gov-5256.story.md")
+	if err := os.WriteFile(storyPath, []byte("---\nid: STORY-GOV-5256\nstatus: DONE\n---\n# Story\n"), 0o644); err != nil {
+		t.Fatalf("write story: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", "."},
+		{"commit", "-m", "initial main commit"},
+		{"checkout", "-b", "feat/gov-5256-unmerged"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("landed via auto-resume\n"), 0o644); err != nil {
+		t.Fatalf("write feature.txt: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", "feature.txt"},
+		{"commit", "-m", "feat(STORY-GOV-5256): feature commit on branch"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+
+	convID := "ebd2122a-fe9f-4472-b880-b33e99199901"
+	var mockBin string
+	if runtime.GOOS == "windows" {
+		mockBin = filepath.Join(binDir, "mock-agy-resume-land.cmd")
+		winScript := fmt.Sprintf("@echo off\r\necho Created conversation %s\r\necho [agy step #92] thinking: earlier step saw 429 ResourceExhausted on optional lookup\r\necho %%* | findstr /C:\"%s\" >nul\r\nif %%errorlevel%%==0 (\r\n  git checkout main >nul 2>&1\r\n  git merge --no-ff feat/gov-5256-unmerged -m \"Merge feat/gov-5256-unmerged\" >nul 2>&1\r\n  echo Autonomous story execution is complete for STORY-GOV-5256.\r\n  exit /b 0\r\n)\r\necho Turn 1 exited while still on feat/gov-5256-unmerged before landing.\r\nexit /b 0\r\n", convID, convID)
+		if err := os.WriteFile(mockBin, []byte(winScript), 0o755); err != nil {
+			t.Fatalf("write windows mock script: %v", err)
+		}
+	} else {
+		mockBin = filepath.Join(binDir, "mock-agy-resume-land")
+		script := fmt.Sprintf(`#!/bin/sh
+echo "Created conversation %s"
+echo "[agy step #92] thinking: earlier step saw 429 ResourceExhausted on optional lookup"
+case "$*" in
+  *"--conversation="*|*"land"*)
+    git checkout main >/dev/null 2>&1
+    git merge --no-ff feat/gov-5256-unmerged -m "Merge feat/gov-5256-unmerged" >/dev/null 2>&1
+    echo "Autonomous story execution is complete for STORY-GOV-5256."
+    exit 0
+    ;;
+  *)
+    echo "Turn 1 exited while still on feat/gov-5256-unmerged before landing."
+    exit 0
+    ;;
+esac
+`, convID)
+		if err := os.WriteFile(mockBin, []byte(script), 0o755); err != nil {
+			t.Fatalf("write mock script: %v", err)
+		}
+	}
+
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
+	runner := NewPromptRunner("autopilot")
+	runner.GracePeriod = 50 * time.Millisecond
+	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:    "prompt_gov_5256",
+		JobID:       "job_7d5cad6fd223f5a0",
+		Repo:        "meta-repo",
+		Prompt:      "/autonomous-story-execution STORY-GOV-5256",
+		StoryID:     "STORY-GOV-5256",
+		TargetAgent: mockBin,
+		WorkingDir:  repoDir,
+		Timeout:     15 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("expected auto-resume to land feature branch and complete STORY-GOV-5256 without error, got err=%v (status=%s category=%s)", err, res.Status, res.FailureCategory)
+	}
+	if res.Status != "completed" {
+		t.Fatalf("expected status=completed after auto-resume landed branch, got %s (category=%s)", res.Status, res.FailureCategory)
+	}
+	if res.ResumeAttempts < 1 {
+		t.Fatalf("expected ResumeAttempts >= 1 when Turn 1 exited on unmerged feature branch with story status: DONE, got %d", res.ResumeAttempts)
+	}
+}
 
