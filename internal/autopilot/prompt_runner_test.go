@@ -1306,8 +1306,11 @@ func TestJob38eeeb536a5a7130_AgyCrashAutoResumeAndNewConversationFallback(t *tes
 	if res.ActiveConversationID != "2bff5c4b-a111-4c71-a7b5-999988887777" {
 		t.Fatalf("expected ActiveConversationID to switch to fallback conversation 2bff5c4b-a111-4c71-a7b5-999988887777, got %q", res.ActiveConversationID)
 	}
-	if !strings.Contains(res.Summary, "auto_resume.new_conversation_fallback") {
-		t.Fatalf("expected supervisor log to record auto_resume.new_conversation_fallback, got:\n%s", res.Summary)
+	if !strings.Contains(res.Output, "auto_resume.new_conversation_fallback") {
+		t.Fatalf("expected supervisor log in Output to record auto_resume.new_conversation_fallback, got:\n%s", res.Output)
+	}
+	if strings.Contains(res.Summary, "[ASE-SUPERVISOR]") || strings.Contains(res.Summary, "[agy step #") {
+		t.Fatalf("expected Summary to strip [ASE-SUPERVISOR] and [agy step #...] lines, got:\n%s", res.Summary)
 	}
 }
 
@@ -2174,6 +2177,38 @@ AC3 of STORY-VIGO-0288 claimed to replace the mock fallback in status.go.
 		t.Fatalf("expected isStoryIncompleteAnywhere to return false when superproject has STORY-VIGO-0310 DONE and submodule is on main")
 	}
 }
+
+func TestStoryGov5253_ConcisePromptSummaryStripsTranscriptAndSupervisorLines(t *testing.T) {
+	var transcriptBuilder strings.Builder
+	for i := 1; i <= 1132; i++ {
+		transcriptBuilder.WriteString(fmt.Sprintf("[2026-11-11T18:00:00Z] [agy step #%d] thinking: Executing step %d with verbose trace payload %s\n", i, i, strings.Repeat("x", 120)))
+		transcriptBuilder.WriteString(fmt.Sprintf("[2026-11-11T18:00:01Z] [agy step #%d] tool run_command: Verification step %d\n", i, i))
+	}
+	finalOutcome := "Autonomous story execution is complete for STORY-GOV-5253 — all acceptance criteria verified and landed."
+	transcriptBuilder.WriteString(fmt.Sprintf("[2026-11-11T18:30:00Z] [agy step #1133] output: %s\n", finalOutcome))
+
+	rawOut := strings.Join([]string{
+		"Created conversation 208632c0-2776-40a2-80e5-c905cecb280c",
+		"[2026-11-11T18:10:00Z] [ASE-SUPERVISOR] Execution active (elapsed=600s, story=STORY-GOV-5253)",
+		"[2026-11-11T18:20:00Z] [ASE-SUPERVISOR] [auto_resume.triggered] Resuming conversation",
+		strings.Repeat("build progress line with verbose output ", 40),
+	}, "\n")
+
+	summary := BuildConcisePromptSummary(rawOut, transcriptBuilder.String(), "", nil)
+	if len(summary) > MaxPromptSummaryChars {
+		t.Fatalf("expected summary length <= %d, got %d", MaxPromptSummaryChars, len(summary))
+	}
+	if strings.Contains(summary, "[agy step #") {
+		t.Fatalf("expected [agy step #...] lines to be stripped from summary, got:\n%s", summary)
+	}
+	if strings.Contains(summary, "[ASE-SUPERVISOR]") {
+		t.Fatalf("expected [ASE-SUPERVISOR] lines to be stripped from summary, got:\n%s", summary)
+	}
+	if !strings.Contains(summary, finalOutcome) {
+		t.Fatalf("expected final executive outcome %q to be preserved in summary, got:\n%s", finalOutcome, summary)
+	}
+}
+
 
 
 
