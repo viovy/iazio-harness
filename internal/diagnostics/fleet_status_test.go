@@ -1444,6 +1444,90 @@ func TestStoryIazio0201_WindowsWSLAlternatesStrandedRebaseAndBrainTranscriptDisc
 	_ = os.RemoveAll(rebaseApplyDir)
 }
 
+func TestStoryGov5254_CrossWorktreeTranscriptAndSiblingStoryGuard(t *testing.T) {
+	parentDir := t.TempDir()
+	repo02 := filepath.Join(parentDir, "meta-repo-02")
+	repo03 := filepath.Join(parentDir, "meta-repo-03")
+	repo04 := filepath.Join(parentDir, "meta-repo-04")
+	for _, r := range []string{repo02, repo03, repo04} {
+		_ = os.MkdirAll(filepath.Join(r, ".autopilot"), 0o755)
+		exec.Command("git", "init", "-b", "main", r).Run()
+		exec.Command("git", "-C", r, "config", "user.email", "test@example.com").Run()
+		exec.Command("git", "-C", r, "config", "user.name", "Test User").Run()
+		_ = os.WriteFile(filepath.Join(r, "README.md"), []byte("clean\n"), 0o644)
+		exec.Command("git", "-C", r, "add", ".").Run()
+		exec.Command("git", "-C", r, "commit", "-m", "init").Run()
+		_ = os.WriteFile(filepath.Join(r, ".autopilot", "state.json"), []byte(`{"state":"IDLE","story_id":""}`), 0o644)
+	}
+
+	// 1. Sibling worktree dominance in TranscriptReferencesRepoPath:
+	// A transcript working in meta-repo-03 that mentions meta-repo-04 once in prose must NOT match meta-repo-04.
+	repo03Transcript := strings.Join([]string{
+		`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"/autonomous-story-execution STORY-GOV-5249"}`,
+		fmt.Sprintf(`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`, filepath.Join(repo03, "AGENTS.md")),
+		fmt.Sprintf(`{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`, filepath.Join(repo03, "docs", "stories", "STORY-GOV-5249.story.md")),
+		fmt.Sprintf(`{"step_index":3,"type":"TOOL_RESPONSE","content":"example worktree path %s in documentation"}`, repo04),
+		fmt.Sprintf(`{"step_index":4,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"edit_file","args":{"Path":%q}}]}`, filepath.Join(repo03, "README.md")),
+	}, "\n") + "\n"
+
+	if !TranscriptReferencesRepoPath(repo03Transcript, repo03) {
+		t.Fatalf("expected TranscriptReferencesRepoPath=true for dominant worktree repo03")
+	}
+	if TranscriptReferencesRepoPath(repo03Transcript, repo04) {
+		t.Fatalf("expected TranscriptReferencesRepoPath=false for incidental prose mention of repo04 inside repo03 transcript")
+	}
+	if TranscriptReferencesRepoPath(repo03Transcript, repo02) {
+		t.Fatalf("expected TranscriptReferencesRepoPath=false for unreferenced sibling repo02")
+	}
+
+	// 2. JSON-escaped newline after Command Working Directory header in JSONL must parse cleanly
+	jsonlHeaderTranscript := fmt.Sprintf(`{"step_index":0,"content":"Command Working Directory: %s\nApp Data Directory: /Users/romeo/.gemini/antigravity-cli"}`, repo04)
+	if !TranscriptReferencesRepoPath(jsonlHeaderTranscript, repo04) {
+		t.Fatalf("expected JSONL Command Working Directory header to match repo04")
+	}
+	if TranscriptReferencesRepoPath(jsonlHeaderTranscript, repo02) {
+		t.Fatalf("expected JSONL Command Working Directory header for repo04 not to match repo02")
+	}
+
+	// 3. Sibling story ownership guard: STORY-GOV-5249 owned by repo03 must never bind to clean main repo04
+	_ = os.WriteFile(filepath.Join(repo03, ".session_story_id"), []byte("STORY-GOV-5249\n"), 0o644)
+	if !IsStoryOwnedBySiblingWorktree(repo04, "STORY-GOV-5249") {
+		t.Fatalf("expected IsStoryOwnedBySiblingWorktree(repo04, STORY-GOV-5249)=true when repo03 owns it")
+	}
+	if IsStoryOwnedBySiblingWorktree(repo03, "STORY-GOV-5249") {
+		t.Fatalf("expected IsStoryOwnedBySiblingWorktree(repo03, STORY-GOV-5249)=false because repo03 is the owner")
+	}
+
+	brainRoot := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainRoot)
+	conv03 := "34e278f2-fe4a-4991-aee4-d52c0b954556"
+	logs03 := filepath.Join(brainRoot, conv03, ".system_generated", "logs")
+	_ = os.MkdirAll(logs03, 0o755)
+	_ = os.WriteFile(filepath.Join(logs03, "transcript.jsonl"), []byte(repo03Transcript), 0o644)
+
+	if active04, _, story04, _ := InspectActiveBrainASETurnForRepo(repo04, time.Now()); active04 || story04 != "" {
+		t.Fatalf("expected InspectActiveBrainASETurnForRepo(repo04) to ignore repo03 brain transcript, got active=%v story=%q", active04, story04)
+	}
+
+	// Even if repo04's own transcript inspects dirty_story_id: STORY-GOV-5249 on clean main with IDLE state.json,
+	// STORY-GOV-5249 must not be bound to repo04.
+	conv04 := "4aa50403-e90d-4482-8f0d-4d90e306c9f9"
+	logs04 := filepath.Join(brainRoot, conv04, ".system_generated", "logs")
+	_ = os.MkdirAll(logs04, 0o755)
+	repo04DiagTranscript := strings.Join([]string{
+		`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"/autonomous-story-execution why is STORY-GOV-5249 shown"}`,
+		fmt.Sprintf(`{"step_index":1,"type":"TOOL_RESPONSE","content":"{\"repo_path\":%q,\"dirty_story_id\":\"STORY-GOV-5249\",\"active_story_id\":\"STORY-GOV-5249\"}"}`, repo04),
+		fmt.Sprintf(`{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`, filepath.Join(repo04, "README.md")),
+	}, "\n") + "\n"
+	_ = os.WriteFile(filepath.Join(logs04, "transcript.jsonl"), []byte(repo04DiagTranscript), 0o644)
+
+	_, _, gotStory04, _ := InspectActiveBrainASETurnForRepo(repo04, time.Now())
+	if gotStory04 != "" {
+		t.Fatalf("expected repo04 diagnostic turn not to bind sibling story STORY-GOV-5249, got %q", gotStory04)
+	}
+}
+
+
 
 
 

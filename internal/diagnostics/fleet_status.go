@@ -21,7 +21,7 @@ import (
 var (
 	branchExplicitStoryRe  = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+-[0-9]+)\b`)
 	branchSlugStoryRe      = regexp.MustCompile(`(?i)^(?:chore|feat|fix|refactor|docs|test|ci|perf|build)/(?:story-)?([a-z]{2,10})-([0-9]{2,6})(?:[-/]|$)`)
-	transcriptBoundStoryRe = regexp.MustCompile(`(?i)(?:--story(?:-id)?[=\s\\"']+|story\s+begin\s+|/autonomous-story-execution[^\n]{0,120}?|story_id[\\"\s:=]+|session_story_id[^\n]{0,80}?)(STORY-[A-Z0-9]+-[0-9]+)`)
+	transcriptBoundStoryRe = regexp.MustCompile(`(?i)(?:--story(?:-id)?[=\s\\"']+|story\s+begin\s+|/autonomous-story-execution[^\n]{0,120}?|(?:^|[^a-z0-9_])story_id[\\"\s:=]+|session_story_id[^\n]{0,80}?)(STORY-[A-Z0-9]+-[0-9]+)`)
 )
 
 // InferStoryIDFromBranch extracts a canonical STORY-<CAT>-<NUM> identifier from a story branch name
@@ -193,7 +193,8 @@ func InspectRepoFleetStatusWithOptions(ctx context.Context, repoPath string, opt
 	// 4. ASE State & Autopilot locks (with Tier 1 completed-ASE artifact cleanup when no active ASE turn is in flight)
 	parseASEStateWithOpts(cleanPath, opts.AutoRemediateTier1, res)
 	if res.ActiveStoryID == "" && inferredBrainStoryID != "" {
-		if res.HasActiveAgentASETurn || !IsStoryCompletedOnDisk(cleanPath, inferredBrainStoryID) {
+		if canBindTranscriptStoryToRepo(cleanPath, inferredBrainStoryID) &&
+			(res.HasActiveAgentASETurn || IsStoryExplicitlyInProgressOnDisk(cleanPath, inferredBrainStoryID) || !isMainBranch || len(res.NonMainSubmodules) > 0) {
 			res.ActiveStoryID = inferredBrainStoryID
 		}
 	}
@@ -1616,7 +1617,7 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 			if argConvID == "" {
 				argConvID = fdConvID
 			}
-			canBindFDStory := fdStoryID != "" && !IsStoryCompletedOnDisk(repoPath, fdStoryID) &&
+			canBindFDStory := fdStoryID != "" && canBindTranscriptStoryToRepo(repoPath, fdStoryID) &&
 				(fdActiveASE || IsStoryExplicitlyInProgressOnDisk(repoPath, fdStoryID) || nonMainBranch || len(res.NonMainSubmodules) > 0)
 
 			isBetterCandidate := res.AgentTool == "" ||
@@ -2050,10 +2051,18 @@ func inspectDarwinAgentProcessDetailed(pid int, etime string, cmdLine string, ha
 func canonicalizeTranscriptPathText(s string) string {
 	lower := strings.ToLower(s)
 	norm := strings.ReplaceAll(lower, `\\`, `/`)
+	if !strings.Contains(norm, `:\`) {
+		norm = strings.ReplaceAll(norm, `\r\n`, "\n")
+		norm = strings.ReplaceAll(norm, `\n`, "\n")
+		norm = strings.ReplaceAll(norm, `\t`, " ")
+	}
+	norm = strings.ReplaceAll(norm, `\"`, `"`)
 	norm = strings.ReplaceAll(norm, `\`, `/`)
 	for strings.Contains(norm, "//") {
 		norm = strings.ReplaceAll(norm, "//", "/")
 	}
+	norm = strings.ReplaceAll(norm, "/private/var/folders/", "/var/folders/")
+	norm = strings.ReplaceAll(norm, "/private/tmp/", "/tmp/")
 	// Normalize WSL /mnt/<drive>/ to <drive>:/ so Windows C:\... and WSL /mnt/c/... match identically.
 	for i := 0; i < 26; i++ {
 		ch := string(rune('a' + i))
@@ -2064,6 +2073,155 @@ func canonicalizeTranscriptPathText(s string) string {
 		}
 	}
 	return norm
+}
+
+func stripTrailingWorktreeNumber(cleanPath string) string {
+	idx := strings.LastIndexByte(cleanPath, '-')
+	slashIdx := strings.LastIndexByte(cleanPath, '/')
+	if idx <= slashIdx+1 || idx >= len(cleanPath)-1 {
+		return cleanPath
+	}
+	for i := idx + 1; i < len(cleanPath); i++ {
+		if cleanPath[i] < '0' || cleanPath[i] > '9' {
+			return cleanPath
+		}
+	}
+	return cleanPath[:idx]
+}
+
+func isTranscriptPathBoundaryChar(ch byte) bool {
+	return ch == '/' || ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' ||
+		ch == '"' || ch == '\'' || ch == ':' || ch == ';' ||
+		ch == ',' || ch == ')' || ch == ']' || ch == '}' || ch == '>'
+}
+
+func countWorktreeFamilyOccurrences(searchAll, cleanRepo string) (selfCount int, maxOtherSiblingCount int) {
+	familyPrefix := stripTrailingWorktreeNumber(cleanRepo)
+	counts := make(map[string]int)
+	search := searchAll
+	for {
+		idx := strings.Index(search, familyPrefix)
+		if idx < 0 {
+			break
+		}
+		afterPrefix := idx + len(familyPrefix)
+		validBefore := true
+		if idx > 0 && !strings.HasPrefix(familyPrefix, "/") {
+			prev := search[idx-1]
+			if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || prev == '_' || prev == '-' {
+				validBefore = false
+			}
+		}
+		advance := afterPrefix
+		if validBefore {
+			candPath := familyPrefix
+			afterCand := afterPrefix
+			if afterPrefix < len(search) && search[afterPrefix] == '-' {
+				j := afterPrefix + 1
+				for j < len(search) && search[j] >= '0' && search[j] <= '9' {
+					j++
+				}
+				if j > afterPrefix+1 {
+					candPath = search[idx:j]
+					afterCand = j
+					advance = j
+				}
+			}
+			if afterCand >= len(search) {
+				counts[candPath]++
+			} else {
+				rest := search[afterCand:]
+				nextCh := search[afterCand]
+				if nextCh != '-' && !strings.HasPrefix(rest, "/.git/objects") && !strings.HasPrefix(rest, "/.git/modules") {
+					if isTranscriptPathBoundaryChar(nextCh) {
+						counts[candPath]++
+					}
+				}
+			}
+		}
+		if advance <= 0 || advance > len(search) {
+			break
+		}
+		search = search[advance:]
+	}
+	selfCount = counts[cleanRepo]
+	for k, v := range counts {
+		if k != cleanRepo && v > maxOtherSiblingCount {
+			maxOtherSiblingCount = v
+		}
+	}
+	return selfCount, maxOtherSiblingCount
+}
+
+// IsStoryOwnedBySiblingWorktree returns true when storyID is not explicitly active in repoPath
+// (neither in repoPath/.session_story_id, repoPath's git branch, nor IN_PROGRESS on disk in repoPath),
+// and a sibling worktree in the same parent directory explicitly owns storyID.
+func IsStoryOwnedBySiblingWorktree(repoPath, storyID string) bool {
+	sid := strings.ToUpper(strings.TrimSpace(storyID))
+	cleanRepo := filepath.Clean(strings.TrimSpace(repoPath))
+	if cleanRepo == "" || cleanRepo == "." || !strings.HasPrefix(sid, "STORY-") {
+		return false
+	}
+	if b, err := os.ReadFile(filepath.Join(cleanRepo, ".session_story_id")); err == nil &&
+		strings.EqualFold(strings.TrimSpace(string(b)), sid) {
+		return false
+	}
+	if br, ok := readGitWorktreeBranch(cleanRepo); ok && strings.EqualFold(InferStoryIDFromBranch(br), sid) {
+		return false
+	}
+	if IsStoryExplicitlyInProgressOnDisk(cleanRepo, sid) {
+		return false
+	}
+
+	parentDir := filepath.Dir(cleanRepo)
+	familyBase := stripTrailingWorktreeNumber(strings.ToLower(filepath.Base(cleanRepo)))
+	entries, err := os.ReadDir(parentDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		candNameLower := strings.ToLower(e.Name())
+		if stripTrailingWorktreeNumber(candNameLower) != familyBase {
+			continue
+		}
+		sibPath := filepath.Clean(filepath.Join(parentDir, e.Name()))
+		if sibPath == cleanRepo {
+			continue
+		}
+		if b, sErr := os.ReadFile(filepath.Join(sibPath, ".session_story_id")); sErr == nil &&
+			strings.EqualFold(strings.TrimSpace(string(b)), sid) {
+			return true
+		}
+		if lockInfo, lErr := repolock.Read(sibPath); lErr == nil && strings.EqualFold(strings.TrimSpace(lockInfo.StoryID), sid) {
+			return true
+		}
+		if br, ok := readGitWorktreeBranch(sibPath); ok && strings.EqualFold(InferStoryIDFromBranch(br), sid) {
+			return true
+		}
+		if IsStoryExplicitlyInProgressOnDisk(sibPath, sid) {
+			return true
+		}
+	}
+	return false
+}
+
+func canBindTranscriptStoryToRepo(repoPath, storyID string) bool {
+	sid := strings.ToUpper(strings.TrimSpace(storyID))
+	if !strings.HasPrefix(sid, "STORY-") {
+		return false
+	}
+	if IsStoryCompletedOnDisk(repoPath, sid) || IsStoryOwnedBySiblingWorktree(repoPath, sid) {
+		return false
+	}
+	if strings.TrimSpace(repoPath) != "" && hasExplicitIdleStateFile(repoPath) && !hasSessionStoryFile(repoPath) {
+		if br, ok := readGitWorktreeBranch(repoPath); !ok || br == "main" || br == "master" {
+			return IsStoryExplicitlyInProgressOnDisk(repoPath, sid)
+		}
+	}
+	return true
 }
 
 // TranscriptReferencesRepoPath returns true if transcript text references repoPath (across Windows C:\...,
@@ -2077,56 +2235,29 @@ func TranscriptReferencesRepoPath(text, repoPath string) bool {
 	}
 	searchAll := canonicalizeTranscriptPathText(text)
 	if cwdMarker := "command working directory: "; strings.Contains(searchAll, cwdMarker) {
-		idx := strings.Index(searchAll, cwdMarker)
-		rest := searchAll[idx+len(cwdMarker):]
-		if nl := strings.IndexAny(rest, "\r\n\""); nl >= 0 {
-			rest = rest[:nl]
-		}
-		declaredCWD := strings.TrimRight(strings.TrimSpace(rest), "/")
-		if declaredCWD != "" {
-			return declaredCWD == cleanRepo
+		searchCWD := searchAll
+		for {
+			idx := strings.Index(searchCWD, cwdMarker)
+			if idx < 0 {
+				break
+			}
+			rest := searchCWD[idx+len(cwdMarker):]
+			if nl := strings.IndexAny(rest, "\r\n\"'"); nl >= 0 {
+				rest = rest[:nl]
+			}
+			if cutIdx := strings.Index(rest, "/napp data directory:"); cutIdx >= 0 {
+				rest = rest[:cutIdx]
+			}
+			declaredCWD := strings.TrimRight(strings.TrimSpace(rest), "/")
+			if strings.HasPrefix(declaredCWD, "/") || (len(declaredCWD) >= 3 && declaredCWD[1] == ':' && declaredCWD[2] == '/') {
+				return declaredCWD == cleanRepo
+			}
+			searchCWD = searchCWD[idx+len(cwdMarker):]
 		}
 	}
 
-	selfCount := 0
-	siblingDashCount := 0
-	search := searchAll
-	for {
-		idx := strings.Index(search, cleanRepo)
-		if idx < 0 {
-			break
-		}
-		afterIdx := idx + len(cleanRepo)
-		validBefore := true
-		if idx > 0 && !strings.HasPrefix(cleanRepo, "/") {
-			prev := search[idx-1]
-			if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || prev == '_' || prev == '-' {
-				validBefore = false
-			}
-		}
-		if validBefore {
-			if afterIdx >= len(search) {
-				selfCount++
-			} else {
-				rest := search[afterIdx:]
-				nextCh := search[afterIdx]
-				if nextCh == '-' {
-					siblingDashCount++
-				} else if !strings.HasPrefix(rest, "/.git/objects") && !strings.HasPrefix(rest, "/.git/modules") {
-					if nextCh == '/' || nextCh == ' ' || nextCh == '\t' || nextCh == '\n' || nextCh == '\r' ||
-						nextCh == '"' || nextCh == '\'' || nextCh == ':' || nextCh == ';' ||
-						nextCh == ',' || nextCh == ')' || nextCh == ']' || nextCh == '}' || nextCh == '>' {
-						selfCount++
-					}
-				}
-			}
-		}
-		search = search[afterIdx:]
-	}
-	if selfCount == 0 {
-		return false
-	}
-	if siblingDashCount > selfCount {
+	selfCount, maxOtherSiblingCount := countWorktreeFamilyOccurrences(searchAll, cleanRepo)
+	if selfCount == 0 || maxOtherSiblingCount >= selfCount {
 		return false
 	}
 	return true
@@ -2241,13 +2372,13 @@ func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bo
 					continue
 				}
 				var candStory string
-				matches := transcriptBoundStoryRe.FindAllStringSubmatch(tailStr, -1)
-				if len(matches) == 0 {
-					matches = transcriptBoundStoryRe.FindAllStringSubmatch(headStr, -1)
-				}
-				for i := len(matches) - 1; i >= 0; i-- {
-					sid := strings.ToUpper(matches[i][1])
-					if !IsStoryCompletedOnDisk(repoPath, sid) {
+				allMatches := append(
+					transcriptBoundStoryRe.FindAllStringSubmatch(headStr, -1),
+					transcriptBoundStoryRe.FindAllStringSubmatch(tailStr, -1)...,
+				)
+				for i := len(allMatches) - 1; i >= 0; i-- {
+					sid := strings.ToUpper(allMatches[i][1])
+					if canBindTranscriptStoryToRepo(repoPath, sid) {
 						candStory = sid
 						break
 					}
@@ -2283,7 +2414,7 @@ func discoverActiveBrainTranscriptForRepo(repoPath string, now time.Time, res *R
 	if res.ActiveConversationID == "" && convID != "" {
 		res.ActiveConversationID = convID
 	}
-	if res.ActiveStoryID == "" && storyID != "" && !IsStoryCompletedOnDisk(repoPath, storyID) {
+	if res.ActiveStoryID == "" && storyID != "" && canBindTranscriptStoryToRepo(repoPath, storyID) {
 		res.ActiveStoryID = storyID
 	}
 	if res.AgentTool == "" {
@@ -2366,6 +2497,7 @@ func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPa
 		cmdLine := strings.Join(fields[3:], " ")
 
 		// 1. Direct command-line path match with strict boundary verification
+		nonMainBranch := res != nil && res.Branch != "" && res.Branch != "main" && res.Branch != "master" && res.Branch != "HEAD" && !isAutomatedMaintenanceBranch(res.Branch)
 		if LineContainsExactRepoPath(cmdLine, repoPath) {
 			prov, convID, isIdle, activeASE, storyID := inspectDarwinAgentProcessDetailed(pid, etime, cmdLine, res.LockDetails != "")
 			if isIdle {
@@ -2378,7 +2510,8 @@ func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPa
 			if activeASE {
 				res.HasActiveAgentASETurn = true
 			}
-			if storyID != "" && res.ActiveStoryID == "" && !IsStoryCompletedOnDisk(repoPath, storyID) {
+			if storyID != "" && res.ActiveStoryID == "" && canBindTranscriptStoryToRepo(repoPath, storyID) &&
+				(activeASE || IsStoryExplicitlyInProgressOnDisk(repoPath, storyID) || nonMainBranch || len(res.NonMainSubmodules) > 0) {
 				res.ActiveStoryID = storyID
 			}
 			if convID != "" && res.ActiveConversationID == "" {
@@ -2391,6 +2524,7 @@ func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPa
 
 	// 2. Check working directory of candidate agent processes via lsof -a -d cwd -p <pids> -F pn
 	if len(cwdCandidates) > 0 {
+		nonMainBranch := res != nil && res.Branch != "" && res.Branch != "main" && res.Branch != "master" && res.Branch != "HEAD" && !isAutomatedMaintenanceBranch(res.Branch)
 		pidStrs := make([]string, 0, len(cwdCandidates))
 		pidToCand := make(map[int]candidateProc, len(cwdCandidates))
 		for _, c := range cwdCandidates {
@@ -2422,7 +2556,8 @@ func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPa
 						if activeASE {
 							res.HasActiveAgentASETurn = true
 						}
-						if storyID != "" && res.ActiveStoryID == "" && !IsStoryCompletedOnDisk(repoPath, storyID) {
+						if storyID != "" && res.ActiveStoryID == "" && canBindTranscriptStoryToRepo(repoPath, storyID) &&
+							(activeASE || IsStoryExplicitlyInProgressOnDisk(repoPath, storyID) || nonMainBranch || len(res.NonMainSubmodules) > 0) {
 							res.ActiveStoryID = storyID
 						}
 						if convID != "" && res.ActiveConversationID == "" {
