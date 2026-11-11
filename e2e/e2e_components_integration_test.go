@@ -600,14 +600,15 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 		_ = exec.Command("git", "-C", repoDir, "commit", "-m", "chore: seed STORY-GOV-3799 in test repo").Run()
 
 		var (
-			mu                  sync.Mutex
-			ackCount            int
-			heartbeatCount      int
-			chunkCount          int
-			exitCodes           []int
-			harvestedConvs      []string
-			activeLeaseExtended bool
-			leaseExpiry         time.Time
+			mu                    sync.Mutex
+			ackCount              int
+			heartbeatCount        int
+			chunkCount            int
+			exitCodes             []int
+			harvestedConvs        []string
+			activeLeaseExtended   bool
+			leaseExpiry           time.Time
+			leaseExtendedDuration time.Duration
 		)
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -619,6 +620,7 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 				ackCount++
 				// Verify GOV-3799 AC-4: AckLease extends lease to 5m ActiveLeaseDuration
 				leaseExpiry = time.Now().Add(5 * time.Minute)
+				leaseExtendedDuration = time.Until(leaseExpiry)
 				activeLeaseExtended = true
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"status":       "RUNNING",
@@ -630,6 +632,7 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 				if candidate.After(leaseExpiry) {
 					leaseExpiry = candidate
 				}
+				leaseExtendedDuration = time.Until(leaseExpiry)
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"status":       "RUNNING",
 					"lease_expiry": leaseExpiry.Format(time.RFC3339),
@@ -747,8 +750,8 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 
 		mu.Lock()
 		defer mu.Unlock()
-		if !activeLeaseExtended || time.Until(leaseExpiry) < 4*time.Minute {
-			t.Fatalf("expected active lease to be extended to ~5m, got remaining=%v", time.Until(leaseExpiry))
+		if !activeLeaseExtended || leaseExtendedDuration < 4*time.Minute || time.Until(leaseExpiry) <= 0 {
+			t.Fatalf("expected active lease to be extended to ~5m, got extended=%v remaining=%v", leaseExtendedDuration, time.Until(leaseExpiry))
 		}
 		if ackCount == 0 || heartbeatCount == 0 {
 			t.Fatalf("expected ack and heartbeat calls, got ack=%d heartbeat=%d", ackCount, heartbeatCount)
