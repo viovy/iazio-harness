@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/viovy/iazio-harness/internal/autopilot"
@@ -63,9 +65,8 @@ func runPromptRun(args []string) error {
 	result, execErr := executor.Execute(ctx, payload)
 
 	if result != nil {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if encErr := enc.Encode(result); encErr != nil {
+		_ = persistPromptResultEnvelope(result, payload)
+		if encErr := encodePromptResultToWriter(os.Stdout, result); encErr != nil {
 			return writePromptError(fmt.Errorf("failed to encode result: %w", encErr))
 		}
 		if execErr != nil {
@@ -78,6 +79,71 @@ func runPromptRun(args []string) error {
 	}
 
 	return writePromptError(execErr)
+}
+
+func isBrokenPipeOrClosedPipeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, os.ErrClosed) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "broken pipe") ||
+		strings.Contains(lower, "pipe is being closed") ||
+		strings.Contains(lower, "file already closed")
+}
+
+func persistPromptResultEnvelope(result *autopilot.PromptResult, payload prompt.PromptPayload) string {
+	if result == nil {
+		return ""
+	}
+	resultFile := strings.TrimSpace(os.Getenv("IAZIO_RESULT_FILE"))
+	if resultFile == "" {
+		jobID := strings.TrimSpace(os.Getenv("IAZIO_JOB_ID"))
+		if jobID == "" {
+			jobID = strings.TrimSpace(payload.PromptID)
+		}
+		if jobID != "" && !strings.ContainsAny(jobID, "/\\") {
+			if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+				resultFile = filepath.Join(home, ".iazio", "runs", jobID, "result.json")
+			}
+		}
+	}
+	if resultFile == "" {
+		return ""
+	}
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return ""
+	}
+	if err := os.MkdirAll(filepath.Dir(resultFile), 0o700); err != nil {
+		return ""
+	}
+	tmpFile := resultFile + ".tmp"
+	if err := os.WriteFile(tmpFile, append(data, '\n'), 0o600); err != nil {
+		return ""
+	}
+	if err := os.Rename(tmpFile, resultFile); err != nil {
+		_ = os.Remove(tmpFile)
+		return ""
+	}
+	return resultFile
+}
+
+func encodePromptResultToWriter(w io.Writer, result *autopilot.PromptResult) error {
+	if result == nil {
+		return nil
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if encErr := enc.Encode(result); encErr != nil {
+		if isBrokenPipeOrClosedPipeError(encErr) {
+			return nil
+		}
+		return encErr
+	}
+	return nil
 }
 
 func writePromptError(err error) error {

@@ -555,7 +555,7 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 			}
 		}
 		if _, err := os.Stat(harvesterMainDir); err == nil {
-			harvesterBin := filepath.Join(homeDir, ".local", "bin", "iazio-harvester")
+			harvesterBin := filepath.Join(homeDir, ".local", "bin", "iazio-harvester.test")
 			cmd := exec.Command("go", "build", "-buildvcs=false", "-o", harvesterBin, "./cmd/iazio-harvester")
 			cmd.Dir = filepath.Clean(filepath.Join("..", "..", "iazio-harvester"))
 			if out, err := cmd.CombinedOutput(); err != nil {
@@ -575,6 +575,7 @@ func TestE2E_Gov3799_AllScenarios_MultiComponentMockAgy(t *testing.T) {
 				"IAZIO_DISABLE_SERVICE_CONTROL=1",
 			)
 			_, _ = cmdVer.CombinedOutput()
+			_ = os.Remove(harvesterBin)
 			if _, err := os.Stat(legacyHarvester); !os.IsNotExist(err) {
 				t.Fatalf("expected legacy shadow binary %s to be removed after single-home reconciliation", legacyHarvester)
 			}
