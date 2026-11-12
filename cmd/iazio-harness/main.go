@@ -31,14 +31,14 @@ import (
 	"github.com/viovy/iazio-harness/internal/diagnostics"
 	"github.com/viovy/iazio-harness/internal/engines"
 	"github.com/viovy/iazio-harness/internal/gitclean"
-	"github.com/viovy/iazio-harness/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 	"github.com/viovy/iazio-harness/internal/prompt"
 	"github.com/viovy/iazio-harness/internal/proof"
 	"github.com/viovy/iazio-harness/internal/repolock"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 	"github.com/viovy/iazio-harness/internal/spool"
 	"github.com/viovy/iazio-harness/internal/story"
-	"github.com/viovy/iazio-harness/internal/telemetry"
+	"github.com/viovy/iazio-core/pkg/telemetry"
 	"github.com/viovy/iazio-harness/internal/watchdog"
 )
 

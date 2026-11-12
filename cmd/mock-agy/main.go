@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/viovy/iazio-harness/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 func main() {
