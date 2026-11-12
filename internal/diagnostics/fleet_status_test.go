@@ -1527,6 +1527,58 @@ func TestStoryGov5254_CrossWorktreeTranscriptAndSiblingStoryGuard(t *testing.T) 
 	}
 }
 
+func TestDeadRepoLockAndStaleSessionStoryFile_ClassifyAsFailedDirtyInsteadOfLiveAdhocASE(t *testing.T) {
+	tmpDir := t.TempDir()
+	_ = exec.Command("git", "init", "-b", "feat/gov-5249-oss-clean-room-hygiene", tmpDir).Run()
+	_ = exec.Command("git", "-C", tmpDir, "config", "user.email", "test@example.com").Run()
+	_ = exec.Command("git", "-C", tmpDir, "config", "user.name", "Test User").Run()
+
+	storiesDir := filepath.Join(tmpDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0o755)
+	_ = os.WriteFile(filepath.Join(storiesDir, "2026-11-11-gov-5249.story.md"), []byte("---\nid: STORY-GOV-5249\nstatus: IN_PROGRESS\n---\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(tmpDir, ".session_story_id"), []byte("STORY-GOV-5249\n"), 0o644)
+
+	// 1. Dead .iazio/repo.lock (post-reboot orphan with dead PID 999999)
+	iazioDir := filepath.Join(tmpDir, ".iazio")
+	_ = os.MkdirAll(iazioDir, 0o755)
+	_ = os.WriteFile(filepath.Join(iazioDir, "repo.lock"), []byte(`{"job_id":"job_de8c502853f28781","pid":999999,"status":"RUNNING"}`), 0o644)
+
+	res := &RepoFleetStatusResult{
+		Branch:              "feat/gov-5249-oss-clean-room-hygiene",
+		ActiveStoryID:       "STORY-GOV-5249",
+		ASEState:            "RUNNING",
+		CurrentPhase:        "ADHOC_ASE",
+		ToolLiveness:        "NONE",
+		ExecutionProvenance: "NONE",
+	}
+	reconcileAdhocASEStateWithOpts(tmpDir, true, res)
+	if res.ASEState != "FAILED_DIRTY" || res.ToolLiveness != "TERMINATED" || res.ExecutionProvenance != "NONE" {
+		t.Fatalf("expected dead repo.lock on incomplete story branch to report FAILED_DIRTY/TERMINATED/NONE, got ASEState=%q ToolLiveness=%q Provenance=%q",
+			res.ASEState, res.ToolLiveness, res.ExecutionProvenance)
+	}
+	if _, err := os.Stat(filepath.Join(iazioDir, "repo.lock")); !os.IsNotExist(err) {
+		t.Fatalf("expected Tier 1 remediation to remove stale .iazio/repo.lock with dead PID")
+	}
+
+	// 2. Stale .session_story_id (>15m old) with no live process or lock
+	staleTime := time.Now().Add(-2 * time.Hour)
+	_ = os.Chtimes(filepath.Join(tmpDir, ".session_story_id"), staleTime, staleTime)
+	resStale := &RepoFleetStatusResult{
+		Branch:              "feat/gov-5249-oss-clean-room-hygiene",
+		ActiveStoryID:       "STORY-GOV-5249",
+		ASEState:            "RUNNING",
+		CurrentPhase:        "ADHOC_ASE",
+		ToolLiveness:        "NONE",
+		ExecutionProvenance: "NONE",
+	}
+	reconcileAdhocASEStateWithOpts(tmpDir, false, resStale)
+	if resStale.ASEState != "FAILED_DIRTY" || resStale.ToolLiveness != "TERMINATED" || resStale.ExecutionProvenance != "NONE" {
+		t.Fatalf("expected stale .session_story_id (>15m old) with no live process to report FAILED_DIRTY/TERMINATED/NONE, got ASEState=%q ToolLiveness=%q Provenance=%q",
+			resStale.ASEState, resStale.ToolLiveness, resStale.ExecutionProvenance)
+	}
+}
+
+
 
 
 
