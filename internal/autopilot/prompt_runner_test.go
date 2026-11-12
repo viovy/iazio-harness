@@ -2209,6 +2209,34 @@ func TestStoryGov5253_ConcisePromptSummaryStripsTranscriptAndSupervisorLines(t *
 	}
 }
 
+func TestStoryGov5265_ConcisePromptSummary500CharCeilingAndCraftCloseoutHeadline(t *testing.T) {
+	if MaxPromptSummaryChars != 500 {
+		t.Fatalf("expected MaxPromptSummaryChars == 500, got %d", MaxPromptSummaryChars)
+	}
+	var transcript strings.Builder
+	for i := 1; i <= 500; i++ {
+		transcript.WriteString(fmt.Sprintf("[agy step #%d] thinking: Deep step trace %d %s\n", i, i, strings.Repeat("y", 100)))
+	}
+	rawOut := strings.Join([]string{
+		"Created conversation 0dedaca4-27ef-4d0e-b3db-60c0749eb3ce",
+		strings.Repeat("intermediate compilation output line with verbose diagnostic text\n", 25),
+		"## CRAFT Closeout",
+		"### **Result**",
+		"Completed STORY-GOV-5265 — list_queue and result.summary bounded to <= 500 chars and <= 2,000 tokens.",
+	}, "\n")
+
+	summary := BuildConcisePromptSummary(rawOut, transcript.String(), "", nil)
+	if len(summary) > 500 {
+		t.Fatalf("expected summary length <= 500 chars, got %d:\n%s", len(summary), summary)
+	}
+	if strings.Contains(summary, "[agy step #") {
+		t.Fatalf("expected zero [agy step # lines in summary, got:\n%s", summary)
+	}
+	if !strings.Contains(summary, "## CRAFT Closeout") || !strings.Contains(summary, "Completed STORY-GOV-5265") {
+		t.Fatalf("expected CRAFT closeout headline in summary, got:\n%s", summary)
+	}
+}
+
 func TestStoryGov5256_ClassifyPromptFailure_ASEGateNotOverriddenByTranscriptNoise(t *testing.T) {
 	transcriptWith429 := strings.Join([]string{
 		"[agy step #92] thinking: Earlier call returned 429 ResourceExhausted quota limit on helper subagent",

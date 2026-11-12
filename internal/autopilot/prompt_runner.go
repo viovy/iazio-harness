@@ -269,13 +269,59 @@ type PromptResult struct {
 	DurationMs           int64    `json:"duration_ms"`
 }
 
-// MaxPromptSummaryChars is the maximum length of PromptResult.Summary (AC2).
-const MaxPromptSummaryChars = 1000
+// MaxPromptSummaryChars is the maximum length of PromptResult.Summary (AC3: <= 500 chars).
+const MaxPromptSummaryChars = 500
 
 var agyStepOutputPrefixRegex = regexp.MustCompile(`^(?:\[[^\]]+\]\s*)?\[agy step #\d+\]\s*output:\s*(.+)$`)
 
-// BuildConcisePromptSummary builds a concise executive summary (<=1,000 chars)
-// stripped of [agy step #...] trace lines and [ASE-SUPERVISOR] log lines.
+// extractCraftOrTerminalHeadline extracts a CRAFT closeout headline or terminal status line
+// from raw output or transcript lines if present.
+func extractCraftOrTerminalHeadline(sources ...string) string {
+	var headline string
+	for _, src := range sources {
+		lines := strings.Split(src, "\n")
+		for i, rawLine := range lines {
+			trimmed := strings.TrimSpace(rawLine)
+			if m := agyStepOutputPrefixRegex.FindStringSubmatch(trimmed); len(m) > 1 {
+				trimmed = strings.TrimSpace(m[1])
+			}
+			if trimmed == "" || strings.Contains(trimmed, "[agy step #") || strings.Contains(trimmed, "[ASE-SUPERVISOR]") {
+				continue
+			}
+			lower := strings.ToLower(trimmed)
+			if strings.HasPrefix(lower, "## craft closeout") || strings.HasPrefix(lower, "# craft closeout") {
+				// Look ahead for the first substantive non-heading line (e.g. Result / Context bullet)
+				detail := ""
+				for j := i + 1; j < len(lines) && j <= i+12; j++ {
+					cand := strings.TrimSpace(lines[j])
+					if m := agyStepOutputPrefixRegex.FindStringSubmatch(cand); len(m) > 1 {
+						cand = strings.TrimSpace(m[1])
+					}
+					if cand == "" || strings.HasPrefix(cand, "#") || strings.Contains(cand, "[agy step #") || strings.Contains(cand, "[ASE-SUPERVISOR]") {
+						continue
+					}
+					detail = cand
+					break
+				}
+				if detail != "" {
+					headline = trimmed + " — " + detail
+				} else {
+					headline = trimmed
+				}
+			} else if strings.Contains(lower, "autonomous story execution is complete") || strings.Contains(lower, "craft closeout") {
+				headline = trimmed
+			}
+		}
+	}
+	if len(headline) > 280 {
+		headline = strings.TrimSpace(headline[:277]) + "..."
+	}
+	return headline
+}
+
+// BuildConcisePromptSummary builds a concise executive summary (<=500 chars)
+// stripped of [agy step #...] trace lines and [ASE-SUPERVISOR] log lines,
+// prioritizing CRAFT closeout headlines or terminal status lines rather than duplicating output.
 func BuildConcisePromptSummary(rawOut, rawTranscript, rawErr string, waitErr error) string {
 	filterCleanLines := func(s string) string {
 		if strings.TrimSpace(s) == "" {
@@ -307,8 +353,22 @@ func BuildConcisePromptSummary(rawOut, rawTranscript, rawErr string, waitErr err
 			}
 		}
 	}
+	craftHeadline := extractCraftOrTerminalHeadline(rawTranscript, rawOut)
+	if craftHeadline != "" && lastStepOutput == "" {
+		lastStepOutput = craftHeadline
+	}
+	if len(lastStepOutput) > 320 {
+		lastStepOutput = strings.TrimSpace(lastStepOutput[:317]) + "..."
+	}
 
 	summary := filterCleanLines(rawOut)
+	if craftHeadline != "" && !strings.Contains(summary, craftHeadline) {
+		if summary == "" {
+			summary = craftHeadline
+		} else {
+			summary = craftHeadline + "\n" + summary
+		}
+	}
 	if lastStepOutput != "" && !strings.Contains(summary, lastStepOutput) {
 		if summary == "" {
 			summary = lastStepOutput
