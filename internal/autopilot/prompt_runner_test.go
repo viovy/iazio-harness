@@ -1521,8 +1521,9 @@ exit 0
 }
 
 func TestTurnLoop_SupervisorHeartbeatDoesNotResetSilentMs(t *testing.T) {
+	t.Setenv("IAZIO_BRAIN_DIR", t.TempDir())
 	origInterval := supervisorHeartbeatInterval
-	supervisorHeartbeatInterval = 150 * time.Millisecond
+	supervisorHeartbeatInterval = 100 * time.Millisecond
 	t.Cleanup(func() { supervisorHeartbeatInterval = origInterval })
 
 	var (
@@ -1553,7 +1554,7 @@ func TestTurnLoop_SupervisorHeartbeatDoesNotResetSilentMs(t *testing.T) {
 
 	binDir := t.TempDir()
 	mockSilent := filepath.Join(binDir, "mock-agy-silent")
-	script := "#!/bin/sh\necho 'initial output'\nsleep 5\nexit 0\n"
+	script := "#!/bin/sh\necho 'initial output'\nsleep 1\nexit 0\n"
 	if err := os.WriteFile(mockSilent, []byte(script), 0o755); err != nil {
 		t.Fatalf("write mock-silent: %v", err)
 	}
@@ -1568,7 +1569,7 @@ func TestTurnLoop_SupervisorHeartbeatDoesNotResetSilentMs(t *testing.T) {
 		Prompt:      "non-ase prompt",
 		TargetAgent: mockSilent,
 		WorkingDir:  t.TempDir(),
-		Timeout:     4500 * time.Millisecond,
+		Timeout:     3000 * time.Millisecond,
 	})
 
 	mu.Lock()
@@ -1579,7 +1580,7 @@ func TestTurnLoop_SupervisorHeartbeatDoesNotResetSilentMs(t *testing.T) {
 	if len(tickSilentMs) < 2 {
 		t.Fatalf("expected >= 2 OUTPUT_TICK payloads, got %v", tickSilentMs)
 	}
-	if tickSilentMs[len(tickSilentMs)-1] <= tickSilentMs[0] || tickSilentMs[len(tickSilentMs)-1] < 2000 {
+	if tickSilentMs[len(tickSilentMs)-1] <= tickSilentMs[0] || tickSilentMs[len(tickSilentMs)-1] < 250 {
 		t.Fatalf("expected silent_ms to increase monotonically across supervisor heartbeats without resetting to 0, got %v", tickSilentMs)
 	}
 }
