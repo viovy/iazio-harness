@@ -33,9 +33,16 @@ func runPromptCommand(args []string) error {
 
 func runPromptRun(args []string) error {
 	jsonMode := false
-	for _, arg := range args {
+	var promptFlag string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 		if arg == "--json" || arg == "-json" {
 			jsonMode = true
+		} else if (arg == "--prompt" || arg == "-prompt") && i+1 < len(args) {
+			promptFlag = args[i+1]
+			i++
+		} else if strings.HasPrefix(arg, "--prompt=") {
+			promptFlag = strings.TrimPrefix(arg, "--prompt=")
 		}
 	}
 
@@ -48,8 +55,36 @@ func runPromptRun(args []string) error {
 	if err != nil {
 		return writePromptError(fmt.Errorf("failed to read stdin: %w", err))
 	}
-	if len(stdinData) == 0 {
-		return writePromptError(errors.New("empty stdin JSON payload"))
+	if len(strings.TrimSpace(string(stdinData))) == 0 {
+		fallbackPrompt := strings.TrimSpace(promptFlag)
+		if fallbackPrompt == "" {
+			fallbackPrompt = strings.TrimSpace(os.Getenv("IAZIO_PROMPT"))
+		}
+		fallbackStoryID := strings.TrimSpace(os.Getenv("IAZIO_STORY_ID"))
+		if fallbackPrompt == "" && fallbackStoryID != "" {
+			fallbackPrompt = "/autonomous-story-execution " + fallbackStoryID
+		}
+		if fallbackPrompt == "" {
+			return writePromptError(errors.New("empty stdin JSON payload"))
+		}
+		synth := map[string]any{
+			"prompt": fallbackPrompt,
+		}
+		if jid := strings.TrimSpace(os.Getenv("IAZIO_JOB_ID")); jid != "" {
+			synth["prompt_id"] = "prompt-" + jid
+		} else if fallbackStoryID != "" {
+			synth["prompt_id"] = "prompt-" + fallbackStoryID
+		}
+		if fallbackStoryID != "" {
+			synth["story_id"] = fallbackStoryID
+		}
+		if repoEnv := strings.TrimSpace(os.Getenv("IAZIO_REPO")); repoEnv != "" {
+			synth["repo"] = repoEnv
+		}
+		if agentEnv := strings.TrimSpace(os.Getenv("IAZIO_TARGET_AGENT")); agentEnv != "" {
+			synth["target_agent"] = agentEnv
+		}
+		stdinData, _ = json.Marshal(synth)
 	}
 
 	var payload prompt.PromptPayload
