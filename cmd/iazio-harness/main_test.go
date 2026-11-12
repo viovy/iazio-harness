@@ -16,8 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/viovy/iazio-harness/internal/autopilot"
 	"github.com/viovy/iazio-harness/internal/checkpoint"
 	"github.com/viovy/iazio-harness/internal/controlplane"
+	"github.com/viovy/iazio-harness/internal/prompt"
 	"github.com/viovy/iazio-harness/internal/spool"
 )
 
@@ -2845,4 +2847,46 @@ func TestExecuteMain_FlushesTelemetryOnErrorAndSuccess(t *testing.T) {
 		t.Fatalf("expected executeMain(nil) to return 1, got %d", code)
 	}
 }
+
+type brokenPipeWriter struct{}
+
+func (brokenPipeWriter) Write(_ []byte) (int, error) {
+	return 0, errors.New("write |1: The pipe is being closed.")
+}
+
+func TestStoryGov5257_PersistPromptResultEnvelopeAndBrokenPipeImmunity(t *testing.T) {
+	tmpDir := t.TempDir()
+	resFile := filepath.Join(tmpDir, "runs", "job_gov5257", "result.json")
+	t.Setenv("IAZIO_RESULT_FILE", resFile)
+
+	res := &autopilot.PromptResult{
+		PromptID:       "job_gov5257",
+		Status:         "completed",
+		ExitCode:       0,
+		StoryID:        "STORY-GOV-5257",
+		ConversationID: "conv-gov5257",
+		Summary:        "Completed STORY-GOV-5257",
+	}
+	path := persistPromptResultEnvelope(res, prompt.PromptPayload{PromptID: "job_gov5257"})
+	if path != resFile {
+		t.Fatalf("expected persisted path %q, got %q", resFile, path)
+	}
+	raw, err := os.ReadFile(resFile)
+	if err != nil {
+		t.Fatalf("read persisted result file: %v", err)
+	}
+	var decoded autopilot.PromptResult
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal persisted result: %v", err)
+	}
+	if decoded.Status != "completed" || decoded.StoryID != "STORY-GOV-5257" {
+		t.Fatalf("unexpected decoded result: %+v", decoded)
+	}
+
+	// Broken pipe on stdout must be treated as non-fatal when encoding PromptResult
+	if err := encodePromptResultToWriter(brokenPipeWriter{}, res); err != nil {
+		t.Fatalf("expected broken pipe writer to be ignored cleanly, got %v", err)
+	}
+}
+
 
