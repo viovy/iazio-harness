@@ -1172,6 +1172,40 @@ func hasSessionStoryFile(repoPath string) bool {
 	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(string(b))), "STORY-")
 }
 
+func hasDeadRunningRepoLock(repoPath string) bool {
+	if strings.TrimSpace(repoPath) == "" {
+		return false
+	}
+	lockInfo, err := repolock.Read(repoPath)
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(lockInfo.Status), "RUNNING") &&
+		lockInfo.PID <= 0 && lockInfo.HarnessPID <= 0 && lockInfo.ToolPID <= 0 {
+		return false
+	}
+	if (lockInfo.PID > 0 && isPIDAlive(lockInfo.PID)) ||
+		(lockInfo.HarnessPID > 0 && isPIDAlive(lockInfo.HarnessPID)) ||
+		(lockInfo.ToolPID > 0 && isPIDAlive(lockInfo.ToolPID)) {
+		return false
+	}
+	return true
+}
+
+func isSessionStoryFileStale(repoPath string, now time.Time) bool {
+	if strings.TrimSpace(repoPath) == "" {
+		return false
+	}
+	fi, err := os.Stat(filepath.Join(repoPath, ".session_story_id"))
+	if err != nil || fi.IsDir() {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return !fi.ModTime().IsZero() && now.Sub(fi.ModTime()) > 15*time.Minute
+}
+
 func pruneCompletedSubmoduleSessionStoryFiles(repoPath string, res *RepoFleetStatusResult) {
 	if strings.TrimSpace(repoPath) == "" {
 		return
@@ -1427,8 +1461,15 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 		storyCompleted := IsStoryCompletedOnDisk(repoPath, res.ActiveStoryID)
 		explicitIdle := hasExplicitIdleStateFile(repoPath)
 		hasRootSessionFile := hasSessionStoryFile(repoPath)
-		if storyCompleted && explicitIdle {
+		deadRepoLock := hasDeadRunningRepoLock(repoPath)
+		staleSessionFile := isSessionStoryFileStale(repoPath, time.Now())
+		if storyCompleted && (explicitIdle || deadRepoLock || staleSessionFile) {
 			if autoRemediateTier1 {
+				if deadRepoLock {
+					_ = os.Remove(filepath.Join(repoPath, ".iazio", "repo.lock"))
+					res.RemediationApplied = true
+					res.RemediationActions = append(res.RemediationActions, "released stale .iazio/repo.lock with dead PID")
+				}
 				if changed, action := cleanOrRestoreSessionStoryFile(repoPath, res.ActiveStoryID); changed {
 					res.RemediationApplied = true
 					res.RemediationActions = append(res.RemediationActions, action)
@@ -1447,7 +1488,12 @@ func reconcileAdhocASEStateWithOpts(repoPath string, autoRemediateTier1 bool, re
 				}
 			}
 			res.ExecutionProvenance = "NONE"
-		} else if !storyCompleted && (explicitIdle || (!hasRootSessionFile && (res.CurrentPhase == "ADHOC_ASE" || nonMainBranch || len(res.NonMainSubmodules) > 0))) {
+		} else if !storyCompleted && (explicitIdle || deadRepoLock || staleSessionFile || (!hasRootSessionFile && (res.CurrentPhase == "ADHOC_ASE" || nonMainBranch || len(res.NonMainSubmodules) > 0))) {
+			if autoRemediateTier1 && deadRepoLock {
+				_ = os.Remove(filepath.Join(repoPath, ".iazio", "repo.lock"))
+				res.RemediationApplied = true
+				res.RemediationActions = append(res.RemediationActions, "released stale .iazio/repo.lock with dead PID")
+			}
 			if res.CurrentPhase == "ADHOC_ASE" {
 				res.CurrentPhase = ""
 			}
