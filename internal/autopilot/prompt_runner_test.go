@@ -1196,6 +1196,12 @@ fi
 }
 
 func TestJobCbbb1363993215f9_PulledDoneStoryNeverShadowsNewlyAllocatedSessionStory(t *testing.T) {
+	mockAgyBin := filepath.Join(t.TempDir(), "mock-agy")
+	buildCmd := exec.Command("go", "build", "-buildvcs=false", "-o", mockAgyBin, "../../cmd/mock-agy")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("build mock-agy failed: %v (%s)", err, string(out))
+	}
+
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
 	t.Setenv("MOCK_AGY_SCENARIO", "job_cbbb1363993215f9_wave4_pulled_done_story_override")
@@ -1206,12 +1212,6 @@ func TestJobCbbb1363993215f9_PulledDoneStoryNeverShadowsNewlyAllocatedSessionSto
 	_ = exec.Command("git", "-C", repoDir, "init").Run()
 	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
 	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Tester").Run()
-
-	mockAgyBin := filepath.Join(t.TempDir(), "mock-agy")
-	buildCmd := exec.Command("go", "build", "-buildvcs=false", "-o", mockAgyBin, "../../cmd/mock-agy")
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("build mock-agy failed: %v (%s)", err, string(out))
-	}
 
 	var mu sync.Mutex
 	var boundStoryIDs []string
@@ -1266,6 +1266,12 @@ func TestJobCbbb1363993215f9_PulledDoneStoryNeverShadowsNewlyAllocatedSessionSto
 }
 
 func TestJob38eeeb536a5a7130_AgyCrashAutoResumeAndNewConversationFallback(t *testing.T) {
+	mockAgyBin := filepath.Join(t.TempDir(), "mock-agy")
+	buildCmd := exec.Command("go", "build", "-buildvcs=false", "-o", mockAgyBin, "../../cmd/mock-agy")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("build mock-agy failed: %v (%s)", err, string(out))
+	}
+
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
 	t.Setenv("MOCK_AGY_SCENARIO", "job_38eeeb536a5a7130_crash_resume_and_new_conv_fallback")
@@ -1276,12 +1282,6 @@ func TestJob38eeeb536a5a7130_AgyCrashAutoResumeAndNewConversationFallback(t *tes
 	_ = exec.Command("git", "-C", repoDir, "init").Run()
 	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
 	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Tester").Run()
-
-	mockAgyBin := filepath.Join(t.TempDir(), "mock-agy")
-	buildCmd := exec.Command("go", "build", "-buildvcs=false", "-o", mockAgyBin, "../../cmd/mock-agy")
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("build mock-agy failed: %v (%s)", err, string(out))
-	}
 
 	runner := NewPromptRunner("autopilot")
 	res, err := runner.RunPrompt(context.Background(), RunPromptOptions{

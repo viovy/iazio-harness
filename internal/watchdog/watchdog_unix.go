@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/viovy/iazio-harness/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 func defaultIsProcessAlive(pid int) bool {

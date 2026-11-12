@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/viovy/iazio-harness/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 // ClientID is the public OAuth client id for this binary.

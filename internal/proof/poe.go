@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/viovy/iazio-harness/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 var (

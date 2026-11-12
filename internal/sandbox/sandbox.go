@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/viovy/iazio-harness/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 // Sandbox represents an isolated ephemeral filesystem snapshot.

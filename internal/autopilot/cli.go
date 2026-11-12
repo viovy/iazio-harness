@@ -12,7 +12,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/viovy/iazio-harness/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 // CreateStoryOptions contains semantic fields required to scaffold a story via autopilot.

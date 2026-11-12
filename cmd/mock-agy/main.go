@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/viovy/iazio-harness/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 func main() {
@@ -242,14 +242,15 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "[mock-agy] Executing ordinary prompt (model: %s, agent: %s)...\n", model, agent)
 		fmt.Fprintf(stdout, "[mock-agy] Prompt: %s\n", fullPrompt)
 		fmt.Fprintln(stdout, "[mock-agy] Initializing background MCP daemons: autopilot-mcp, chrome-devtools-mcp...")
-
-		// Spawn background sleeper that holds pipes open
-		cmd := procutil.Command("sleep", "60")
-		cmd.Stdout = stdout
-		cmd.Stderr = stderr
-		_ = cmd.Start()
-
 		fmt.Fprintln(stdout, "[mock-agy] Execution completed successfully. Primary engine PID exiting 0.")
+
+		if stdout == os.Stdout {
+			// Spawn background sleeper that holds pipes open when running as subprocess
+			cmd := procutil.Command("sleep", "60")
+			cmd.Stdout = stdout
+			cmd.Stderr = stderr
+			_ = cmd.Start()
+		}
 		return 0
 
 	case "agent_restart_and_upgrade_mid_run":

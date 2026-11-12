@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness/internal/idempotency"
-	"github.com/viovy/iazio-harness/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 	"github.com/viovy/iazio-harness/internal/sandbox"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 )

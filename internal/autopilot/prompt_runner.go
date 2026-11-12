@@ -24,7 +24,7 @@ import (
 	"github.com/viovy/iazio-harness/internal/auth"
 	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/engines"
-	"github.com/viovy/iazio-harness/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 	"github.com/viovy/iazio-harness/internal/redact"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 	"github.com/viovy/iazio-harness/internal/watchdog"
@@ -1812,8 +1812,9 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	onStreamConvDetected := func(newConv string) {
 		streamMu.Lock()
 		curStory := boundStoryID
+		pid := lastToolPID
 		streamMu.Unlock()
-		emitJobHeartbeat(lastToolPID, newConv, curStory)
+		emitJobHeartbeat(pid, newConv, curStory)
 	}
 	stdoutW = &chunkStreamingWriter{
 		mu: &streamMu, buf: &stdoutBuf, lastOutAt: &lastOutAt, streamedAny: &streamedAny,
@@ -1893,7 +1894,9 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		toolPID := 0
 		if cmd.Process != nil {
 			toolPID = cmd.Process.Pid
+			streamMu.Lock()
 			lastToolPID = toolPID
+			streamMu.Unlock()
 		}
 
 		if !isResumeTurn && jobID != "" && apiURL != "" {
@@ -1904,6 +1907,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 			streamMu.Lock()
 			storyLabel := boundStoryID
+			curBound := boundStoryID
 			activeConv := detectedConvID
 			streamMu.Unlock()
 			if storyLabel == "" {
@@ -1919,14 +1923,17 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 			_ = controlplane.PostChunk(ctx, apiURL, tok, jobID, "stdout", banner)
 			_ = controlplane.PostTick(ctx, apiURL, tok, jobID, 0, os.Getpid(), toolPID, int(time.Since(startTime).Seconds()))
-			emitJobHeartbeat(toolPID, activeConv, boundStoryID)
+			emitJobHeartbeat(toolPID, activeConv, curBound)
 		} else if isResumeTurn && jobID != "" && apiURL != "" {
+			streamMu.Lock()
+			curBound := boundStoryID
+			streamMu.Unlock()
 			tok := resolveToken()
 			if resumeConvID != "" {
 				_ = controlplane.PostConversation(ctx, apiURL, tok, jobID, resumeConvID)
 			}
 			_ = controlplane.PostTick(ctx, apiURL, tok, jobID, 0, os.Getpid(), toolPID, int(time.Since(startTime).Seconds()))
-			emitJobHeartbeat(toolPID, resumeConvID, boundStoryID)
+			emitJobHeartbeat(toolPID, resumeConvID, curBound)
 		}
 
 		waitDone := make(chan error, 1)
