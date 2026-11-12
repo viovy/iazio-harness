@@ -77,9 +77,14 @@ func initTestGitWorktree(t *testing.T) string {
 	t.Helper()
 	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
 	worktree := t.TempDir()
+	t.Setenv("IAZIO_FLEET_ROOT", worktree)
+	t.Setenv("FLEET_ROOT", worktree)
 	_ = exec.Command("git", "init", worktree).Run()
 	_ = exec.Command("git", "-C", worktree, "config", "user.name", "Test User").Run()
 	_ = exec.Command("git", "-C", worktree, "config", "user.email", "test@test.local").Run()
+	_ = os.WriteFile(filepath.Join(worktree, ".gitmodules"), []byte(""), 0o644)
+	_ = exec.Command("git", "-C", worktree, "add", ".gitmodules").Run()
+	_ = exec.Command("git", "-C", worktree, "commit", "-m", "chore: init test gitmodules").Run()
 	return worktree
 }
 

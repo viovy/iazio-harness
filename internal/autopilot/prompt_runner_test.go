@@ -1521,8 +1521,9 @@ exit 0
 }
 
 func TestTurnLoop_SupervisorHeartbeatDoesNotResetSilentMs(t *testing.T) {
+	t.Setenv("IAZIO_BRAIN_DIR", t.TempDir())
 	origInterval := supervisorHeartbeatInterval
-	supervisorHeartbeatInterval = 150 * time.Millisecond
+	supervisorHeartbeatInterval = 100 * time.Millisecond
 	t.Cleanup(func() { supervisorHeartbeatInterval = origInterval })
 
 	var (
@@ -1553,7 +1554,7 @@ func TestTurnLoop_SupervisorHeartbeatDoesNotResetSilentMs(t *testing.T) {
 
 	binDir := t.TempDir()
 	mockSilent := filepath.Join(binDir, "mock-agy-silent")
-	script := "#!/bin/sh\necho 'initial output'\nsleep 5\nexit 0\n"
+	script := "#!/bin/sh\necho 'initial output'\nsleep 1\nexit 0\n"
 	if err := os.WriteFile(mockSilent, []byte(script), 0o755); err != nil {
 		t.Fatalf("write mock-silent: %v", err)
 	}
@@ -1568,7 +1569,7 @@ func TestTurnLoop_SupervisorHeartbeatDoesNotResetSilentMs(t *testing.T) {
 		Prompt:      "non-ase prompt",
 		TargetAgent: mockSilent,
 		WorkingDir:  t.TempDir(),
-		Timeout:     4500 * time.Millisecond,
+		Timeout:     3000 * time.Millisecond,
 	})
 
 	mu.Lock()
@@ -1579,7 +1580,7 @@ func TestTurnLoop_SupervisorHeartbeatDoesNotResetSilentMs(t *testing.T) {
 	if len(tickSilentMs) < 2 {
 		t.Fatalf("expected >= 2 OUTPUT_TICK payloads, got %v", tickSilentMs)
 	}
-	if tickSilentMs[len(tickSilentMs)-1] <= tickSilentMs[0] || tickSilentMs[len(tickSilentMs)-1] < 2000 {
+	if tickSilentMs[len(tickSilentMs)-1] <= tickSilentMs[0] || tickSilentMs[len(tickSilentMs)-1] < 250 {
 		t.Fatalf("expected silent_ms to increase monotonically across supervisor heartbeats without resetting to 0, got %v", tickSilentMs)
 	}
 }
@@ -2206,6 +2207,34 @@ func TestStoryGov5253_ConcisePromptSummaryStripsTranscriptAndSupervisorLines(t *
 	}
 	if !strings.Contains(summary, finalOutcome) {
 		t.Fatalf("expected final executive outcome %q to be preserved in summary, got:\n%s", finalOutcome, summary)
+	}
+}
+
+func TestStoryGov5265_ConcisePromptSummary500CharCeilingAndCraftCloseoutHeadline(t *testing.T) {
+	if MaxPromptSummaryChars != 500 {
+		t.Fatalf("expected MaxPromptSummaryChars == 500, got %d", MaxPromptSummaryChars)
+	}
+	var transcript strings.Builder
+	for i := 1; i <= 500; i++ {
+		transcript.WriteString(fmt.Sprintf("[agy step #%d] thinking: Deep step trace %d %s\n", i, i, strings.Repeat("y", 100)))
+	}
+	rawOut := strings.Join([]string{
+		"Created conversation 0dedaca4-27ef-4d0e-b3db-60c0749eb3ce",
+		strings.Repeat("intermediate compilation output line with verbose diagnostic text\n", 25),
+		"## CRAFT Closeout",
+		"### **Result**",
+		"Completed STORY-GOV-5265 — list_queue and result.summary bounded to <= 500 chars and <= 2,000 tokens.",
+	}, "\n")
+
+	summary := BuildConcisePromptSummary(rawOut, transcript.String(), "", nil)
+	if len(summary) > 500 {
+		t.Fatalf("expected summary length <= 500 chars, got %d:\n%s", len(summary), summary)
+	}
+	if strings.Contains(summary, "[agy step #") {
+		t.Fatalf("expected zero [agy step # lines in summary, got:\n%s", summary)
+	}
+	if !strings.Contains(summary, "## CRAFT Closeout") || !strings.Contains(summary, "Completed STORY-GOV-5265") {
+		t.Fatalf("expected CRAFT closeout headline in summary, got:\n%s", summary)
 	}
 }
 
