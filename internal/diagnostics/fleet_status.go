@@ -1300,9 +1300,14 @@ func isDiagnosticCmdLine(cmdLine string) bool {
 	return strings.Contains(lower, "fleet-status") ||
 		strings.Contains(lower, "repo evaluate") ||
 		strings.Contains(lower, "repo remediate") ||
+		strings.Contains(lower, "prompt run") ||
+		strings.Contains(lower, "execute shell prompt") ||
+		strings.Contains(lower, "iazio-agy-log-git-update") ||
 		strings.Contains(lower, "status --json") ||
 		strings.Contains(lower, "auth status") ||
 		strings.Contains(lower, "autopilot-mcp") ||
+		strings.Contains(lower, "autopilot-fleet") ||
+		strings.Contains(lower, "autopilot-observe") ||
 		strings.Contains(lower, "iazio-mcp") ||
 		strings.Contains(lower, "mcp serve") ||
 		strings.Contains(lower, "mcp-server") ||
@@ -1317,6 +1322,32 @@ func isDiagnosticCmdLine(cmdLine string) bool {
 		strings.Contains(lower, "org.eclipse.equinox") ||
 		strings.Contains(lower, " --hub") ||
 		strings.HasSuffix(strings.TrimSpace(lower), "--hub")
+}
+
+func isAutomatedMaintenanceRepoLock(repoPath string) bool {
+	if strings.TrimSpace(repoPath) == "" {
+		return false
+	}
+	lockInfo, err := repolock.Read(repoPath)
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(lockInfo.Status), "RUNNING") {
+		return false
+	}
+	alive := (lockInfo.PID > 0 && isPIDAlive(lockInfo.PID)) ||
+		(lockInfo.HarnessPID > 0 && isPIDAlive(lockInfo.HarnessPID)) ||
+		(lockInfo.ToolPID > 0 && isPIDAlive(lockInfo.ToolPID))
+	if !alive {
+		return false
+	}
+	jobLower := strings.ToLower(strings.TrimSpace(lockInfo.JobID))
+	schedLower := strings.ToLower(strings.TrimSpace(lockInfo.ScheduleID))
+	promptLower := strings.ToLower(strings.TrimSpace(lockInfo.Prompt))
+	return strings.HasPrefix(jobLower, "autopilot-git-update") ||
+		strings.HasPrefix(jobLower, "git-update-") ||
+		strings.HasPrefix(schedLower, "autopilot-git-update") ||
+		strings.Contains(promptLower, "autopilot git-update")
 }
 
 func isAutomatedMaintenanceBranch(branch string) bool {
@@ -1603,6 +1634,9 @@ func isPIDAlive(pid int) bool {
 }
 
 func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
+	if isAutomatedMaintenanceRepoLock(repoPath) {
+		return
+	}
 	if runtime.GOOS != "linux" {
 		// Non-linux fallback using ps and lsof CWD inspection
 		discoverAgentProcessesFallback(repoPath, res)
@@ -1801,17 +1835,100 @@ func extractBrainCandidateFromOpenPath(rawPath string) (appDataDir string, convI
 	return "", "", false
 }
 
-func containsASEWorkflowMarker(s string) bool {
+func isAutomatedMaintenanceTranscript(s string) bool {
 	lower := strings.ToLower(s)
-	return strings.Contains(lower, "/autonomous-story-execution") ||
-		strings.Contains(lower, "skills/autonomous-story-execution") ||
-		strings.Contains(lower, "autopilot-story") ||
-		strings.Contains(lower, "autopilot-git-flow") ||
-		strings.Contains(lower, "autopilot story begin") ||
-		strings.Contains(lower, "autopilot ase") ||
-		strings.Contains(lower, "git-flow ase-start") ||
-		strings.Contains(lower, "git-flow ase-ship") ||
-		strings.Contains(lower, ".session_story_id")
+	return strings.Contains(lower, `execute shell prompt "autopilot git-update"`) ||
+		strings.Contains(lower, `execute shell prompt \"autopilot git-update\"`) ||
+		strings.Contains(lower, "diagnostic failure summary from shell autopilot git-update") ||
+		strings.Contains(lower, "iazio-agy-log-git-update-agy") ||
+		strings.Contains(lower, `"job_id":"autopilot-git-update`) ||
+		strings.Contains(lower, `"schedule_id":"autopilot-git-update`)
+}
+
+func stripSystemTagRange(lower string, openTag, closeTag string) string {
+	for {
+		start := strings.Index(lower, openTag)
+		if start < 0 {
+			break
+		}
+		rest := lower[start+len(openTag):]
+		endRel := strings.Index(rest, closeTag)
+		if endRel >= 0 {
+			end := start + len(openTag) + endRel + len(closeTag)
+			if closeTag == "</rule[" {
+				if gt := strings.IndexByte(lower[end:], '>'); gt >= 0 && gt < 256 {
+					end += gt + 1
+				}
+			}
+			lower = lower[:start] + " " + lower[end:]
+			continue
+		}
+		// If the closing tag was truncated by the head/tail byte window, strip up to <user_request> or newline
+		reqIdx := strings.Index(rest, "<user_request>")
+		nlIdx := strings.IndexByte(rest, '\n')
+		cut := len(lower)
+		if reqIdx >= 0 && (nlIdx < 0 || reqIdx < nlIdx) {
+			cut = start + len(openTag) + reqIdx
+		} else if nlIdx >= 0 {
+			cut = start + len(openTag) + nlIdx
+		}
+		lower = lower[:start] + " " + lower[cut:]
+	}
+	return lower
+}
+
+func stripTranscriptBoilerplateAndToolOutputs(s string) string {
+	if s == "" {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, rawLine := range lines {
+		lowerLine := strings.ToLower(rawLine)
+		if strings.Contains(lowerLine, `"type":"tool_response"`) || strings.Contains(lowerLine, `"type": "tool_response"`) {
+			continue
+		}
+		filtered = append(filtered, lowerLine)
+	}
+	cleaned := strings.Join(filtered, "\n")
+	for _, pair := range [][2]string{
+		{"<user_rules>", "</user_rules>"},
+		{"<rule[", "</rule["},
+		{"<skills>", "</skills>"},
+		{"<subagents>", "</subagents>"},
+		{"<slash_commands>", "</slash_commands>"},
+		{"<mcp_servers>", "</mcp_servers>"},
+		{"<context_summary>", "</context_summary>"},
+	} {
+		cleaned = stripSystemTagRange(cleaned, pair[0], pair[1])
+	}
+	return cleaned
+}
+
+func containsASEWorkflowMarker(s string) bool {
+	if isAutomatedMaintenanceTranscript(s) {
+		return false
+	}
+	cleaned := stripTranscriptBoilerplateAndToolOutputs(s)
+	return strings.Contains(cleaned, "/autonomous-story-execution") ||
+		strings.Contains(cleaned, "skills/autonomous-story-execution") ||
+		strings.Contains(cleaned, "commands/autonomous-story-execution.md") ||
+		strings.Contains(cleaned, "autopilot-story") ||
+		strings.Contains(cleaned, "autopilot-git-flow") ||
+		strings.Contains(cleaned, "autopilot story begin") ||
+		strings.Contains(cleaned, "autopilot ase") ||
+		strings.Contains(cleaned, "git-flow ase-start") ||
+		strings.Contains(cleaned, "git-flow ase-ship") ||
+		strings.Contains(cleaned, ".session_story_id")
+}
+
+func extractBoundStoryMatchesFromTranscript(headStr, tailStr string) [][]string {
+	cleanHead := stripTranscriptBoilerplateAndToolOutputs(headStr)
+	cleanTail := stripTranscriptBoilerplateAndToolOutputs(tailStr)
+	return append(
+		transcriptBoundStoryRe.FindAllStringSubmatch(cleanHead, -1),
+		transcriptBoundStoryRe.FindAllStringSubmatch(cleanTail, -1)...,
+	)
 }
 
 func hasNonEmptyJSONArray(raw json.RawMessage) bool {
@@ -1845,10 +1962,14 @@ func hasPendingBackgroundTask(tail string) bool {
 }
 
 func isTranscriptTurnInFlight(tail []byte, modTime time.Time, now time.Time) bool {
-	if modTime.IsZero() || now.Sub(modTime) > 45*time.Minute {
+	if modTime.IsZero() || now.Sub(modTime) > 15*time.Minute {
 		return false
 	}
 	tailStr := string(tail)
+	hasBg := hasPendingBackgroundTask(tailStr)
+	if !hasBg && now.Sub(modTime) > 3*time.Minute {
+		return false
+	}
 	lines := strings.Split(tailStr, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
@@ -1876,7 +1997,7 @@ func isTranscriptTurnInFlight(tail []byte, modTime time.Time, now time.Time) boo
 		if strings.EqualFold(step.Type, "PLANNER_RESPONSE") &&
 			strings.EqualFold(step.Status, "DONE") &&
 			!hasTools {
-			if now.Sub(modTime) <= 15*time.Minute && hasPendingBackgroundTask(tailStr) {
+			if now.Sub(modTime) <= 15*time.Minute && hasBg {
 				return true
 			}
 			return false
@@ -1931,12 +2052,14 @@ func inspectBrainTranscriptDir(brainDir string, now time.Time) (newestMod time.T
 		if modTime.After(newestMod) {
 			newestMod = modTime
 		}
-		if containsASEWorkflowMarker(string(head)) || containsASEWorkflowMarker(string(tail)) {
+		headStr := string(head)
+		tailStr := string(tail)
+		if isAutomatedMaintenanceTranscript(headStr) || isAutomatedMaintenanceTranscript(tailStr) {
+			continue
+		}
+		if containsASEWorkflowMarker(headStr) || containsASEWorkflowMarker(tailStr) {
 			if inferredStoryID == "" && !modTime.IsZero() && now.Sub(modTime) <= 2*time.Hour {
-				matches := transcriptBoundStoryRe.FindAllStringSubmatch(string(tail), -1)
-				if len(matches) == 0 {
-					matches = transcriptBoundStoryRe.FindAllStringSubmatch(string(head), -1)
-				}
+				matches := extractBoundStoryMatchesFromTranscript(headStr, tailStr)
 				if len(matches) > 0 {
 					inferredStoryID = strings.ToUpper(matches[len(matches)-1][1])
 				}
@@ -2256,7 +2379,7 @@ func IsStoryOwnedBySiblingWorktree(repoPath, storyID string) bool {
 
 func canBindTranscriptStoryToRepo(repoPath, storyID string) bool {
 	sid := strings.ToUpper(strings.TrimSpace(storyID))
-	if !strings.HasPrefix(sid, "STORY-") {
+	if !strings.HasPrefix(sid, "STORY-") || strings.HasPrefix(sid, "STORY-GOV-POINTERS-") {
 		return false
 	}
 	if IsStoryCompletedOnDisk(repoPath, sid) || IsStoryOwnedBySiblingWorktree(repoPath, sid) {
@@ -2268,6 +2391,87 @@ func canBindTranscriptStoryToRepo(repoPath, storyID string) bool {
 		}
 	}
 	return true
+}
+
+func isConversationClaimedByOtherWorktree(repoPath, candID string) bool {
+	cleanRepo := filepath.Clean(strings.TrimSpace(repoPath))
+	if cleanRepo == "" || cleanRepo == "." {
+		return false
+	}
+	cleanRepoSlash := strings.ToLower(filepath.ToSlash(cleanRepo))
+
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		for _, stateFile := range []string{
+			filepath.Join(home, ".iazio", "watchdog-active-jobs.json"),
+			filepath.Join(home, ".iazio", "harness-active-jobs.json"),
+		} {
+			if data, err := os.ReadFile(stateFile); err == nil {
+				var jobs []struct {
+					WorktreePath   string `json:"worktree_path"`
+					ConversationID string `json:"conversation_id"`
+				}
+				if json.Unmarshal(data, &jobs) == nil {
+					for _, j := range jobs {
+						if strings.EqualFold(strings.TrimSpace(j.ConversationID), candID) {
+							wtSlash := strings.ToLower(filepath.ToSlash(filepath.Clean(j.WorktreePath)))
+							if wtSlash != "" && wtSlash != cleanRepoSlash {
+								return true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	parentDir := filepath.Dir(cleanRepo)
+	if entries, err := os.ReadDir(parentDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			sibPath := filepath.Clean(filepath.Join(parentDir, e.Name()))
+			if strings.EqualFold(filepath.ToSlash(sibPath), cleanRepoSlash) {
+				continue
+			}
+			if lockInfo, lErr := repolock.Read(sibPath); lErr == nil {
+				if strings.EqualFold(strings.TrimSpace(lockInfo.ConversationID), candID) {
+					return true
+				}
+			}
+		}
+	}
+
+	if home != "" {
+		dbPath := filepath.Join(home, ".gemini", "antigravity-cli", "conversations", candID+".db")
+		if raw, err := os.ReadFile(dbPath); err == nil {
+			const prefix = "file://"
+			idx := 0
+			for {
+				pos := strings.Index(string(raw[idx:]), prefix)
+				if pos < 0 {
+					break
+				}
+				start := idx + pos + len(prefix)
+				end := start
+				for end < len(raw) && raw[end] >= 32 && raw[end] <= 126 && raw[end] != '"' && raw[end] != '\'' && raw[end] != '\r' && raw[end] != '\n' && raw[end] != '}' && raw[end] != ']' {
+					end++
+				}
+				if end > start {
+					declared := filepath.Clean(strings.TrimSpace(string(raw[start:end])))
+					declaredSlash := strings.ToLower(filepath.ToSlash(declared))
+					if declaredSlash != "" && strings.Contains(declaredSlash, "/meta-repo") && !strings.Contains(declaredSlash, ".json") && !strings.Contains(declaredSlash, ".txt") && !strings.Contains(declaredSlash, ".log") {
+						if declaredSlash != cleanRepoSlash {
+							return true
+						}
+					}
+				}
+				idx = start
+			}
+		}
+	}
+	return false
 }
 
 // TranscriptReferencesRepoPath returns true if transcript text references repoPath (across Windows C:\...,
@@ -2372,7 +2576,7 @@ func candidateBrainRootDirs() []string {
 // InspectActiveBrainASETurnForRepo scans candidate Antigravity brain directories for an in-flight
 // /autonomous-story-execution turn targeting repoPath (modified within the last 15 minutes).
 func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bool, convID string, storyID string, newestMod time.Time) {
-	if strings.TrimSpace(repoPath) == "" {
+	if strings.TrimSpace(repoPath) == "" || isAutomatedMaintenanceRepoLock(repoPath) {
 		return false, "", "", time.Time{}
 	}
 	if now.IsZero() {
@@ -2388,6 +2592,9 @@ func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bo
 				continue
 			}
 			candID := e.Name()
+			if isConversationClaimedByOtherWorktree(repoPath, candID) {
+				continue
+			}
 			convBrainDir := filepath.Join(brainRoot, candID)
 			for _, rel := range []string{
 				filepath.Join(".system_generated", "logs", "transcript.jsonl"),
@@ -2408,6 +2615,9 @@ func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bo
 				}
 				headStr := string(head)
 				tailStr := string(tail)
+				if isAutomatedMaintenanceTranscript(headStr) || isAutomatedMaintenanceTranscript(tailStr) {
+					continue
+				}
 				if !TranscriptReferencesRepoPath(headStr+"\n"+tailStr, repoPath) {
 					continue
 				}
@@ -2418,10 +2628,7 @@ func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bo
 					continue
 				}
 				var candStory string
-				allMatches := append(
-					transcriptBoundStoryRe.FindAllStringSubmatch(headStr, -1),
-					transcriptBoundStoryRe.FindAllStringSubmatch(tailStr, -1)...,
-				)
+				allMatches := extractBoundStoryMatchesFromTranscript(headStr, tailStr)
 				for i := len(allMatches) - 1; i >= 0; i-- {
 					sid := strings.ToUpper(allMatches[i][1])
 					if canBindTranscriptStoryToRepo(repoPath, sid) {
@@ -2449,7 +2656,7 @@ func HasActiveBrainASETurnForRepo(repoPath string, now time.Time) bool {
 }
 
 func discoverActiveBrainTranscriptForRepo(repoPath string, now time.Time, res *RepoFleetStatusResult) bool {
-	if res == nil {
+	if res == nil || isAutomatedMaintenanceRepoLock(repoPath) {
 		return false
 	}
 	active, convID, storyID, _ := InspectActiveBrainASETurnForRepo(repoPath, now)
@@ -2480,6 +2687,9 @@ func discoverActiveBrainTranscriptForRepo(repoPath string, now time.Time, res *R
 }
 
 func discoverAgentProcessesFallback(repoPath string, res *RepoFleetStatusResult) {
+	if isAutomatedMaintenanceRepoLock(repoPath) {
+		return
+	}
 	if runtime.GOOS != "windows" {
 		selfPID := os.Getpid()
 		parentPID := os.Getppid()

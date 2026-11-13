@@ -1578,6 +1578,97 @@ func TestDeadRepoLockAndStaleSessionStoryFile_ClassifyAsFailedDirtyInsteadOfLive
 	}
 }
 
+func TestStoryGov5273_EliminateAdhocASEFalsePositiveRecurrence(t *testing.T) {
+	parentDir := t.TempDir()
+	repo04 := filepath.Join(parentDir, "meta-repo-04")
+	_ = os.MkdirAll(filepath.Join(repo04, ".autopilot"), 0o755)
+	_ = exec.Command("git", "init", "-b", "main", repo04).Run()
+	_ = exec.Command("git", "-C", repo04, "config", "user.email", "test@example.com").Run()
+	_ = exec.Command("git", "-C", repo04, "config", "user.name", "Test User").Run()
+	_ = os.WriteFile(filepath.Join(repo04, "README.md"), []byte("clean\n"), 0o644)
+	_ = exec.Command("git", "-C", repo04, "add", ".").Run()
+	_ = exec.Command("git", "-C", repo04, "commit", "-m", "init").Run()
+	_ = os.WriteFile(filepath.Join(repo04, ".autopilot", "state.json"), []byte(`{"state":"IDLE","story_id":""}`), 0o644)
+
+	brainRoot := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainRoot)
+
+	// 1. Injected <RULE[.../AGENTS.md]> boilerplate and TOOL_RESPONSE outputs must NEVER trigger containsASEWorkflowMarker
+	boilerplateTranscript := strings.Join([]string{
+		fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"<user_rules><RULE[%s/AGENTS.md]>autopilot story begin <ID> | autopilot ase --bind | git-flow ase-start | git-flow ase-ship</RULE[%s/AGENTS.md]></user_rules><skills>autonomous-story-execution</skills><user_information>Command Working Directory: %s\nApp Data Directory: /Users/romeo/.gemini/antigravity-cli</user_information><USER_REQUEST>explain repository layout</USER_REQUEST>"}`, repo04, repo04, repo04),
+		`{"step_index":1,"type":"TOOL_RESPONSE","status":"DONE","content":"Found /autonomous-story-execution and STORY-GOV-5249 in docs"}`,
+		fmt.Sprintf(`{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`, filepath.Join(repo04, "README.md")),
+	}, "\n") + "\n"
+
+	if containsASEWorkflowMarker(boilerplateTranscript) {
+		t.Fatalf("expected containsASEWorkflowMarker=false when ASE keywords only appear in <user_rules>/<skills> or TOOL_RESPONSE")
+	}
+	if matches := extractBoundStoryMatchesFromTranscript(boilerplateTranscript, ""); len(matches) != 0 {
+		t.Fatalf("expected extractBoundStoryMatchesFromTranscript to ignore TOOL_RESPONSE story mentions, got %v", matches)
+	}
+
+	// 2. Stage-2 git-update escalation transcript (`execute shell prompt "autopilot git-update"`) and STORY-GOV-POINTERS-* must NEVER trigger ADHOC_ASE
+	gitUpdateConv := "adc06b45-cb61-41f3-9231-228abac20909"
+	gitUpdateLogs := filepath.Join(brainRoot, gitUpdateConv, ".system_generated", "logs")
+	_ = os.MkdirAll(gitUpdateLogs, 0o755)
+	gitUpdateTranscript := strings.Join([]string{
+		fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"<user_rules><RULE[%s/AGENTS.md]>autopilot ase --bind</RULE[%s/AGENTS.md]></user_rules><user_information>Command Working Directory: %s\nApp Data Directory: /Users/romeo/.gemini/antigravity-cli</user_information><USER_REQUEST>execute shell prompt \"autopilot git-update\"\n[SIR] STORY-GOV-POINTERS-20261113-033931</USER_REQUEST>"}`, repo04, repo04, repo04),
+		fmt.Sprintf(`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"autopilot git-update","Path":%q}}]}`, filepath.Join(repo04, "README.md")),
+	}, "\n") + "\n"
+	_ = os.WriteFile(filepath.Join(gitUpdateLogs, "transcript.jsonl"), []byte(gitUpdateTranscript), 0o644)
+
+	if active, _, _, _ := InspectActiveBrainASETurnForRepo(repo04, time.Now()); active {
+		t.Fatalf("expected InspectActiveBrainASETurnForRepo=false for automated git-update escalation transcript")
+	}
+	if discoverActiveBrainTranscriptForRepo(repo04, time.Now(), &RepoFleetStatusResult{}) {
+		t.Fatalf("expected discoverActiveBrainTranscriptForRepo=false for automated git-update escalation transcript")
+	}
+	if canBindTranscriptStoryToRepo(repo04, "STORY-GOV-POINTERS-20261113-033931") {
+		t.Fatalf("expected canBindTranscriptStoryToRepo=false for synthetic STORY-GOV-POINTERS-*")
+	}
+
+	// 3. Active .iazio/repo.lock with job_id="autopilot-git-update-agy" suppresses ad-hoc ASE discovery
+	iazioDir := filepath.Join(repo04, ".iazio")
+	_ = os.MkdirAll(iazioDir, 0o755)
+	_ = os.WriteFile(filepath.Join(iazioDir, "repo.lock"), []byte(fmt.Sprintf(`{"job_id":"autopilot-git-update-agy","pid":%d,"status":"RUNNING","prompt":"execute shell prompt \"autopilot git-update\""}`, os.Getpid())), 0o644)
+	if !isAutomatedMaintenanceRepoLock(repo04) {
+		t.Fatalf("expected isAutomatedMaintenanceRepoLock=true while live autopilot-git-update-agy lock is held")
+	}
+	_ = os.RemoveAll(iazioDir)
+
+	// 4. Killed/terminated agy transcript without pending background task expires after 3 minutes (not 15-45 minutes)
+	aseConv := "34d879bb-7e55-43ff-af13-483faedfb54f"
+	aseLogs := filepath.Join(brainRoot, aseConv, ".system_generated", "logs")
+	_ = os.MkdirAll(aseLogs, 0o755)
+	aseTranscriptPath := filepath.Join(aseLogs, "transcript.jsonl")
+	aseTranscript := strings.Join([]string{
+		fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"<user_information>Command Working Directory: %s\nApp Data Directory: /Users/romeo/.gemini/antigravity-cli</user_information><USER_REQUEST>/autonomous-story-execution STORY-GOV-5273</USER_REQUEST>"}`, repo04),
+		fmt.Sprintf(`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`, filepath.Join(repo04, "README.md")),
+	}, "\n") + "\n"
+	_ = os.WriteFile(aseTranscriptPath, []byte(aseTranscript), 0o644)
+	fourMinAgo := time.Now().Add(-4 * time.Minute)
+	_ = os.Chtimes(aseTranscriptPath, fourMinAgo, fourMinAgo)
+
+	if isTranscriptTurnInFlight([]byte(aseTranscript), fourMinAgo, time.Now()) {
+		t.Fatalf("expected non-background-task transcript older than 3m (4m) to NOT be considered in-flight")
+	}
+	if active, _, _, _ := InspectActiveBrainASETurnForRepo(repo04, time.Now()); active {
+		t.Fatalf("expected 4m-stale non-bg-task transcript not to fabricate live ad-hoc ASE")
+	}
+
+	// 5. Diagnostic command line filter excludes `iazio-harness prompt run` and `execute shell prompt`
+	for _, cmdLine := range []string{
+		`/Users/romeo/.local/bin/iazio-harness prompt run --json`,
+		`/Users/romeo/.antigravity-cli/bin/agy --print execute shell prompt "autopilot git-update"`,
+		`agy --log-file /tmp/iazio-agy-log-git-update-agy-123.log`,
+	} {
+		if !isDiagnosticCmdLine(strings.ToLower(cmdLine)) {
+			t.Fatalf("expected isDiagnosticCmdLine=true for %q", cmdLine)
+		}
+	}
+}
+
+
 
 
 

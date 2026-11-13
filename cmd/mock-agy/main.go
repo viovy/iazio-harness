@@ -976,6 +976,85 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "[mock-agy] Active Phase 0 brain transcript written for conversation %s\n", cid)
 		return 0
 
+	case "gov_5273_adhoc_ase_false_positive_recurrence_flow":
+		cid := conversationID
+		if cid == "" {
+			cid = "adc06b45-cb61-41f3-9231-228abac20909"
+		}
+		brainRoot := strings.TrimSpace(os.Getenv("IAZIO_BRAIN_DIR"))
+		if brainRoot == "" {
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				brainRoot = filepath.Join(home, ".gemini", "antigravity-cli", "brain")
+			}
+		}
+		repoPath := strings.TrimSpace(os.Getenv("MOCK_AGY_REPO_PATH"))
+		if repoPath == "" {
+			if wd, err := os.Getwd(); err == nil {
+				repoPath = wd
+			}
+		}
+		logsDir := filepath.Join(brainRoot, cid, ".system_generated", "logs")
+		_ = os.MkdirAll(logsDir, 0o755)
+		transcriptPath := filepath.Join(logsDir, "transcript.jsonl")
+		escapedRepoPath := strings.ReplaceAll(repoPath, `\`, `\\`)
+		escapedReadme := strings.ReplaceAll(filepath.Join(repoPath, "README.md"), `\`, `\\`)
+		systemBoilerplate := fmt.Sprintf(
+			"<user_rules><RULE[%s/AGENTS.md]>autopilot story begin <ID> | autopilot ase --bind | git-flow ase-start <slug> | git-flow ase-ship</RULE[%s/AGENTS.md]></user_rules>"+
+				"<skills>autonomous-story-execution (/Users/romeo/work/meta-repo/.agents/skills/autonomous-story-execution/SKILL.md)</skills>"+
+				"<user_information>Command Working Directory: %s\nApp Data Directory: /Users/romeo/.gemini/antigravity-cli</user_information>",
+			escapedRepoPath, escapedRepoPath, escapedRepoPath,
+		)
+
+		phase := strings.TrimSpace(os.Getenv("MOCK_AGY_PHASE"))
+		switch phase {
+		case "git_update_escalation":
+			step0 := fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":%q}`,
+				systemBoilerplate+`<USER_REQUEST>execute shell prompt "autopilot git-update"`+"\n"+
+					`Diagnostic failure summary from shell autopilot git-update:`+"\n"+
+					`[SIR] STORY-GOV-POINTERS-20261113-033931</USER_REQUEST>`) + "\n"
+			step1 := fmt.Sprintf(`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"autopilot git-update","Path":%q}}]}`, escapedReadme) + "\n"
+			_ = os.WriteFile(transcriptPath, []byte(step0+step1), 0o644)
+			fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+			return 0
+
+		case "non_ase_interactive_prompt":
+			step0 := fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":%q}`,
+				systemBoilerplate+`<USER_REQUEST>explain the architecture of this repository</USER_REQUEST>`) + "\n"
+			step1 := fmt.Sprintf(`{"step_index":1,"type":"TOOL_RESPONSE","status":"DONE","content":"Found historical reference to /autonomous-story-execution and STORY-GOV-5249 in docs"}`) + "\n"
+			step2 := fmt.Sprintf(`{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`, escapedReadme) + "\n"
+			_ = os.WriteFile(transcriptPath, []byte(step0+step1+step2), 0o644)
+			fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+			return 0
+
+		case "genuine_adhoc_ase_turn":
+			storiesDir := filepath.Join(repoPath, "docs", "stories")
+			_ = os.MkdirAll(storiesDir, 0o755)
+			storyPath := filepath.Join(storiesDir, "2026-11-13-gov-5273-eliminate-adhoc-ase-false-positive-recurrence.story.md")
+			_ = os.WriteFile(storyPath, []byte("---\nid: STORY-GOV-5273\ntitle: Eliminate Ad-Hoc ASE False-Positive Recurrence\nstatus: IN_PROGRESS\n---\n"), 0o644)
+			step0 := fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":%q}`,
+				systemBoilerplate+`<USER_REQUEST>/autonomous-story-execution STORY-GOV-5273 deep review and fix</USER_REQUEST>`) + "\n"
+			step1 := fmt.Sprintf(`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`, escapedReadme) + "\n"
+			_ = os.WriteFile(transcriptPath, []byte(step0+step1), 0o644)
+			fmt.Fprintf(stdout, "Created conversation %s\n", cid)
+			return 0
+
+		case "complete_genuine_adhoc_ase_turn":
+			storiesDir := filepath.Join(repoPath, "docs", "stories")
+			_ = os.MkdirAll(storiesDir, 0o755)
+			storyPath := filepath.Join(storiesDir, "2026-11-13-gov-5273-eliminate-adhoc-ase-false-positive-recurrence.story.md")
+			storyMarkdown := "---\nid: STORY-GOV-5273\ntitle: Eliminate Ad-Hoc ASE False-Positive Recurrence\nstatus: DONE\n---\n## 5. Definition of Done\n- [x] All root causes remediated and verified\n## 7. Reviews\n| Tool | Status |\n|---|---|\n| tdd | PASS |\n"
+			_ = os.WriteFile(storyPath, []byte(storyMarkdown), 0o644)
+			_ = procutil.Command("git", "-C", repoPath, "add", "docs").Run()
+			_ = procutil.Command("git", "-C", repoPath, "commit", "-m", "fix(gov-5273): eliminate adhoc ASE false-positive recurrence [STORY-GOV-5273]").Run()
+			step0 := fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":%q}`,
+				systemBoilerplate+`<USER_REQUEST>/autonomous-story-execution STORY-GOV-5273 deep review and fix</USER_REQUEST>`) + "\n"
+			step2 := `{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","content":"## CRAFT Closeout\nCompleted STORY-GOV-5273."}` + "\n"
+			_ = os.WriteFile(transcriptPath, []byte(step0+step2), 0o644)
+			fmt.Fprintf(stdout, "Completed conversation %s\n", cid)
+			return 0
+		}
+		return 0
+
 	default:
 		// Default simple execution
 		if conversationID != "" {
