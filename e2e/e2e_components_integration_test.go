@@ -908,3 +908,122 @@ func TestE2E_Iazio0201_WindowsWSLAlternates_StrandedRebase_And_AdhocASEBrainDisc
 		t.Fatalf("expected slotRepo to transition cleanly back to IDLE/NONE/Clean after story completion, got %+v", stDone)
 	}
 }
+
+// TestE2E_Gov5273_EliminateAdhocASEFalsePositiveRecurrenceWithMockAgy verifies end-to-end using compiled mock-agy:
+//  1. Stage-2 git-update escalation (`execute shell prompt "autopilot git-update"`) with realistic `<RULE[.../AGENTS.md]>`
+//     and `<skills>` system prompt boilerplate and `STORY-GOV-POINTERS-*` output NEVER triggers `ADHOC_ASE` / `INDEPENDENT_USER_SESSION`.
+//  2. Interactive non-ASE prompt (`explain the architecture of this repository`) whose `TOOL_RESPONSE` outputs mention
+//     `/autonomous-story-execution` and `STORY-GOV-5249` NEVER triggers `ADHOC_ASE` or binds `STORY-GOV-5249`.
+//  3. A genuine `/autonomous-story-execution STORY-GOV-5273` turn in mock-agy IS detected as `ADHOC_ASE` / `INDEPENDENT_USER_SESSION` / `LIVE`
+//     while active, and transitions back to `IDLE` / `NONE` when either (a) the turn completes or (b) the process dies and >3m elapses without a background task.
+func TestE2E_Gov5273_EliminateAdhocASEFalsePositiveRecurrenceWithMockAgy(t *testing.T) {
+	mockAgy := buildCompiledMockAgy(t)
+	baseWork := t.TempDir()
+	repo04 := filepath.Join(baseWork, "meta-repo-04")
+	_ = os.MkdirAll(filepath.Join(repo04, ".autopilot"), 0o755)
+
+	_ = exec.Command("git", "init", "-b", "main", repo04).Run()
+	_ = exec.Command("git", "-C", repo04, "config", "user.email", "e2e@iazio.local").Run()
+	_ = exec.Command("git", "-C", repo04, "config", "user.name", "Iazio E2E").Run()
+	_ = os.WriteFile(filepath.Join(repo04, ".gitignore"), []byte(".session_story_id\n.autopilot/\n.iazio/\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(repo04, "AGENTS.md"), []byte("# Agent Execution Router\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(repo04, "README.md"), []byte("main-v1\n"), 0o644)
+	_ = exec.Command("git", "-C", repo04, "add", ".").Run()
+	_ = exec.Command("git", "-C", repo04, "commit", "-m", "init main").Run()
+	_ = os.WriteFile(filepath.Join(repo04, ".autopilot", "state.json"), []byte(`{"state":"IDLE","story_id":""}`), 0o644)
+
+	brainRoot := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainRoot)
+
+	// Case 1: mock-agy executes Stage-2 git-update escalation prompt
+	convGitUpdate := "adc06b45-cb61-41f3-9231-228abac20909"
+	cmdGitUpdate := exec.Command(mockAgy, "--conversation="+convGitUpdate, "--print", `execute shell prompt "autopilot git-update"`)
+	cmdGitUpdate.Dir = repo04
+	cmdGitUpdate.Env = append(os.Environ(),
+		"IAZIO_BRAIN_DIR="+brainRoot,
+		"MOCK_AGY_SCENARIO=gov_5273_adhoc_ase_false_positive_recurrence_flow",
+		"MOCK_AGY_PHASE=git_update_escalation",
+		"MOCK_AGY_REPO_PATH="+repo04,
+	)
+	if out, err := cmdGitUpdate.CombinedOutput(); err != nil {
+		t.Fatalf("mock-agy git_update_escalation failed: %v\noutput: %s", err, string(out))
+	}
+
+	stAfterGitUpdate, err := diagnostics.InspectRepoFleetStatus(context.Background(), repo04)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus(after git_update_escalation): %v", err)
+	}
+	if stAfterGitUpdate.ASEState != "IDLE" || stAfterGitUpdate.ExecutionProvenance != "NONE" || stAfterGitUpdate.ActiveStoryID != "" {
+		t.Fatalf("expected git_update_escalation mock-agy run to remain IDLE/NONE with empty story, got %+v", stAfterGitUpdate)
+	}
+
+	// Case 2: mock-agy executes non-ASE interactive prompt whose tool output quotes /autonomous-story-execution and STORY-GOV-5249
+	convInteractive := "b1234567-cb61-41f3-9231-228abac20909"
+	cmdInteractive := exec.Command(mockAgy, "--conversation="+convInteractive, "--print", "explain the architecture of this repository")
+	cmdInteractive.Dir = repo04
+	cmdInteractive.Env = append(os.Environ(),
+		"IAZIO_BRAIN_DIR="+brainRoot,
+		"MOCK_AGY_SCENARIO=gov_5273_adhoc_ase_false_positive_recurrence_flow",
+		"MOCK_AGY_PHASE=non_ase_interactive_prompt",
+		"MOCK_AGY_REPO_PATH="+repo04,
+	)
+	if out, err := cmdInteractive.CombinedOutput(); err != nil {
+		t.Fatalf("mock-agy non_ase_interactive_prompt failed: %v\noutput: %s", err, string(out))
+	}
+
+	stAfterInteractive, err := diagnostics.InspectRepoFleetStatus(context.Background(), repo04)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus(after non_ase_interactive_prompt): %v", err)
+	}
+	if stAfterInteractive.ASEState != "IDLE" || stAfterInteractive.ExecutionProvenance != "NONE" || stAfterInteractive.ActiveStoryID != "" {
+		t.Fatalf("expected non-ASE interactive mock-agy run to remain IDLE/NONE with empty story, got %+v", stAfterInteractive)
+	}
+
+	// Case 3: mock-agy executes genuine /autonomous-story-execution STORY-GOV-5273 turn -> detected as RUNNING / ADHOC_ASE
+	convASE := "c7654321-cb61-41f3-9231-228abac20909"
+	cmdASE := exec.Command(mockAgy, "--conversation="+convASE, "--print", "/autonomous-story-execution STORY-GOV-5273 deep review and fix")
+	cmdASE.Dir = repo04
+	cmdASE.Env = append(os.Environ(),
+		"IAZIO_BRAIN_DIR="+brainRoot,
+		"MOCK_AGY_SCENARIO=gov_5273_adhoc_ase_false_positive_recurrence_flow",
+		"MOCK_AGY_PHASE=genuine_adhoc_ase_turn",
+		"MOCK_AGY_REPO_PATH="+repo04,
+	)
+	if out, err := cmdASE.CombinedOutput(); err != nil {
+		t.Fatalf("mock-agy genuine_adhoc_ase_turn failed: %v\noutput: %s", err, string(out))
+	}
+
+	stDuringASE, err := diagnostics.InspectRepoFleetStatus(context.Background(), repo04)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus(during genuine_adhoc_ase_turn): %v", err)
+	}
+	if stDuringASE.ASEState != "RUNNING" ||
+		stDuringASE.CurrentPhase != "ADHOC_ASE" ||
+		stDuringASE.ExecutionProvenance != "INDEPENDENT_USER_SESSION" ||
+		stDuringASE.ToolLiveness != "LIVE" ||
+		stDuringASE.ActiveStoryID != "STORY-GOV-5273" {
+		t.Fatalf("expected genuine mock-agy ASE turn to report RUNNING/ADHOC_ASE/INDEPENDENT_USER_SESSION/LIVE for STORY-GOV-5273, got %+v", stDuringASE)
+	}
+
+	// Case 4: mock-agy completes STORY-GOV-5273 -> transitions back to IDLE / NONE / Clean
+	cmdComplete := exec.Command(mockAgy, "--conversation="+convASE, "--print", "/autonomous-story-execution STORY-GOV-5273 complete")
+	cmdComplete.Dir = repo04
+	cmdComplete.Env = append(os.Environ(),
+		"IAZIO_BRAIN_DIR="+brainRoot,
+		"MOCK_AGY_SCENARIO=gov_5273_adhoc_ase_false_positive_recurrence_flow",
+		"MOCK_AGY_PHASE=complete_genuine_adhoc_ase_turn",
+		"MOCK_AGY_REPO_PATH="+repo04,
+	)
+	if out, err := cmdComplete.CombinedOutput(); err != nil {
+		t.Fatalf("mock-agy complete_genuine_adhoc_ase_turn failed: %v\noutput: %s", err, string(out))
+	}
+
+	stCompleted, err := diagnostics.InspectRepoFleetStatus(context.Background(), repo04)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus(after complete_genuine_adhoc_ase_turn): %v", err)
+	}
+	if stCompleted.ASEState != "IDLE" || stCompleted.ExecutionProvenance != "NONE" || !stCompleted.IsClean || stCompleted.ActiveStoryID != "" {
+		t.Fatalf("expected completed mock-agy ASE turn to return to IDLE/NONE/Clean, got %+v", stCompleted)
+	}
+}
+
