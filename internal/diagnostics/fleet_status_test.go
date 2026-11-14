@@ -1668,6 +1668,174 @@ func TestStoryGov5273_EliminateAdhocASEFalsePositiveRecurrence(t *testing.T) {
 	}
 }
 
+func TestStoryGov5281_LargeCompactedTranscriptToolResponseAndStoryPrecedence(t *testing.T) {
+	repoDir := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-b", "main"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test User"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+	_ = os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Test\n"), 0o644)
+	_ = exec.Command("git", "-C", repoDir, "add", ".").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "init").Run()
+	_ = exec.Command("git", "-C", repoDir, "checkout", "-b", "feat/STORY-GOV-5281-ase-model-routing").Run()
+
+	// Create an incomplete on-disk story and .session_story_id + explicit IDLE state.json (common mid-interactive-session)
+	storiesDir := filepath.Join(repoDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0o755)
+	_ = os.WriteFile(filepath.Join(storiesDir, "2026-11-14-gov-5281.story.md"), []byte("---\nid: STORY-GOV-5281\nstatus: IN_PROGRESS\n---\n## 6. Definition of Done\n- [ ] Pending\n"), 0o644)
+	_ = os.MkdirAll(filepath.Join(repoDir, ".autopilot"), 0o755)
+	_ = os.WriteFile(filepath.Join(repoDir, ".autopilot", "state.json"), []byte(`{"state":"IDLE","story_id":""}`), 0o644)
+	_ = os.WriteFile(filepath.Join(repoDir, ".session_story_id"), []byte("STORY-GOV-5281\n"), 0o644)
+	staleTime := time.Now().Add(-30 * time.Minute)
+	_ = os.Chtimes(filepath.Join(repoDir, ".session_story_id"), staleTime, staleTime)
+
+	brainRoot := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainRoot)
+	convID := "test5281-0000-4000-8000-000000005281"
+	logsDir := filepath.Join(brainRoot, convID, ".system_generated", "logs")
+	_ = os.MkdirAll(logsDir, 0o755)
+
+	// Build a >300 KB compacted transcript where:
+	// - Step 0 is >96KB compaction USER_INPUT with <CONTEXT_SUMMARY> containing /autonomous-story-execution in # User Requests AND prose mentioning STORY-DISC-002
+	// - Middle contains a USER_INPUT invoking /autonomous-story-execution STORY-GOV-5281
+	// - Tail contains TOOL_RESPONSE reading fleet_status.go code (`execute shell prompt "autopilot git-update"`) and an active tool_calls PLANNER_RESPONSE
+	padding := strings.Repeat("analysis padding token ", 5500) // ~126 KB
+	step0 := fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"<user_information>Command Working Directory: %s\nApp Data Directory: /Users/romeo/.gemini/antigravity-cli</user_information><CONTEXT_SUMMARY>\n# User Requests\n1. deep review\n2. /autonomous-story-execution implement discoveries\n\n# Previous Session Summary:\nReviewed --story-id STORY-DISC-002 earlier. %s\n</CONTEXT_SUMMARY><USER_REQUEST>continue</USER_REQUEST>"}`, repoDir, padding)
+	stepMid := `{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>/autonomous-story-execution STORY-GOV-5281</USER_REQUEST>"}`
+	stepToolPad := fmt.Sprintf(`{"step_index":2,"type":"TOOL_RESPONSE","status":"DONE","content":"%s"}`, padding)
+	stepToolPoison := `{"step_index":3,"type":"TOOL_RESPONSE","status":"DONE","content":"1840: return strings.Contains(lower, ` + "`execute shell prompt \"autopilot git-update\"`" + `) || strings.Contains(lower, \"iazio-agy-log-git-update-agy\")"}`
+	stepTail := fmt.Sprintf(`{"step_index":4,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`, filepath.Join(repoDir, "README.md"))
+
+	transcriptBody := strings.Join([]string{step0, stepMid, stepToolPad, stepToolPoison, stepTail}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(logsDir, "transcript.jsonl"), []byte(transcriptBody), 0o644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	active, gotConv, _, _ := InspectActiveBrainASETurnForRepo(repoDir, time.Now())
+	if !active || gotConv != convID {
+		t.Fatalf("expected InspectActiveBrainASETurnForRepo=true for compacted >300KB transcript with TOOL_RESPONSE git-update snippet, got active=%v conv=%q", active, gotConv)
+	}
+
+	res, err := InspectRepoFleetStatus(context.Background(), repoDir)
+	if err != nil {
+		t.Fatalf("InspectRepoFleetStatus error: %v", err)
+	}
+	if !res.HasActiveAgentASETurn {
+		t.Fatalf("expected HasActiveAgentASETurn=true, got false (ASEState=%q CurrentPhase=%q)", res.ASEState, res.CurrentPhase)
+	}
+	if res.ASEState != "RUNNING" || res.CurrentPhase != "ADHOC_ASE" || res.ExecutionProvenance != "INDEPENDENT_USER_SESSION" {
+		t.Fatalf("expected RUNNING/ADHOC_ASE/INDEPENDENT_USER_SESSION, got ASEState=%q CurrentPhase=%q Provenance=%q",
+			res.ASEState, res.CurrentPhase, res.ExecutionProvenance)
+	}
+	if res.ActiveStoryID != "STORY-GOV-5281" {
+		t.Fatalf("expected authoritative on-disk/branch ActiveStoryID=STORY-GOV-5281 (not transcript prose STORY-DISC-002), got %q", res.ActiveStoryID)
+	}
+}
+
+func TestStoryGov5281_ClassifyProcessEnvProvenanceMaintenanceIsolation(t *testing.T) {
+	cases := []struct {
+		name      string
+		envStr    string
+		wantProv  string
+		wantMaint bool
+	}{
+		{
+			name:      "maintenance_flag_and_legacy_managed_by",
+			envStr:    "PATH=/usr/bin\x00IAZIO_AGENT_MANAGED=1\x00IAZIO_MAINTENANCE_RUN=1\x00IAZIO_MANAGED_BY=harness",
+			wantProv:  "NONE",
+			wantMaint: true,
+		},
+		{
+			name:      "legacy_agent_managed_without_job_id",
+			envStr:    "PATH=/usr/bin IAZIO_AGENT_MANAGED=1 IAZIO_MANAGED_BY=harness",
+			wantProv:  "NONE",
+			wantMaint: true,
+		},
+		{
+			name:      "coordinated_harness_with_job_id",
+			envStr:    "PATH=/usr/bin IAZIO_AGENT_MANAGED=1 IAZIO_MANAGED_BY=harness IAZIO_HARNESS_JOB_ID=job_1234",
+			wantProv:  "COORDINATED_HARNESS",
+			wantMaint: false,
+		},
+		{
+			name:      "independent_user_session",
+			envStr:    "PATH=/usr/bin\x00USER=romeo",
+			wantProv:  "INDEPENDENT_USER_SESSION",
+			wantMaint: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotProv, gotMaint := classifyProcessEnvProvenance(tc.envStr)
+			if gotProv != tc.wantProv || gotMaint != tc.wantMaint {
+				t.Fatalf("classifyProcessEnvProvenance() = (%q, %v), want (%q, %v)", gotProv, gotMaint, tc.wantProv, tc.wantMaint)
+			}
+			if isAutomatedMaintenanceEnv(tc.envStr) != tc.wantMaint {
+				t.Fatalf("isAutomatedMaintenanceEnv() = %v, want %v", !tc.wantMaint, tc.wantMaint)
+			}
+		})
+	}
+}
+
+func TestIsDBWorkspaceClaimedBySiblingWorktreeAndBrainDetection(t *testing.T) {
+	// (a) Self workspace root + sub-file URIs + prose citation to sibling docs must NOT claim for sibling.
+	selfDB := []byte("header\x00file:///Users/romeo/work/meta-repo-03\x00file:///Users/romeo/work/meta-repo-03/ai/skills/autopilot/SKILL.md\x00see [ref](file:///Users/romeo/work/meta-repo-02/docs/x.md)\x00tail")
+	if isDBWorkspaceClaimedBySiblingWorktree(selfDB, "/users/romeo/work/meta-repo-03") {
+		t.Fatalf("expected self workspace .db with sub-file URIs and sibling prose link to return false for meta-repo-03")
+	}
+
+	// (b) Explicit sibling workspace root without self workspace root must return true.
+	siblingDB := []byte("header\x00file:///Users/romeo/work/meta-repo-02\x00file:///Users/romeo/work/meta-repo-02/README.md\x00")
+	if !isDBWorkspaceClaimedBySiblingWorktree(siblingDB, "/users/romeo/work/meta-repo-03") {
+		t.Fatalf("expected sibling workspace .db to return true when probing meta-repo-03")
+	}
+
+	// (c) End-to-end InspectActiveBrainASETurnForRepo with HOME conversation .db containing self workspace root,
+	// sub-file URIs, and sibling prose link detects active brain turn on meta-repo-03.
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	workRoot := filepath.Join(tmpRoot, "work")
+	repo03 := filepath.Join(workRoot, "meta-repo-03")
+	repo02 := filepath.Join(workRoot, "meta-repo-02")
+	brainRoot := filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain")
+	convDir := filepath.Join(homeDir, ".gemini", "antigravity-cli", "conversations")
+	convID := "ea854a37-959c-4886-bf7f-d3ab255ffde1"
+	logsDir := filepath.Join(brainRoot, convID, ".system_generated", "logs")
+	for _, dir := range []string{repo03, repo02, logsDir, convDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("IAZIO_BRAIN_DIR", brainRoot)
+
+	dbContent := fmt.Sprintf("sqlite\x00file://%s\x00file://%s/ai/skills/autopilot/SKILL.md\x00[note](file://%s/docs/x.md)", repo03, repo03, repo02)
+	if err := os.WriteFile(filepath.Join(convDir, convID+".db"), []byte(dbContent), 0o644); err != nil {
+		t.Fatalf("write conv db: %v", err)
+	}
+	transcriptBody := strings.Join([]string{
+		fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"Command Working Directory: %s\n<USER_REQUEST>/autonomous-story-execution STORY-GOV-5281</USER_REQUEST>"}`, repo03),
+		fmt.Sprintf(`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`, filepath.Join(repo03, "README.md")),
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(logsDir, "transcript.jsonl"), []byte(transcriptBody), 0o644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	active, gotConv, gotStory, _ := InspectActiveBrainASETurnForRepo(repo03, time.Now())
+	if !active || gotConv != convID || gotStory != "STORY-GOV-5281" {
+		t.Fatalf("expected InspectActiveBrainASETurnForRepo to detect (%v, %s, STORY-GOV-5281), got (%v, %q, %q)", true, convID, active, gotConv, gotStory)
+	}
+}
+
+
 
 
 

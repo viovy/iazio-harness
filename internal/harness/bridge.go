@@ -16,9 +16,38 @@ import (
 type Bridge struct {
 	Autopilot       AutopilotClient
 	Executor        Executor
+	ModelEscalator  func(stage string, retryCount int, sirCode string) string
 	MaxStageRetries int
 	OnHITLSuspend   func(ctx context.Context, suspend HITLSuspend) error
 	OnEvent         func(ev HarnessEvent)
+}
+
+// DefaultStageModelEscalation selects the model tier for a stage based on retry count.
+func DefaultStageModelEscalation(stage string, retryCount int, sirCode string) string {
+	switch {
+	case retryCount >= 2:
+		return "gemini-4-hydrogen-high"
+	case retryCount == 1:
+		return "gemini-4-carbon-high"
+	default:
+		return "gemini-3.8-flash-high"
+	}
+}
+
+func (b *Bridge) resolveStageModel(stage string, retryCount int, sirCode string) string {
+	escalator := b.ModelEscalator
+	if escalator == nil {
+		escalator = DefaultStageModelEscalation
+	}
+	return strings.TrimSpace(escalator(stage, retryCount, sirCode))
+}
+
+func (b *Bridge) executeForStage(ctx context.Context, worktreePath, prompt, stage string, retryCount int, sirCode string) (string, error) {
+	model := b.resolveStageModel(stage, retryCount, sirCode)
+	if me, ok := b.Executor.(ModelExecutor); ok && model != "" {
+		return model, me.ExecuteWithModel(ctx, worktreePath, prompt, model)
+	}
+	return model, b.Executor.Execute(ctx, worktreePath, prompt)
 }
 
 // NewBridge creates a new SIR Checkpoint Bridge.
@@ -69,14 +98,20 @@ func (b *Bridge) ExecuteStory(ctx context.Context, jobID, storyID, initialPrompt
 	if boot.CodingGuardrails != "" {
 		fullPrompt = fmt.Sprintf("%s\n\n### Coding Guardrails\n%s", initialPrompt, boot.CodingGuardrails)
 	}
-	if err := b.Executor.Execute(ctx, boot.WorktreePath, fullPrompt); err != nil {
+	activeModel, err := b.executeForStage(ctx, boot.WorktreePath, fullPrompt, "initial_coding_pass", 0, "")
+	if err != nil {
 		return fmt.Errorf("initial coding executor failed: %w", err)
 	}
 
+	var initialPayload any
+	if activeModel != "" {
+		initialPayload = map[string]any{"model": activeModel}
+	}
 	b.emitEvent(HarnessEvent{
 		Type:      "stage_transition",
 		JobID:     jobID,
 		Stage:     "initial_coding_pass",
+		Payload:   initialPayload,
 		Timestamp: time.Now().UTC(),
 	})
 
@@ -96,19 +131,24 @@ func (b *Bridge) ExecuteStory(ctx context.Context, jobID, storyID, initialPrompt
 
 		stageHaltCounts[haltedStage]++
 		curRetries := stageHaltCounts[haltedStage]
+		remediationModel := b.resolveStageModel(haltedStage, curRetries, sir.Incident.SIRCode)
 
+		sirPayload := map[string]any{
+			"sir_code":    sir.Incident.SIRCode,
+			"summary":     sir.Incident.Summary,
+			"retry_count": curRetries,
+			"resume_cmd":  sir.Checkpoint.ResumeCmd,
+		}
+		if remediationModel != "" {
+			sirPayload["model"] = remediationModel
+		}
 		b.emitEvent(HarnessEvent{
 			Type:       "sir_halt",
 			JobID:      jobID,
 			Stage:      haltedStage,
 			Checkpoint: ckptID,
 			Timestamp:  time.Now().UTC(),
-			Payload: map[string]any{
-				"sir_code":    sir.Incident.SIRCode,
-				"summary":     sir.Incident.Summary,
-				"retry_count": curRetries,
-				"resume_cmd":  sir.Checkpoint.ResumeCmd,
-			},
+			Payload:    sirPayload,
 		})
 
 		// 5. HITL Circuit Breaker: suspend if halted stage retries exceed threshold
@@ -151,8 +191,12 @@ func (b *Bridge) ExecuteStory(ctx context.Context, jobID, storyID, initialPrompt
 		remediationPrompt := BuildRemediationPrompt(sir)
 
 		// Dispatch coding executor with hydrated SIR context only
-		if err := b.Executor.Execute(ctx, boot.WorktreePath, remediationPrompt); err != nil {
+		usedModel, err := b.executeForStage(ctx, boot.WorktreePath, remediationPrompt, haltedStage, curRetries, sir.Incident.SIRCode)
+		if err != nil {
 			return fmt.Errorf("executor remediation pass failed: %w", err)
+		}
+		if usedModel != "" {
+			activeModel = usedModel
 		}
 
 		// 4. Checkpoint Resume
@@ -167,10 +211,15 @@ func (b *Bridge) ExecuteStory(ctx context.Context, jobID, storyID, initialPrompt
 		}
 	}
 
+	var completedPayload any
+	if activeModel != "" {
+		completedPayload = map[string]any{"model": activeModel}
+	}
 	b.emitEvent(HarnessEvent{
 		Type:      "stage_transition",
 		JobID:     jobID,
 		Stage:     "completed",
+		Payload:   completedPayload,
 		Timestamp: time.Now().UTC(),
 	})
 

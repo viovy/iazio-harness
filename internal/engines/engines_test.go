@@ -130,12 +130,52 @@ func TestArgvOrder(t *testing.T) {
 			cwd:  "/repos/leaf-01",
 		},
 		{
+			name: "agy with valid effort",
+			req: ExecutionRequest{
+				Engine: "agy", Prompt: "plan work", Kind: "execute",
+				Model: "gemini-4-hydrogen-high", Effort: "  XHIGH ",
+				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
+			},
+			want: []string{"agy", "--print", "plan work", "--print-timeout", "0", "--model", "gemini-4-hydrogen-high", "--dangerously-skip-permissions", "--effort", "xhigh"},
+			cwd:  "/repos/leaf-01",
+		},
+		{
+			name: "agy ignores invalid effort",
+			req: ExecutionRequest{
+				Engine: "agy", Prompt: "plan work", Kind: "execute",
+				Effort:       "extreme",
+				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
+			},
+			want: []string{"agy", "--print", "plan work", "--print-timeout", "0", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"},
+			cwd:  "/repos/leaf-01",
+		},
+		{
 			name: "opencode",
 			req: ExecutionRequest{
 				Engine: "opencode", Prompt: "p", Kind: "execute",
 				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
 			},
 			want: []string{"opencode", "run", "--auto", "p"},
+			cwd:  "/repos/leaf-01",
+		},
+		{
+			name: "opencode auto model preserves default argv",
+			req: ExecutionRequest{
+				Engine: "opencode", Prompt: "p", Kind: "execute",
+				Model:        "auto",
+				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
+			},
+			want: []string{"opencode", "run", "--auto", "p"},
+			cwd:  "/repos/leaf-01",
+		},
+		{
+			name: "opencode explicit model",
+			req: ExecutionRequest{
+				Engine: "opencode", Prompt: "p", Kind: "execute",
+				Model:        "openrouter/qwen-3",
+				WorktreePath: "/repos/leaf-01", DocsHubPath: "/repos/docs-hub",
+			},
+			want: []string{"opencode", "run", "-m", "openrouter/qwen-3", "--auto", "p"},
 			cwd:  "/repos/leaf-01",
 		},
 		{

@@ -658,3 +658,31 @@ func TestGov3839_ExecutorResolvesAbsoluteWorktreePathAndNormalizedPrompt(t *test
 		t.Fatalf("expected Submodule 'iazio-mcp' within WorktreePath to resolve WorkingDir to iazio-mcp, got %q", opts.WorkingDir)
 	}
 }
+
+func TestExecutor_PropagatesModelAndEffort(t *testing.T) {
+	fleetRoot, _, _ := setupTestFleet(t)
+	runner := &mockPromptRunner{}
+	exec := NewExecutor(fleetRoot, runner)
+	exec.SetLockDir(t.TempDir())
+
+	_, err := exec.Execute(context.Background(), PromptPayload{
+		PromptID:    "prompt_model_prop",
+		Repo:        "iazio-mcp",
+		Prompt:      "run model test",
+		TargetAgent: "agy",
+		Model:       "  gemini-4-carbon-high  ",
+		Effort:      "  high ",
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	runner.mu.Lock()
+	opts := runner.lastOpts
+	runner.mu.Unlock()
+	if opts.Model != "gemini-4-carbon-high" {
+		t.Fatalf("expected propagated Model gemini-4-carbon-high, got %q", opts.Model)
+	}
+	if opts.Effort != "high" {
+		t.Fatalf("expected propagated Effort high, got %q", opts.Effort)
+	}
+}

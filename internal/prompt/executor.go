@@ -35,6 +35,8 @@ type PromptPayload struct {
 	Prompt               string `json:"prompt"`
 	NormalizedPrompt     string `json:"normalized_prompt,omitempty"`
 	TargetAgent          string `json:"target_agent,omitempty"`
+	Model                string `json:"model,omitempty"`
+	Effort               string `json:"effort,omitempty"`
 	TimeoutSeconds       int    `json:"timeout_seconds,omitempty"`
 	TraceID              string `json:"trace_id,omitempty"`
 }
@@ -180,6 +182,8 @@ func (e *Executor) Execute(ctx context.Context, payload PromptPayload) (*autopil
 		Title:                payload.Title,
 		Prompt:               payload.Prompt,
 		TargetAgent:          payload.TargetAgent,
+		Model:                strings.TrimSpace(payload.Model),
+		Effort:               strings.TrimSpace(payload.Effort),
 		WorkingDir:           workingDir,
 		TraceID:              payload.TraceID,
 		Timeout:              timeout,
