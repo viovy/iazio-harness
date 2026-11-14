@@ -294,3 +294,155 @@ func TestParseSIREnvelope(t *testing.T) {
 		t.Fatalf("expected nil for status!=SIR_BOUNDARY_HALT")
 	}
 }
+
+type mockModelExecutor struct {
+	mockExecutor
+	usedModels []string
+}
+
+func (m *mockModelExecutor) ExecuteWithModel(ctx context.Context, worktreePath string, prompt string, model string) error {
+	m.mu.Lock()
+	m.executeCalls = append(m.executeCalls, worktreePath)
+	m.receivedPrompts = append(m.receivedPrompts, prompt)
+	m.usedModels = append(m.usedModels, model)
+	m.mu.Unlock()
+	return nil
+}
+
+func TestDefaultStageModelEscalation(t *testing.T) {
+	if got := DefaultStageModelEscalation("initial_coding_pass", 0, ""); got != "gemini-3.8-flash-high" {
+		t.Fatalf("retry 0 got %q, want gemini-3.8-flash-high", got)
+	}
+	if got := DefaultStageModelEscalation("unit_test", 1, "SIR_UNIT_TEST_FAILED"); got != "gemini-4-carbon-high" {
+		t.Fatalf("retry 1 got %q, want gemini-4-carbon-high", got)
+	}
+	if got := DefaultStageModelEscalation("unit_test", 2, "SIR_UNIT_TEST_FAILED"); got != "gemini-4-hydrogen-high" {
+		t.Fatalf("retry 2 got %q, want gemini-4-hydrogen-high", got)
+	}
+	if got := DefaultStageModelEscalation("unit_test", 5, "SIR_UNIT_TEST_FAILED"); got != "gemini-4-hydrogen-high" {
+		t.Fatalf("retry 5 got %q, want gemini-4-hydrogen-high", got)
+	}
+}
+
+func TestBridge_ModelEscalationWithModelExecutor(t *testing.T) {
+	sirEnv := sampleSIREnvelope("unit_test", "ckpt_01", 100)
+
+	var resumeCount int
+	ap := &mockAutopilot{
+		runFn: func(ctx context.Context, worktreePath string) (*RunResult, error) {
+			return &RunResult{ExitCode: 1, SIREnv: sirEnv}, nil
+		},
+		resumeFn: func(ctx context.Context, worktreePath string, resumeCmd string) (*RunResult, error) {
+			resumeCount++
+			if resumeCount == 1 {
+				return &RunResult{ExitCode: 1, SIREnv: sirEnv}, nil
+			}
+			return &RunResult{ExitCode: 0}, nil
+		},
+	}
+
+	exec := &mockModelExecutor{}
+	var events []HarnessEvent
+	var evMu sync.Mutex
+
+	bridge := NewBridge(ap, exec)
+	bridge.OnEvent = func(ev HarnessEvent) {
+		evMu.Lock()
+		events = append(events, ev)
+		evMu.Unlock()
+	}
+
+	if err := bridge.ExecuteStory(context.Background(), "job-model-esc", "STORY-TEST-5281", "Implement routing"); err != nil {
+		t.Fatalf("unexpected ExecuteStory error: %v", err)
+	}
+
+	exec.mu.Lock()
+	gotModels := append([]string(nil), exec.usedModels...)
+	exec.mu.Unlock()
+
+	wantModels := []string{"gemini-3.8-flash-high", "gemini-4-carbon-high", "gemini-4-hydrogen-high"}
+	if strings.Join(gotModels, ",") != strings.Join(wantModels, ",") {
+		t.Fatalf("executed models %v, want %v", gotModels, wantModels)
+	}
+
+	evMu.Lock()
+	defer evMu.Unlock()
+
+	var stageModels []string
+	var haltModels []string
+	for _, ev := range events {
+		payloadMap, ok := ev.Payload.(map[string]any)
+		if !ok {
+			continue
+		}
+		m, _ := payloadMap["model"].(string)
+		if m == "" {
+			continue
+		}
+		if ev.Type == "stage_transition" {
+			stageModels = append(stageModels, ev.Stage+"="+m)
+		}
+		if ev.Type == "sir_halt" {
+			haltModels = append(haltModels, m)
+		}
+	}
+
+	wantStage := []string{"initial_coding_pass=gemini-3.8-flash-high", "completed=gemini-4-hydrogen-high"}
+	if strings.Join(stageModels, ",") != strings.Join(wantStage, ",") {
+		t.Fatalf("stage_transition models %v, want %v", stageModels, wantStage)
+	}
+	wantHalts := []string{"gemini-4-carbon-high", "gemini-4-hydrogen-high"}
+	if strings.Join(haltModels, ",") != strings.Join(wantHalts, ",") {
+		t.Fatalf("sir_halt models %v, want %v", haltModels, wantHalts)
+	}
+}
+
+func TestBridge_CustomModelEscalatorEmptyModelFallsBackAndOmitsPayload(t *testing.T) {
+	sirEnv := sampleSIREnvelope("lint", "ckpt_custom", 50)
+	ap := &mockAutopilot{
+		runFn: func(ctx context.Context, worktreePath string) (*RunResult, error) {
+			return &RunResult{ExitCode: 1, SIREnv: sirEnv}, nil
+		},
+		resumeFn: func(ctx context.Context, worktreePath string, resumeCmd string) (*RunResult, error) {
+			return &RunResult{ExitCode: 0}, nil
+		},
+	}
+
+	exec := &mockModelExecutor{}
+	var events []HarnessEvent
+	bridge := NewBridge(ap, exec)
+	bridge.ModelEscalator = func(stage string, retryCount int, sirCode string) string {
+		if retryCount == 0 {
+			return ""
+		}
+		return "custom-escalation-model"
+	}
+	bridge.OnEvent = func(ev HarnessEvent) {
+		events = append(events, ev)
+	}
+
+	if err := bridge.ExecuteStory(context.Background(), "job-custom", "STORY-TEST-5281", "Run check"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	exec.mu.Lock()
+	if len(exec.executeCalls) != 2 {
+		t.Fatalf("expected 2 executor calls, got %d", len(exec.executeCalls))
+	}
+	if len(exec.usedModels) != 1 || exec.usedModels[0] != "custom-escalation-model" {
+		t.Fatalf("expected empty model to fall back to Execute() and retry to use ExecuteWithModel, got %v", exec.usedModels)
+	}
+	exec.mu.Unlock()
+
+	for _, ev := range events {
+		if ev.Type == "stage_transition" && ev.Stage == "initial_coding_pass" && ev.Payload != nil {
+			t.Fatalf("expected nil payload when model is empty on initial_coding_pass, got %#v", ev.Payload)
+		}
+		if ev.Type == "sir_halt" {
+			pm, _ := ev.Payload.(map[string]any)
+			if pm["model"] != "custom-escalation-model" {
+				t.Fatalf("expected sir_halt model custom-escalation-model, got %#v", pm["model"])
+			}
+		}
+	}
+}

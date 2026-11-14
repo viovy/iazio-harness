@@ -62,6 +62,7 @@ type ExecutionRequest struct {
 	DocsHubPath                string
 	PrintTimeout               string
 	Model                      string
+	Effort                     string
 	Agent                      string
 	DisableSlashCommands       bool
 	DangerouslySkipPermissions bool
@@ -1005,6 +1006,9 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		if req.LogFile != "" {
 			argv = append(argv, "--log-file", req.LogFile)
 		}
+		if effort := normalizeValidEffort(req.Effort); effort != "" {
+			argv = append(argv, "--effort", effort)
+		}
 		return argv, nil
 	case "copilot":
 		argv := []string{"copilot", "--prompt", req.Prompt}
@@ -1013,6 +1017,9 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		}
 		return argv, nil
 	case "opencode":
+		if m := strings.TrimSpace(req.Model); m != "" && !strings.EqualFold(m, "auto") {
+			return []string{"opencode", "run", "-m", m, "--auto", req.Prompt}, nil
+		}
 		return []string{"opencode", "run", "--auto", req.Prompt}, nil
 	case "autopilot":
 		if req.Kind == "story_begin" {
@@ -1039,5 +1046,14 @@ func BuildArgv(req ExecutionRequest) ([]string, error) {
 		return argv, nil
 	default:
 		return nil, errors.New("unknown engine")
+	}
+}
+
+func normalizeValidEffort(effort string) string {
+	switch normalized := strings.ToLower(strings.TrimSpace(effort)); normalized {
+	case "low", "medium", "high", "xhigh", "max":
+		return normalized
+	default:
+		return ""
 	}
 }

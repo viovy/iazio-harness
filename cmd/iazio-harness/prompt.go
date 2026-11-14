@@ -84,6 +84,12 @@ func runPromptRun(args []string) error {
 		if agentEnv := strings.TrimSpace(os.Getenv("IAZIO_TARGET_AGENT")); agentEnv != "" {
 			synth["target_agent"] = agentEnv
 		}
+		if modelEnv := strings.TrimSpace(os.Getenv("IAZIO_MODEL")); modelEnv != "" {
+			synth["model"] = modelEnv
+		}
+		if effortEnv := strings.TrimSpace(os.Getenv("IAZIO_EFFORT")); effortEnv != "" {
+			synth["effort"] = effortEnv
+		}
 		stdinData, _ = json.Marshal(synth)
 	}
 
@@ -91,6 +97,7 @@ func runPromptRun(args []string) error {
 	if err := json.Unmarshal(stdinData, &payload); err != nil {
 		return writePromptError(fmt.Errorf("invalid prompt JSON payload: %w", err))
 	}
+	populatePromptPayloadModelFromEnv(&payload)
 
 	// Graceful termination context listening for SIGINT and SIGTERM
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -192,4 +199,20 @@ func writePromptError(err error) error {
 	errBytes, _ := json.Marshal(errPayload)
 	fmt.Fprintln(os.Stderr, string(errBytes))
 	return err
+}
+
+func populatePromptPayloadModelFromEnv(payload *prompt.PromptPayload) {
+	if payload == nil {
+		return
+	}
+	if strings.TrimSpace(payload.Model) == "" {
+		if modelEnv := strings.TrimSpace(os.Getenv("IAZIO_MODEL")); modelEnv != "" {
+			payload.Model = modelEnv
+		}
+	}
+	if strings.TrimSpace(payload.Effort) == "" {
+		if effortEnv := strings.TrimSpace(os.Getenv("IAZIO_EFFORT")); effortEnv != "" {
+			payload.Effort = effortEnv
+		}
+	}
 }

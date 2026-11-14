@@ -76,11 +76,18 @@ type Watchdog struct {
 }
 
 func isRunningUnderGoTest() bool {
+	if os.Getenv("IAZIO_TEST_MODE") == "1" {
+		return true
+	}
 	if flag.Lookup("test.v") != nil {
 		return true
 	}
 	arg0 := strings.ToLower(os.Args[0])
-	return strings.HasSuffix(arg0, ".test") || strings.HasSuffix(arg0, ".test.exe")
+	return strings.HasSuffix(arg0, ".test") ||
+		strings.HasSuffix(arg0, ".test.exe") ||
+		strings.Contains(arg0, "/t/test") ||
+		strings.Contains(arg0, "/tmp/test") ||
+		strings.Contains(arg0, `\temp\test`)
 }
 
 func isSyntheticTestTrackedJob(j *TrackedJob) bool {
@@ -92,7 +99,11 @@ func isSyntheticTestTrackedJob(j *TrackedJob) bool {
 		return true
 	}
 	wt := j.WorktreePath
-	return strings.Contains(wt, "TestExecuteJob_") || strings.Contains(wt, "/T/Test") || strings.Contains(wt, `\Temp\Test`)
+	return strings.Contains(wt, "TestExecuteJob_") ||
+		strings.Contains(wt, "TestE2E_") ||
+		strings.Contains(wt, "/T/Test") ||
+		strings.Contains(wt, "/tmp/Test") ||
+		strings.Contains(wt, `\Temp\Test`)
 }
 
 // New creates a Watchdog.

@@ -196,6 +196,8 @@ type RunPromptOptions struct {
 	Title                      string        `json:"title,omitempty"`
 	Prompt                     string        `json:"prompt"`
 	TargetAgent                string        `json:"target_agent,omitempty"`
+	Model                      string        `json:"model,omitempty"`
+	Effort                     string        `json:"effort,omitempty"`
 	WorkingDir                 string        `json:"working_dir"`
 	TraceID                    string        `json:"trace_id,omitempty"`
 	Timeout                    time.Duration `json:"timeout,omitempty"`
@@ -1918,6 +1920,10 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 
 		var tmpLogPath string
 		var args []string
+		var resolvedModel, resolvedEffort string
+		if isMockAgy || isDirectAgy || strings.Contains(strings.ToLower(filepath.Base(cmdBin)), "autopilot") || targetAgent == "" || targetAgent == "auto" || strings.EqualFold(targetAgent, "autopilot") {
+			resolvedModel, resolvedEffort = ResolvePromptExecutionModel(opts, resumeAttempts)
+		}
 		if isMockAgy || isDirectAgy {
 			_, _ = agyhooks.SanitizeEnv(os.Environ())
 			if logFile, errL := os.CreateTemp("", fmt.Sprintf("iazio-agy-log-%s-*.log", opts.PromptID)); errL == nil {
@@ -1927,6 +1933,12 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 			cmdBin = effectiveAgent
 			args = []string{"--print", turnPrompt, "--dangerously-skip-permissions"}
+			if (isDirectAgy || (isMockAgy && strings.TrimSpace(opts.Model) != "")) && resolvedModel != "" {
+				args = append(args, "--model", resolvedModel)
+				if resolvedEffort != "" {
+					args = append(args, "--effort", resolvedEffort)
+				}
+			}
 			if resumeConvID != "" {
 				args = append(args, "--conversation="+resumeConvID)
 			}
@@ -1952,6 +1964,12 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		cmd := procutil.Command(cmdBin, args...)
 		cmd.Dir = opts.WorkingDir
 		cmd.Env = append(os.Environ(), fmt.Sprintf("IAZIO_PARENT_HARNESS_PID=%d", os.Getpid()))
+		if resolvedModel != "" {
+			cmd.Env = append(cmd.Env, "AGY_MODEL="+resolvedModel)
+			if resolvedEffort != "" {
+				cmd.Env = append(cmd.Env, "AGY_EFFORT="+resolvedEffort)
+			}
+		}
 		if targetBranch != "" {
 			cmd.Env = append(cmd.Env, "AUTOPILOT_TARGET_BRANCH="+targetBranch)
 		}
@@ -3009,4 +3027,207 @@ func captureGitSnapshot(dir, gitBin string) (headSHA, treeSHA string, modified [
 	}
 
 	return headSHA, treeSHA, modified
+}
+
+// ResolvePromptExecutionModel selects the agy model and effort for a prompt turn based on
+// task scope, resume attempt tier, explicit overrides, and local quota circuit caches.
+func ResolvePromptExecutionModel(opts RunPromptOptions, resumeAttempt int) (model, effort string) {
+	return resolvePromptExecutionModelFromCache(opts, resumeAttempt, defaultQuotaCachePaths(), time.Now().UTC())
+}
+
+func defaultQuotaCachePaths() []string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return nil
+	}
+	return []string{
+		filepath.Join(home, ".autopilot", "state", "model-quota-circuit.json"),
+		filepath.Join(home, ".autopilot", "review-model-cache.json"),
+	}
+}
+
+func resolvePromptExecutionModelFromCache(opts RunPromptOptions, resumeAttempt int, cachePaths []string, now time.Time) (model, effort string) {
+	tripped := loadTrippedAgyModels(cachePaths, now)
+	ladder := agyCandidateLadder(opts, resumeAttempt)
+
+	chosenModel := ""
+	explicitModel := strings.TrimSpace(opts.Model)
+	if explicitModel != "" && !strings.EqualFold(explicitModel, "auto") {
+		if !tripped[strings.ToLower(explicitModel)] {
+			chosenModel = explicitModel
+		}
+	}
+	if chosenModel == "" {
+		for _, candidate := range ladder {
+			if !tripped[strings.ToLower(candidate)] {
+				chosenModel = candidate
+				break
+			}
+		}
+	}
+	if chosenModel == "" && len(ladder) > 0 {
+		chosenModel = ladder[0]
+	}
+
+	chosenEffort := strings.ToLower(strings.TrimSpace(opts.Effort))
+	if chosenEffort == "" {
+		chosenEffort = defaultEffortForModel(chosenModel)
+	}
+	return chosenModel, chosenEffort
+}
+
+func agyCandidateLadder(opts RunPromptOptions, resumeAttempt int) []string {
+	repo := strings.TrimSpace(opts.Repo)
+	isMultiOrRoot := repo == "" || repo == "." || strings.EqualFold(repo, "meta-repo") || strings.Contains(opts.Prompt, "submodules")
+	switch {
+	case resumeAttempt >= 2:
+		return []string{"gemini-4-hydrogen-high", "gemini-4-argon-high", "gemini-4-carbon-high", "gemini-3.8-flash-high"}
+	case resumeAttempt == 1 || isMultiOrRoot:
+		return []string{"gemini-4-carbon-high", "gemini-4-argon-high", "gemini-3.8-flash-high"}
+	default:
+		return []string{"gemini-3.8-flash-high", "gemini-4-carbon-medium", "gemini-4-carbon-high", "gemini-4-argon-high"}
+	}
+}
+
+func defaultEffortForModel(model string) string {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case lower == "gemini-4-hydrogen-high" || strings.HasSuffix(lower, "-xhigh"):
+		return "xhigh"
+	case strings.HasSuffix(lower, "-medium"):
+		return "medium"
+	case strings.HasSuffix(lower, "-low"):
+		return "low"
+	case strings.HasSuffix(lower, "-max"):
+		return "max"
+	case lower == "":
+		return ""
+	default:
+		return "high"
+	}
+}
+
+func loadTrippedAgyModels(cachePaths []string, now time.Time) map[string]bool {
+	tripped := make(map[string]bool)
+	for _, path := range cachePaths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || len(bytes.TrimSpace(data)) == 0 {
+			continue
+		}
+		var raw any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			continue
+		}
+		collectTrippedAgyModels(raw, "", now, tripped)
+	}
+	return tripped
+}
+
+func collectTrippedAgyModels(node any, keyHint string, now time.Time, tripped map[string]bool) {
+	switch typed := node.(type) {
+	case []any:
+		for _, item := range typed {
+			collectTrippedAgyModels(item, "", now, tripped)
+		}
+	case map[string]any:
+		if isQuotaEntryMap(typed) {
+			if model, ok := extractActiveTrippedAgyModel(typed, keyHint, now); ok {
+				tripped[strings.ToLower(model)] = true
+			}
+			return
+		}
+		for k, v := range typed {
+			nextHint := k
+			switch strings.ToLower(k) {
+			case "entries", "models", "circuits", "cache", "items":
+				nextHint = ""
+			}
+			collectTrippedAgyModels(v, nextHint, now, tripped)
+		}
+	}
+}
+
+func isQuotaEntryMap(m map[string]any) bool {
+	for _, field := range []string{"status", "disabled", "expires_at", "expiresAt"} {
+		if _, exists := m[field]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+func extractActiveTrippedAgyModel(m map[string]any, keyHint string, now time.Time) (string, bool) {
+	hintTool, hintModel := splitToolModelKey(keyHint)
+	tool := firstNonEmptyString(m["tool"], hintTool)
+	model := firstNonEmptyString(m["model"], hintModel)
+	if model == "" {
+		return "", false
+	}
+	if tool != "" && !strings.EqualFold(tool, "agy") {
+		return "", false
+	}
+	if tool == "" && strings.Contains(keyHint, ":") {
+		return "", false
+	}
+
+	disabled, _ := m["disabled"].(bool)
+	status := strings.ToLower(strings.TrimSpace(firstNonEmptyString(m["status"])))
+	isTrippedStatus := disabled || status == "quota-exceeded" || status == "quota_exceeded" || status == "disabled"
+	if !isTrippedStatus {
+		return "", false
+	}
+
+	expiresAt, hasExpiry := parseOptionalExpiry(m["expires_at"], m["expiresAt"])
+	if hasExpiry && !expiresAt.After(now) {
+		return "", false
+	}
+	return model, true
+}
+
+func splitToolModelKey(key string) (tool, model string) {
+	trimmed := strings.TrimSpace(key)
+	if idx := strings.Index(trimmed, ":"); idx > 0 {
+		return strings.TrimSpace(trimmed[:idx]), strings.TrimSpace(trimmed[idx+1:])
+	}
+	return "", trimmed
+}
+
+func firstNonEmptyString(vals ...any) string {
+	for _, v := range vals {
+		if s, ok := v.(string); ok {
+			if trimmed := strings.TrimSpace(s); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
+func parseOptionalExpiry(vals ...any) (time.Time, bool) {
+	for _, v := range vals {
+		if v == nil {
+			continue
+		}
+		switch tv := v.(type) {
+		case string:
+			s := strings.TrimSpace(tv)
+			if s == "" {
+				continue
+			}
+			if parsed, err := time.Parse(time.RFC3339Nano, s); err == nil {
+				return parsed, true
+			}
+			if parsed, err := time.Parse(time.RFC3339, s); err == nil {
+				return parsed, true
+			}
+		case float64:
+			if tv > 0 {
+				return time.Unix(int64(tv), 0).UTC(), true
+			}
+		}
+	}
+	return time.Time{}, false
 }

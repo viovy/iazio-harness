@@ -322,8 +322,19 @@ func TestSyntheticTestTrackedJobAndDefaultStateLoad(t *testing.T) {
 	if !isSyntheticTestTrackedJob(&TrackedJob{JobID: "job-1", WorktreePath: "/tmp/TestExecuteJob_123"}) {
 		t.Errorf("expected TestExecuteJob_ worktree path to be synthetic")
 	}
+	if !isSyntheticTestTrackedJob(&TrackedJob{JobID: "job-1570", WorktreePath: "/tmp/TestOther_123/001"}) {
+		t.Errorf("expected /tmp/Test worktree path to be synthetic")
+	}
+	if !isSyntheticTestTrackedJob(&TrackedJob{JobID: "job-1570", WorktreePath: "/var/folders/x/T/TestE2E_StoryGov5206/002"}) {
+		t.Errorf("expected TestE2E_ worktree path to be synthetic")
+	}
 	if isSyntheticTestTrackedJob(&TrackedJob{JobID: "job_real_123", WorktreePath: "/work/sample-repo"}) {
 		t.Errorf("expected real job not to be synthetic")
+	}
+
+	t.Setenv("IAZIO_TEST_MODE", "1")
+	if !isRunningUnderGoTest() {
+		t.Errorf("expected IAZIO_TEST_MODE=1 to report isRunningUnderGoTest=true")
 	}
 
 	tempDir := t.TempDir()

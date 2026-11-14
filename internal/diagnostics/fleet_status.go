@@ -2,10 +2,13 @@
 package diagnostics
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -199,6 +202,9 @@ func InspectRepoFleetStatusWithOptions(ctx context.Context, repoPath string, opt
 	// 3. Process Discovery & Provenance (run before ASE state pruning so active brain ASE turns are never pruned mid-turn)
 	discoverAgentProcesses(cleanPath, res)
 	inferredBrainStoryID := res.ActiveStoryID
+	// Clear transcript-prose-inferred story ID before authoritative on-disk/branch checks so
+	// .autopilot/state.json, .session_story_id, and current branch always take precedence.
+	res.ActiveStoryID = ""
 
 	// 4. ASE State & Autopilot locks (with Tier 1 completed-ASE artifact cleanup when no active ASE turn is in flight)
 	parseASEStateWithOpts(cleanPath, opts.AutoRemediateTier1, res)
@@ -1701,6 +1707,12 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 			toolName, match = isAgentTool(cmdArgs[1])
 		}
 		if match {
+			environBytes, _ := os.ReadFile(filepath.Join("/proc", name, "environ"))
+			provenance, isMaintenance := classifyProcessEnvProvenance(string(environBytes))
+			if isMaintenance {
+				continue
+			}
+
 			fdPaths := readProcOpenFDLinks(pid)
 			fdConvID, _, fdActiveASE, fdStoryID := inspectOpenAgentPathsForBrainAndASE(fdPaths, time.Now())
 			argConvID := extractConversationIDFromArgs(cmdArgs)
@@ -1726,17 +1738,7 @@ func discoverAgentProcesses(repoPath string, res *RepoFleetStatusResult) {
 				if canBindFDStory && res.ActiveStoryID == "" {
 					res.ActiveStoryID = fdStoryID
 				}
-
-				// Read environ for execution provenance
-				environBytes, _ := os.ReadFile(filepath.Join("/proc", name, "environ"))
-				environStr := string(environBytes)
-				if strings.Contains(environStr, "IAZIO_MANAGED_BY=harness") ||
-					strings.Contains(environStr, "IAZIO_HARNESS_JOB_ID") ||
-					strings.Contains(environStr, "IAZIO_AGENT_MANAGED=1") {
-					res.ExecutionProvenance = "COORDINATED_HARNESS"
-				} else {
-					res.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
-				}
+				res.ExecutionProvenance = provenance
 			} else if fdActiveASE || canBindFDStory {
 				if fdActiveASE {
 					res.HasActiveAgentASETurn = true
@@ -1845,14 +1847,67 @@ func extractBrainCandidateFromOpenPath(rawPath string) (appDataDir string, convI
 	return "", "", false
 }
 
+func stripTranscriptToolResponseLines(s string) string {
+	if s == "" {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, rawLine := range lines {
+		lowerLine := strings.ToLower(rawLine)
+		if strings.Contains(lowerLine, `"type":"tool_response"`) || strings.Contains(lowerLine, `"type": "tool_response"`) {
+			continue
+		}
+		filtered = append(filtered, rawLine)
+	}
+	return strings.Join(filtered, "\n")
+}
+
 func isAutomatedMaintenanceTranscript(s string) bool {
-	lower := strings.ToLower(s)
+	lower := strings.ToLower(stripTranscriptToolResponseLines(s))
 	return strings.Contains(lower, `execute shell prompt "autopilot git-update"`) ||
 		strings.Contains(lower, `execute shell prompt \"autopilot git-update\"`) ||
 		strings.Contains(lower, "diagnostic failure summary from shell autopilot git-update") ||
 		strings.Contains(lower, "iazio-agy-log-git-update-agy") ||
 		strings.Contains(lower, `"job_id":"autopilot-git-update`) ||
 		strings.Contains(lower, `"schedule_id":"autopilot-git-update`)
+}
+
+func extractContextSummaryUserRequests(lower string) string {
+	const openTag = "<context_summary>"
+	const closeTag = "</context_summary>"
+	const reqHeader = "# user requests"
+	var collected []string
+	search := lower
+	for {
+		start := strings.Index(search, openTag)
+		if start < 0 {
+			break
+		}
+		block := search[start+len(openTag):]
+		advance := start + len(openTag)
+		if end := strings.Index(block, closeTag); end >= 0 {
+			advance += end + len(closeTag)
+			block = block[:end]
+		} else {
+			advance = len(search)
+		}
+		if reqIdx := strings.Index(block, reqHeader); reqIdx >= 0 {
+			reqSec := block[reqIdx:]
+			cut := len(reqSec)
+			for _, sep := range []string{"\n# ", `\n# `, "\n</context_summary>", `\n</context_summary>`} {
+				if idx := strings.Index(reqSec[len(reqHeader):], sep); idx >= 0 {
+					cand := len(reqHeader) + idx
+					if cand < cut {
+						cut = cand
+					}
+				}
+			}
+			collected = append(collected, reqSec[:cut])
+		}
+		search = search[advance:]
+	}
+	return strings.Join(collected, "\n")
 }
 
 func stripSystemTagRange(lower string, openTag, closeTag string) string {
@@ -1901,6 +1956,7 @@ func stripTranscriptBoilerplateAndToolOutputs(s string) string {
 		filtered = append(filtered, lowerLine)
 	}
 	cleaned := strings.Join(filtered, "\n")
+	preservedRequests := extractContextSummaryUserRequests(cleaned)
 	for _, pair := range [][2]string{
 		{"<user_rules>", "</user_rules>"},
 		{"<rule[", "</rule["},
@@ -1911,6 +1967,9 @@ func stripTranscriptBoilerplateAndToolOutputs(s string) string {
 		{"<context_summary>", "</context_summary>"},
 	} {
 		cleaned = stripSystemTagRange(cleaned, pair[0], pair[1])
+	}
+	if preservedRequests != "" {
+		cleaned += "\n" + preservedRequests
 	}
 	return cleaned
 }
@@ -1925,6 +1984,9 @@ func containsASEWorkflowMarker(s string) bool {
 		strings.Contains(cleaned, "commands/autonomous-story-execution.md") ||
 		strings.Contains(cleaned, "autopilot-story") ||
 		strings.Contains(cleaned, "autopilot-git-flow") ||
+		strings.Contains(cleaned, "autopilot-review-scheme") ||
+		strings.Contains(cleaned, "autopilot review-scheme") ||
+		strings.Contains(cleaned, "autopilot conformance") ||
 		strings.Contains(cleaned, "autopilot story begin") ||
 		strings.Contains(cleaned, "autopilot ase") ||
 		strings.Contains(cleaned, "git-flow ase-start") ||
@@ -2049,6 +2111,66 @@ func readHeadAndTailBytes(path string, headLimit, tailLimit int64) (head []byte,
 	return head, tail, modTime, nil
 }
 
+func readMiddleTranscriptUserInputs(path string, headLimit, tailLimit int64) string {
+	const maxScanFileSize = 32 * 1024 * 1024
+	const maxCollectedBytes = 256 * 1024
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil || fi.Size() <= headLimit+tailLimit || fi.Size() > maxScanFileSize {
+		return ""
+	}
+	startOffset := headLimit - 4096
+	if startOffset < 0 {
+		startOffset = 0
+	}
+	endOffset := fi.Size() - tailLimit + 4096
+	if endOffset > fi.Size() {
+		endOffset = fi.Size()
+	}
+	if startOffset > 0 {
+		if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+			return ""
+		}
+	}
+	reader := bufio.NewReaderSize(f, 64*1024)
+	offset := startOffset
+	if startOffset > 0 {
+		firstFrag, rErr := reader.ReadString('\n')
+		offset += int64(len(firstFrag))
+		if rErr != nil {
+			return ""
+		}
+	}
+	var b strings.Builder
+	for offset < endOffset {
+		line, rErr := reader.ReadString('\n')
+		offset += int64(len(line))
+		if len(line) > 0 {
+			lower := strings.ToLower(line)
+			if strings.Contains(lower, `"type":"user_input"`) || strings.Contains(lower, `"type": "user_input"`) {
+				if b.Len()+len(line) > maxCollectedBytes {
+					remaining := maxCollectedBytes - b.Len()
+					if remaining > 0 {
+						b.WriteString(line[:remaining])
+						b.WriteByte('\n')
+					}
+					break
+				}
+				b.WriteString(line)
+			}
+		}
+		if rErr != nil {
+			break
+		}
+	}
+	return b.String()
+}
+
 func inspectBrainTranscriptDir(brainDir string, now time.Time) (newestMod time.Time, hasActiveASETurn bool, inferredStoryID string) {
 	for _, rel := range []string{
 		filepath.Join(".system_generated", "logs", "transcript.jsonl"),
@@ -2064,12 +2186,17 @@ func inspectBrainTranscriptDir(brainDir string, now time.Time) (newestMod time.T
 		}
 		headStr := string(head)
 		tailStr := string(tail)
-		if isAutomatedMaintenanceTranscript(headStr) || isAutomatedMaintenanceTranscript(tailStr) {
+		midUserInputs := readMiddleTranscriptUserInputs(full, 64*1024, 128*1024)
+		if isAutomatedMaintenanceTranscript(headStr) || isAutomatedMaintenanceTranscript(midUserInputs) || isAutomatedMaintenanceTranscript(tailStr) {
 			continue
 		}
-		if containsASEWorkflowMarker(headStr) || containsASEWorkflowMarker(tailStr) {
+		if containsASEWorkflowMarker(headStr) || containsASEWorkflowMarker(midUserInputs) || containsASEWorkflowMarker(tailStr) {
 			if inferredStoryID == "" && !modTime.IsZero() && now.Sub(modTime) <= 2*time.Hour {
-				matches := extractBoundStoryMatchesFromTranscript(headStr, tailStr)
+				combinedHead := headStr
+				if midUserInputs != "" {
+					combinedHead += "\n" + midUserInputs
+				}
+				matches := extractBoundStoryMatchesFromTranscript(combinedHead, tailStr)
 				if len(matches) > 0 {
 					inferredStoryID = strings.ToUpper(matches[len(matches)-1][1])
 				}
@@ -2185,6 +2312,47 @@ func inspectDarwinAgentProcess(pid int, etime string, cmdLine string, hasRepoLoc
 	return provenance, convID, isIdle
 }
 
+func envHasNonEmptyVar(fields []string, key string) bool {
+	prefix := key + "="
+	for _, f := range fields {
+		if strings.HasPrefix(f, prefix) && strings.TrimSpace(strings.TrimPrefix(f, prefix)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func envContainsKV(fields []string, kv string) bool {
+	for _, f := range fields {
+		if f == kv {
+			return true
+		}
+	}
+	return false
+}
+
+func isAutomatedMaintenanceEnv(envStr string) bool {
+	fields := strings.Fields(strings.ReplaceAll(envStr, "\x00", " "))
+	if envContainsKV(fields, "IAZIO_MAINTENANCE_RUN=1") {
+		return true
+	}
+	if envContainsKV(fields, "IAZIO_AGENT_MANAGED=1") && !envHasNonEmptyVar(fields, "IAZIO_HARNESS_JOB_ID") {
+		return true
+	}
+	return false
+}
+
+func classifyProcessEnvProvenance(envStr string) (string, bool) {
+	if isAutomatedMaintenanceEnv(envStr) {
+		return "NONE", true
+	}
+	fields := strings.Fields(strings.ReplaceAll(envStr, "\x00", " "))
+	if envHasNonEmptyVar(fields, "IAZIO_HARNESS_JOB_ID") || envContainsKV(fields, "IAZIO_MANAGED_BY=harness") {
+		return "COORDINATED_HARNESS", false
+	}
+	return "INDEPENDENT_USER_SESSION", false
+}
+
 func inspectDarwinAgentProcessDetailed(pid int, etime string, cmdLine string, hasRepoLock bool) (provenance string, convID string, isIdle bool, hasActiveASETurn bool, inferredStoryID string) {
 	provenance = "INDEPENDENT_USER_SESSION"
 	convID = extractConversationIDFromArgs(strings.Fields(cmdLine))
@@ -2193,11 +2361,10 @@ func inspectDarwinAgentProcessDetailed(pid int, etime string, cmdLine string, ha
 	envOut, envErr := procutil.CommandContext(envCtx, "ps", "eww", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
 	cancelEnv()
 	if envErr == nil {
-		envStr := string(envOut)
-		if strings.Contains(envStr, "IAZIO_MANAGED_BY=harness") ||
-			strings.Contains(envStr, "IAZIO_HARNESS_JOB_ID") ||
-			strings.Contains(envStr, "IAZIO_AGENT_MANAGED=1") {
-			provenance = "COORDINATED_HARNESS"
+		var isMaint bool
+		provenance, isMaint = classifyProcessEnvProvenance(string(envOut))
+		if isMaint {
+			return "NONE", "", true, false, ""
 		}
 	}
 	if provenance == "COORDINATED_HARNESS" {
@@ -2205,8 +2372,8 @@ func inspectDarwinAgentProcessDetailed(pid int, etime string, cmdLine string, ha
 	}
 
 	elapsed := parsePsElapsedDuration(etime)
-	lsofCtx, cancelLsof := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-	lsofOut, lsofErr := procutil.CommandContext(lsofCtx, "lsof", "-p", strconv.Itoa(pid), "-F", "n").Output()
+	lsofCtx, cancelLsof := context.WithTimeout(context.Background(), 8*time.Second)
+	lsofOut, lsofErr := procutil.CommandContext(lsofCtx, "lsof", "-n", "-P", "-p", strconv.Itoa(pid), "-F", "n").Output()
 	cancelLsof()
 	var newestTranscript time.Time
 	if lsofErr == nil && len(lsofOut) > 0 {
@@ -2216,6 +2383,20 @@ func inspectDarwinAgentProcessDetailed(pid int, etime string, cmdLine string, ha
 		inferredStoryID = storyID
 		if convID == "" && lsofConv != "" {
 			convID = lsofConv
+		}
+	}
+	if newestTranscript.IsZero() && convID != "" {
+		for _, brainRoot := range candidateBrainRootDirs() {
+			modTime, activeASE, storyID := inspectBrainTranscriptDir(filepath.Join(brainRoot, convID), time.Now())
+			if !modTime.IsZero() && modTime.After(newestTranscript) {
+				newestTranscript = modTime
+			}
+			if activeASE {
+				hasActiveASETurn = true
+			}
+			if inferredStoryID == "" && storyID != "" {
+				inferredStoryID = storyID
+			}
 		}
 	}
 
@@ -2456,32 +2637,82 @@ func isConversationClaimedByOtherWorktree(repoPath, candID string) bool {
 	if home != "" {
 		dbPath := filepath.Join(home, ".gemini", "antigravity-cli", "conversations", candID+".db")
 		if raw, err := os.ReadFile(dbPath); err == nil {
-			const prefix = "file://"
-			idx := 0
-			for {
-				pos := strings.Index(string(raw[idx:]), prefix)
-				if pos < 0 {
-					break
-				}
-				start := idx + pos + len(prefix)
-				end := start
-				for end < len(raw) && raw[end] >= 32 && raw[end] <= 126 && raw[end] != '"' && raw[end] != '\'' && raw[end] != '\r' && raw[end] != '\n' && raw[end] != '}' && raw[end] != ']' {
-					end++
-				}
-				if end > start {
-					declared := filepath.Clean(strings.TrimSpace(string(raw[start:end])))
-					declaredSlash := strings.ToLower(filepath.ToSlash(declared))
-					if declaredSlash != "" && strings.Contains(declaredSlash, "/meta-repo") && !strings.Contains(declaredSlash, ".json") && !strings.Contains(declaredSlash, ".txt") && !strings.Contains(declaredSlash, ".log") {
-						if declaredSlash != cleanRepoSlash {
-							return true
-						}
-					}
-				}
-				idx = start
+			if isDBWorkspaceClaimedBySiblingWorktree(raw, cleanRepoSlash) {
+				return true
 			}
 		}
 	}
 	return false
+}
+
+func splitSlashDirBase(p string) (string, string) {
+	p = strings.TrimRight(p, "/")
+	idx := strings.LastIndexByte(p, '/')
+	if idx < 0 {
+		return "", p
+	}
+	if idx == 0 {
+		return "/", p[1:]
+	}
+	return p[:idx], p[idx+1:]
+}
+
+func isDBWorkspaceClaimedBySiblingWorktree(raw []byte, cleanRepoSlash string) bool {
+	if len(raw) == 0 || strings.TrimSpace(cleanRepoSlash) == "" {
+		return false
+	}
+	cleanRepoSlash = strings.TrimRight(strings.ToLower(filepath.ToSlash(cleanRepoSlash)), "/")
+	parentSlash, baseName := splitSlashDirBase(cleanRepoSlash)
+	familyBase := stripTrailingWorktreeNumber(baseName)
+	if parentSlash == "" || familyBase == "" {
+		return false
+	}
+
+	selfRootCount := 0
+	siblingCounts := make(map[string]int)
+	maxSiblingRootCount := 0
+
+	prefix := []byte("file://")
+	idx := 0
+	for idx < len(raw) {
+		pos := bytes.Index(raw[idx:], prefix)
+		if pos < 0 {
+			break
+		}
+		start := idx + pos + len(prefix)
+		end := start
+		for end < len(raw) {
+			b := raw[end]
+			if b < 32 || b > 126 ||
+				b == '"' || b == '\'' || b == '\r' || b == '\n' ||
+				b == '}' || b == ']' || b == ')' || b == ' ' || b == '\t' ||
+				b == '<' || b == '>' || b == '#' || b == '?' ||
+				b == ',' || b == ';' || b == '`' {
+				break
+			}
+			end++
+		}
+		if end > start {
+			token := strings.TrimSpace(string(raw[start:end]))
+			declaredSlash := strings.TrimRight(strings.ToLower(filepath.ToSlash(filepath.Clean(token))), "/")
+			if strings.HasPrefix(declaredSlash, "/") {
+				dirSlash, decBase := splitSlashDirBase(declaredSlash)
+				if dirSlash == parentSlash && stripTrailingWorktreeNumber(decBase) == familyBase {
+					if declaredSlash == cleanRepoSlash {
+						selfRootCount++
+					} else {
+						siblingCounts[declaredSlash]++
+						if siblingCounts[declaredSlash] > maxSiblingRootCount {
+							maxSiblingRootCount = siblingCounts[declaredSlash]
+						}
+					}
+				}
+			}
+		}
+		idx = start
+	}
+
+	return maxSiblingRootCount > 0 && (selfRootCount == 0 || maxSiblingRootCount > selfRootCount*2)
 }
 
 // TranscriptReferencesRepoPath returns true if transcript text references repoPath (across Windows C:\...,
@@ -2625,20 +2856,29 @@ func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bo
 				}
 				headStr := string(head)
 				tailStr := string(tail)
-				if isAutomatedMaintenanceTranscript(headStr) || isAutomatedMaintenanceTranscript(tailStr) {
+				midUserInputs := readMiddleTranscriptUserInputs(full, 96*1024, 128*1024)
+				if isAutomatedMaintenanceTranscript(headStr) || isAutomatedMaintenanceTranscript(midUserInputs) || isAutomatedMaintenanceTranscript(tailStr) {
 					continue
 				}
-				if !TranscriptReferencesRepoPath(headStr+"\n"+tailStr, repoPath) {
+				combinedForRef := headStr + "\n" + tailStr
+				if midUserInputs != "" {
+					combinedForRef = headStr + "\n" + midUserInputs + "\n" + tailStr
+				}
+				if !TranscriptReferencesRepoPath(combinedForRef, repoPath) {
 					continue
 				}
-				if !containsASEWorkflowMarker(headStr) && !containsASEWorkflowMarker(tailStr) {
+				if !containsASEWorkflowMarker(headStr) && !containsASEWorkflowMarker(midUserInputs) && !containsASEWorkflowMarker(tailStr) {
 					continue
 				}
 				if !isTranscriptTurnInFlight(tail, modTime, now) {
 					continue
 				}
 				var candStory string
-				allMatches := extractBoundStoryMatchesFromTranscript(headStr, tailStr)
+				combinedHead := headStr
+				if midUserInputs != "" {
+					combinedHead += "\n" + midUserInputs
+				}
+				allMatches := extractBoundStoryMatchesFromTranscript(combinedHead, tailStr)
 				for i := len(allMatches) - 1; i >= 0; i-- {
 					sid := strings.ToUpper(allMatches[i][1])
 					if canBindTranscriptStoryToRepo(repoPath, sid) {
@@ -2766,7 +3006,7 @@ func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPa
 		nonMainBranch := res != nil && res.Branch != "" && res.Branch != "main" && res.Branch != "master" && res.Branch != "HEAD" && !isAutomatedMaintenanceBranch(res.Branch)
 		if LineContainsExactRepoPath(cmdLine, repoPath) {
 			prov, convID, isIdle, activeASE, storyID := inspectDarwinAgentProcessDetailed(pid, etime, cmdLine, res.LockDetails != "")
-			if isIdle {
+			if isIdle || prov == "NONE" {
 				continue
 			}
 			res.AgentPID = pid
@@ -2797,8 +3037,8 @@ func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPa
 			pidStrs = append(pidStrs, strconv.Itoa(c.pid))
 			pidToCand[c.pid] = c
 		}
-		lsofCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		lsofCmd := procutil.CommandContext(lsofCtx, "lsof", "-a", "-d", "cwd", "-p", strings.Join(pidStrs, ","), "-F", "pn")
+		lsofCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		lsofCmd := procutil.CommandContext(lsofCtx, "lsof", "-n", "-P", "-a", "-d", "cwd", "-p", strings.Join(pidStrs, ","), "-F", "pn")
 		lsofOut, lsofErr := lsofCmd.Output()
 		cancel()
 		if lsofErr == nil && len(lsofOut) > 0 {
@@ -2812,7 +3052,7 @@ func parsePsOutputForAgentProcesses(psOut string, selfPID, parentPID int, repoPa
 					if HasExactRepoPathBoundary(cwd, repoPath) {
 						cand := pidToCand[currPID]
 						prov, convID, isIdle, activeASE, storyID := inspectDarwinAgentProcessDetailed(currPID, cand.etime, cand.line, res.LockDetails != "")
-						if isIdle {
+						if isIdle || prov == "NONE" {
 							continue
 						}
 						res.AgentPID = currPID

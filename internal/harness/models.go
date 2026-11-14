@@ -108,6 +108,12 @@ type Executor interface {
 	Execute(ctx context.Context, worktreePath string, prompt string) error
 }
 
+// ModelExecutor is an optional Executor extension that accepts an explicit model selection per stage/retry.
+type ModelExecutor interface {
+	Executor
+	ExecuteWithModel(ctx context.Context, worktreePath string, prompt string, model string) error
+}
+
 // AutopilotClient abstracts the deterministic autopilot SDLC toolchain.
 type AutopilotClient interface {
 	StoryBegin(ctx context.Context, storyID string) (*BootstrapResult, error)
