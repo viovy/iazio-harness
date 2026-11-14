@@ -16,8 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/viovy/iazio-harness/internal/idempotency"
 	"github.com/viovy/iazio-core/pkg/procutil"
+	"github.com/viovy/iazio-harness/internal/agyhooks"
+	"github.com/viovy/iazio-harness/internal/idempotency"
 	"github.com/viovy/iazio-harness/internal/sandbox"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 )
@@ -327,6 +328,10 @@ func (c CLI) Execute(ctx context.Context, req ExecutionRequest, stream EventStre
 	}
 	defer stderrR.Close()
 	cmd.Stderr = stderrW
+
+	if c.Name() == "agy" || req.Engine == "agy" || strings.Contains(filepath.Base(bin), "mock-agy") {
+		_, _ = agyhooks.SanitizeEnv(cmd.Env)
+	}
 
 	if err := cmd.Start(); err != nil {
 		_ = stdoutW.Close()

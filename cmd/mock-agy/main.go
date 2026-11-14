@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -1053,6 +1054,71 @@ func run(args []string, scenario string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "Completed conversation %s\n", cid)
 			return 0
 		}
+		return 0
+
+	case "stale_plugin_hook_pretooluse_auto_resume":
+		targetCID := "c0ffee00-1234-5678-9abc-000000000205"
+		home, _ := os.UserHomeDir()
+		brainRoot := strings.TrimSpace(os.Getenv("IAZIO_BRAIN_DIR"))
+		if brainRoot == "" && home != "" {
+			brainRoot = filepath.Join(home, ".gemini", "antigravity-cli", "brain")
+		}
+		convDir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+		logsDir := filepath.Join(brainRoot, targetCID, ".system_generated", "logs")
+		transcriptPath := filepath.Join(logsDir, "transcript.jsonl")
+		dtPluginDir := filepath.Join(home, ".gemini", "config", "plugins", "googlecloudtools.datacloud_telemetry")
+		cfgPath := filepath.Join(home, ".gemini", "config", "config.json")
+
+		if !strings.Contains(strings.ToLower(fullPrompt), "sanitized") && conversationID == "" {
+			_ = os.MkdirAll(convDir, 0o755)
+			_ = os.WriteFile(filepath.Join(convDir, targetCID+".db"), []byte("mock-db"), 0o644)
+			_ = os.MkdirAll(logsDir, 0o755)
+			step0 := fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":%q}`, fullPrompt) + "\n"
+			step1 := `{"step_index":1,"type":"TOOL_RESPONSE","status":"ERROR","content":"JSON hook \"jsonhook__googlecloudtools.datacloud_telemetry_PreToolUse_0_0\" failed:\ncommand failed: chdir /Users/romeo/.gemini/config/plugins/googlecloudtools.datacloud_telemetry: no such file or directory"}` + "\n"
+			_ = os.WriteFile(transcriptPath, []byte(step0+step1), 0o644)
+
+			_ = os.MkdirAll(dtPluginDir, 0o755)
+			_ = os.WriteFile(filepath.Join(dtPluginDir, "hooks.json"), []byte(`{"PreToolUse":[{"type":"command","command":"node hooks/missing.js"}]}`), 0o644)
+			_ = os.WriteFile(cfgPath, []byte("{\n  \"plugins\": {\n    \"googlecloudtools.datacloud_telemetry\": {\n      \"enabled\": true\n    }\n  }\n}\n"), 0o600)
+
+			fmt.Fprintf(stdout, "Created conversation %s\n", targetCID)
+			fmt.Fprintln(stdout, "Tool execution blocked by PreToolUse plugin hook error; exiting turn 1.")
+			return 0
+		}
+
+		if conversationID != targetCID {
+			fmt.Fprintf(stderr, "expected --conversation=%s on resume, got %q\n", targetCID, conversationID)
+			return 2
+		}
+		if _, err := os.Stat(dtPluginDir); !os.IsNotExist(err) {
+			fmt.Fprintf(stderr, "expected stale plugin dir %s to be removed before Turn 2, got err=%v\n", dtPluginDir, err)
+			return 2
+		}
+		cfgRaw, err := os.ReadFile(cfgPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "failed reading %s on Turn 2: %v\n", cfgPath, err)
+			return 2
+		}
+		var cfg map[string]any
+		if uErr := json.Unmarshal(cfgRaw, &cfg); uErr != nil {
+			fmt.Fprintf(stderr, "invalid json in %s: %v\n", cfgPath, uErr)
+			return 2
+		}
+		pluginsMap, _ := cfg["plugins"].(map[string]any)
+		dtEntry, _ := pluginsMap["googlecloudtools.datacloud_telemetry"].(map[string]any)
+		enabled, hasEnabled := dtEntry["enabled"].(bool)
+		if !hasEnabled || enabled {
+			fmt.Fprintf(stderr, "expected googlecloudtools.datacloud_telemetry enabled=false in %s, got %#v\n", cfgPath, dtEntry)
+			return 2
+		}
+
+		step2 := `{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","content":"Tool execution restored cleanly after plugin hook sanitization."}` + "\n"
+		if tf, oErr := os.OpenFile(transcriptPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); oErr == nil {
+			_, _ = tf.WriteString(step2)
+			_ = tf.Close()
+		}
+		fmt.Fprintf(stdout, "Resumed conversation %s\n", targetCID)
+		fmt.Fprintln(stdout, "[mock-agy] Turn 2 completed cleanly after ~/.gemini/config sanitization.")
 		return 0
 
 	default:

@@ -746,3 +746,35 @@ func TestDiagnose_JetskiHeadlessPermissionDenial(t *testing.T) {
 		t.Fatalf("expected CodePermissionDenied finding, got: %+v", rep.Findings)
 	}
 }
+
+func TestDiagnose_StalePluginHookDirAutoHealable(t *testing.T) {
+	wt := t.TempDir()
+	rep := Diagnose(DiagnosticInput{
+		JobID:        "job_stale_hook_1",
+		StoryID:      "STORY-GOV-5291",
+		WorktreePath: wt,
+		ExitCode:     0,
+		OutputText:   `JSON hook "jsonhook__googlecloudtools.datacloud_telemetry_PreToolUse_0_0" failed:` + "\n" + `command failed: chdir /Users/romeo/.gemini/config/plugins/googlecloudtools.datacloud_telemetry: no such file or directory`,
+	})
+	if rep.Healthy {
+		t.Fatal("expected Healthy=false when stale plugin hook error is present")
+	}
+	var found bool
+	for _, f := range rep.Findings {
+		if f.Code == CodeStalePluginHook {
+			found = true
+			if f.Severity != "ERROR" {
+				t.Fatalf("expected ERROR severity, got %q", f.Severity)
+			}
+			if f.Remediation != "Sanitize ~/.gemini/config/plugins + pin disabled state in ~/.gemini/config/config.json and resume agy conversation" {
+				t.Fatalf("unexpected remediation: %q", f.Remediation)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected CodeStalePluginHook finding, got: %+v", rep.Findings)
+	}
+	if rep.SIR == nil || !rep.SIR.AutoHealable || rep.SIR.Category != CodeStalePluginHook {
+		t.Fatalf("expected AutoHealable SIR with category %s, got %+v", CodeStalePluginHook, rep.SIR)
+	}
+}

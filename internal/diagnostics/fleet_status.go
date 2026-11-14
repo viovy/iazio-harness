@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-core/pkg/procutil"
+	"github.com/viovy/iazio-harness/internal/agyhooks"
 	"github.com/viovy/iazio-harness/internal/repolock"
 )
 
@@ -121,6 +122,15 @@ func InspectRepoFleetStatusWithOptions(ctx context.Context, repoPath string, opt
 
 	// 0b. Check git lock sentinels (prune abandoned >5m .lock files and abort stranded maintenance/completed rebases)
 	inspectGitLockSentinels(cleanPath, opts.AutoRemediateTier1 || opts.AutoRemediateSafe, res)
+
+	// 0c. Sanitize user-level ~/.gemini/config/plugins when --auto-remediate is enabled outside go test.
+	if opts.AutoRemediateSafe && !agyhooks.IsTestProcess() {
+		if sanRes, sErr := agyhooks.SanitizeHome(""); sErr == nil && sanRes.Changed {
+			res.RemediationApplied = true
+			res.RemediationActions = append(res.RemediationActions,
+				fmt.Sprintf("sanitized ~/.gemini/config/plugins (removed=%v, disabled=%v)", sanRes.RemovedPluginDirs, sanRes.DisabledPlugins))
+		}
+	}
 
 	// 1. Git Status Porcelain v2 & Branch
 	cmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "status", "--porcelain=v2", "--branch")

@@ -11,8 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/viovy/iazio-harness/internal/ase/gate"
 	"github.com/viovy/iazio-core/pkg/procutil"
+	"github.com/viovy/iazio-harness/internal/agyhooks"
+	"github.com/viovy/iazio-harness/internal/ase/gate"
 )
 
 // Anomaly codes.
@@ -32,6 +33,7 @@ const (
 	CodeNonZeroExit           = "NON_ZERO_EXIT"
 	CodeIncompleteASEFlow     = "incomplete_ase_flow"
 	CodeStoryNotFound         = "STORY_NOT_FOUND"
+	CodeStalePluginHook       = "STALE_PLUGIN_HOOK_DIR"
 )
 
 // Finding represents one detected issue or anomaly.
@@ -386,6 +388,8 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 		}
 	}
 
+	hasStalePluginHook, stalePluginName := agyhooks.DetectStalePluginHookFailure(input.OutputText)
+
 	// 4. Compile findings
 	if hasAlreadyDone {
 		if report.Branch != "" && report.Branch != "main" && report.Branch != "master" && !branchMerged {
@@ -475,6 +479,19 @@ func Diagnose(input DiagnosticInput) DiagnosticReport {
 			Severity:    "ERROR",
 			Message:     "Execution encountered permission or authentication denial.",
 			Remediation: "Verify secret vault token, GitHub auth credentials, or environment permissions.",
+		})
+	}
+
+	if hasStalePluginHook {
+		msg := "Antigravity CLI PreToolUse plugin hook failed due to missing ~/.gemini/config/plugins directory."
+		if stalePluginName != "" {
+			msg = fmt.Sprintf("Antigravity CLI PreToolUse plugin hook (%s) failed due to missing ~/.gemini/config/plugins/%s directory.", stalePluginName, stalePluginName)
+		}
+		report.Findings = append(report.Findings, Finding{
+			Code:        CodeStalePluginHook,
+			Severity:    "ERROR",
+			Message:     msg,
+			Remediation: "Sanitize ~/.gemini/config/plugins + pin disabled state in ~/.gemini/config/config.json and resume agy conversation",
 		})
 	}
 
@@ -603,6 +620,12 @@ func createSIR(input DiagnosticInput, report DiagnosticReport) *SIRRecord {
 	for _, f := range report.Findings {
 		if f.Code == CodeAlreadyDoneOnMain {
 			category = "SUPERSEDED_BRANCH"
+			autoHeal = true
+			remediation = f.Remediation
+			summary = f.Message
+			break
+		} else if f.Code == CodeStalePluginHook {
+			category = CodeStalePluginHook
 			autoHeal = true
 			remediation = f.Remediation
 			summary = f.Message

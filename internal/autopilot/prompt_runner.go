@@ -21,10 +21,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/viovy/iazio-core/pkg/procutil"
+	"github.com/viovy/iazio-harness/internal/agyhooks"
 	"github.com/viovy/iazio-harness/internal/auth"
 	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/engines"
-	"github.com/viovy/iazio-core/pkg/procutil"
 	"github.com/viovy/iazio-harness/internal/redact"
 	"github.com/viovy/iazio-harness/internal/sessionstore"
 	"github.com/viovy/iazio-harness/internal/watchdog"
@@ -1429,6 +1430,11 @@ func stripTranscriptStepLinesForClassification(s string) string {
 }
 
 // ClassifyPromptFailure classifies upstream, downstream, and local execution failures.
+func isStaleHookFailureText(text string) bool {
+	matched, _ := agyhooks.DetectStalePluginHookFailure(text)
+	return matched
+}
+
 func ClassifyPromptFailure(execStatus, failureCategory, failureStage, combinedOutput string, waitErr error) (category, stage, direction, service string) {
 	category = strings.TrimSpace(failureCategory)
 	stage = strings.TrimSpace(failureStage)
@@ -1441,6 +1447,8 @@ func ClassifyPromptFailure(execStatus, failureCategory, failureStage, combinedOu
 	switch {
 	case category == "PERMISSION_DENIED" || strings.Contains(lower, "permission_denied") || strings.Contains(lower, "auto-denied"):
 		return "PERMISSION_DENIED", "TOOL_EXECUTION", "LOCAL_EXECUTION", "iazio-harness/sandbox"
+	case category == "STALE_PLUGIN_HOOK_DIR" || strings.Contains(lower, "stale_plugin_hook_dir") || isStaleHookFailureText(errText):
+		return "STALE_PLUGIN_HOOK_DIR", "TOOL_EXECUTION", "LOCAL_EXECUTION", "agy-cli/plugin-hooks"
 	case category == "BACKGROUND_DRAIN_TIMEOUT" || strings.Contains(lower, "background_drain_timeout"):
 		return "BACKGROUND_DRAIN_TIMEOUT", "BACKGROUND_DRAIN", "LOCAL_EXECUTION", "agy-cli"
 	case category == "ASE_GATE_INCOMPLETE" || strings.Contains(lower, "ase_gate_incomplete") || strings.Contains(lower, "dirty_worktree_post_exit") || strings.Contains(lower, "incomplete_ase_flow") || strings.Contains(lower, "unmerged_feature_branch") || strings.Contains(lower, "unpushed_commits") || strings.Contains(lower, "missing_story_binding"):
@@ -1887,15 +1895,31 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		ctx: ctx, apiURL: apiURL, token: token, jobID: jobID, stream: "stderr",
 	}
 
+	var lastTurnStaleHook bool
+	var lastTurnStalePlugin string
+
 	runSingleTurn := func(turnPrompt string, resumeConvID string, isResumeTurn bool) (turnStatus string, turnExit int, turnErr error, turnBgDrainReaped bool, turnPrintTimeout bool) {
 		streamMu.Lock()
 		turnStartOutLen := stdoutBuf.Len()
 		turnStartErrLen := stderrBuf.Len()
 		streamMu.Unlock()
 
+		var turnStartTranscriptOffset int64
+		if resumeConvID != "" && sessionstore.IsValidConversationID(resumeConvID) {
+			if brainDir := resolveBrainDir(); brainDir != "" {
+				tp := filepath.Join(brainDir, resumeConvID, ".system_generated", "logs", "transcript.jsonl")
+				if fi, errStat := os.Stat(tp); errStat == nil {
+					turnStartTranscriptOffset = fi.Size()
+				}
+			}
+		}
+		lastTurnStaleHook = false
+		lastTurnStalePlugin = ""
+
 		var tmpLogPath string
 		var args []string
 		if isMockAgy || isDirectAgy {
+			_, _ = agyhooks.SanitizeEnv(os.Environ())
 			if logFile, errL := os.CreateTemp("", fmt.Sprintf("iazio-agy-log-%s-*.log", opts.PromptID)); errL == nil {
 				tmpLogPath = logFile.Name()
 				_ = logFile.Close()
@@ -2120,6 +2144,30 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			return curConv, curBoundStory
 		}
 
+		checkTurnStaleHook := func(convID, outSlice, errSlice string) (bool, string) {
+			if !(isMockAgy || isDirectAgy) {
+				return false, ""
+			}
+			var logChunk string
+			if tmpLogPath != "" {
+				if lb, lErr := os.ReadFile(tmpLogPath); lErr == nil {
+					logChunk = string(lb)
+				}
+			}
+			if matched, plugin := agyhooks.DetectStalePluginHookFailure(outSlice, errSlice, logChunk); matched {
+				return true, plugin
+			}
+			if convID != "" && sessionstore.IsValidConversationID(convID) {
+				if brainDir := resolveBrainDir(); brainDir != "" {
+					tp := filepath.Join(brainDir, convID, ".system_generated", "logs", "transcript.jsonl")
+					if matched, plugin := agyhooks.ScanTranscriptSliceForStaleHook(tp, turnStartTranscriptOffset); matched {
+						return true, plugin
+					}
+				}
+			}
+			return false, ""
+		}
+
 		// Multi-day (>24h) ASE resilience: allow up to 336 active turn timeout deferrals (7+ days)
 		// and up to 720 background drain deferrals (12 hours) while active SDLC children are running under toolPID.
 		const maxTimeoutDeferrals = 336
@@ -2171,9 +2219,14 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				terminalPlannerTurn := isTranscriptAtTerminalPlannerResponse(curConv)
 				if inBgDrain || (terminalPlannerTurn && time.Since(lastWorktreeCheckAt) >= 10*time.Second) {
 					lastWorktreeCheckAt = time.Now()
+					turnStaleNow, turnStalePluginNow := checkTurnStaleHook(curConv, outSnapshot, errSnapshot)
+					if turnStaleNow {
+						lastTurnStaleHook = true
+						lastTurnStalePlugin = turnStalePluginNow
+					}
 					// If ASE/story execution is already completed in the worktree/transcript and no SDLC child is running, settle immediately as completed!
 					sdlcActiveNow, _ := hasActiveSDLCChildProcess(toolPID)
-					if !sdlcActiveNow && isASEFlowCompletedInWorktree(opts.WorkingDir, curBoundStory, fullOut+"\n"+fullTranscript+"\n"+fullErr, gitBin) {
+					if !sdlcActiveNow && !turnStaleNow && isASEFlowCompletedInWorktree(opts.WorkingDir, curBoundStory, fullOut+"\n"+fullTranscript+"\n"+fullErr, gitBin) {
 						turnCompletedDuringDrain = true
 						turnBgDrainReaped = false
 						drainStateDesc := "while root agent entered background drain"
@@ -2376,7 +2429,12 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 		}
 
-		if !canceled && !hasHeadlessPermissionDenial(fullOutFinal+"\n"+fullErrFinal) &&
+		if matched, plugin := checkTurnStaleHook(curConvFinal, outFinal, errFinal); matched {
+			lastTurnStaleHook = true
+			lastTurnStalePlugin = plugin
+		}
+
+		if !canceled && !lastTurnStaleHook && !hasHeadlessPermissionDenial(fullOutFinal+"\n"+fullErrFinal) &&
 			(turnCompletedDuringDrain || isASEFlowCompletedInWorktree(opts.WorkingDir, curTurnStory, fullOutFinal+"\n"+fullTranscriptFinal+"\n"+fullErrFinal, gitBin)) {
 			return "completed", 0, nil, false, false
 		}
@@ -2413,6 +2471,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	// Check if in-place auto-resume should be triggered when conversation ID is resolved or when agy crashes during an ASE flow
 	if (isMockAgy || isDirectAgy) && ctx.Err() == nil {
 		failedConvAttempts := make(map[string]int)
+		staleHookConvCount := make(map[string]int)
 		for resumeAttempts < maxAutoResumes {
 			streamMu.Lock()
 			curConv := detectedConvID
@@ -2438,7 +2497,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					maxAutoResumes = defaultASEMaxAutoResumeAttempts
 				}
 			}
-			if !hasHeadlessPermissionDenial(rawStdStreams) && isASEFlowCompletedInWorktree(opts.WorkingDir, curStory, rawCombined, gitBin) {
+			if !lastTurnStaleHook && !hasHeadlessPermissionDenial(rawStdStreams) && isASEFlowCompletedInWorktree(opts.WorkingDir, curStory, rawCombined, gitBin) {
 				execStatus = "completed"
 				exitCode = 0
 				waitErr = nil
@@ -2460,12 +2519,24 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			lowerStd := strings.ToLower(stripTranscriptStepLinesForClassification(rawStdStreams))
 			isFatalQuota := strings.Contains(lowerStd, "resourceexhausted") || strings.Contains(lowerStd, "429 you have exhausted")
 			isCorruptedSession := strings.Contains(lowerCombined, "conversation session corrupted") || strings.Contains(lowerCombined, "database disk image is malformed")
+
+			var staleSanRes agyhooks.SanitizeResult
+			if lastTurnStaleHook {
+				staleSanRes, _ = agyhooks.SanitizeEnv(os.Environ())
+				if curConv != "" {
+					staleHookConvCount[curConv]++
+				}
+			}
+
 			if (execStatus != "completed" || exitCode != 0) && curConv != "" {
-				failedConvAttempts[curConv]++
+				if !lastTurnStaleHook || staleHookConvCount[curConv] > 1 {
+					failedConvAttempts[curConv]++
+				}
 			}
 			aseCrashOrIncomplete := isASEFlow && (execStatus != "completed" || exitCode != 0) && !isFatalQuota
 			needsResume := !hasHeadlessPermissionDenial(rawStdStreams) && !isFatalQuota &&
-				((curConv != "" && (bgDrainReaped || printTimedOut || aseDirtyIncomplete || aseBranchIncomplete || (storyIncomplete && (execStatus != "completed" || hasDirtyWorktree || bgDrainIdleRegex.MatchString(rawCombined))))) ||
+				(lastTurnStaleHook ||
+					(curConv != "" && (bgDrainReaped || printTimedOut || aseDirtyIncomplete || aseBranchIncomplete || (storyIncomplete && (execStatus != "completed" || hasDirtyWorktree || bgDrainIdleRegex.MatchString(rawCombined))))) ||
 					aseCrashOrIncomplete)
 
 			if !needsResume {
@@ -2479,6 +2550,47 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			}
 
 			fallbackToNewConv := curConv == "" || isCorruptedSession || (curConv != "" && failedConvAttempts[curConv] >= 2)
+			if lastTurnStaleHook {
+				if fallbackToNewConv {
+					prevConv := curConv
+					curConv = ""
+					streamMu.Lock()
+					detectedConvID = ""
+					streamMu.Unlock()
+					hookConvLabel := prevConv
+					if hookConvLabel == "" {
+						hookConvLabel = "<new>"
+					}
+					resumeNote := fmt.Sprintf(
+						"[%s] [ASE-SUPERVISOR] [plugin_hook.sanitized_auto_resume] Detected stale Antigravity plugin hook (%s); sanitized ~/.gemini/config/plugins (removed=%v, disabled=%v) and auto-resuming conversation %s (attempt %d/%d)...\n",
+						time.Now().UTC().Format(time.RFC3339), lastTurnStalePlugin, staleSanRes.RemovedPluginDirs, staleSanRes.DisabledPlugins, hookConvLabel, resumeAttempts, maxAutoResumes,
+					)
+					emitSupervisorNote(resumeNote)
+					resumePrompt := "Stale ~/.gemini/config/plugins PreToolUse hook directory has been sanitized by iazio-harness and tool execution is restored. Continue and complete the original request."
+					if isASEFlow {
+						resumePrompt = fmt.Sprintf(
+							"Stale ~/.gemini/config/plugins PreToolUse hook directory has been sanitized by iazio-harness and tool execution is restored. Continue and complete /autonomous-story-execution for %s in a new conversation: inspect existing worktree state (branch=%s, dirty_files=%d, unpushed_commits=%d), finish remaining tasks, commit all changes cleanly, mark story status: DONE, run autopilot-git-flow land --story %s --status-done --record-reviews, and settle the worktree on main.",
+							storyTarget, nonMainBranchName, len(nonEphemeralModified), unpushedCnt, storyTarget,
+						)
+					}
+					execStatus, exitCode, waitErr, bgDrainReaped, printTimedOut = runSingleTurn(resumePrompt, "", false)
+				} else {
+					resumeNote := fmt.Sprintf(
+						"[%s] [ASE-SUPERVISOR] [plugin_hook.sanitized_auto_resume] Detected stale Antigravity plugin hook (%s); sanitized ~/.gemini/config/plugins (removed=%v, disabled=%v) and auto-resuming conversation %s (attempt %d/%d)...\n",
+						time.Now().UTC().Format(time.RFC3339), lastTurnStalePlugin, staleSanRes.RemovedPluginDirs, staleSanRes.DisabledPlugins, curConv, resumeAttempts, maxAutoResumes,
+					)
+					emitSupervisorNote(resumeNote)
+					resumePrompt := "Stale ~/.gemini/config/plugins PreToolUse hook directory has been sanitized by iazio-harness and tool execution is restored. Continue and complete the original request."
+					if isASEFlow {
+						resumePrompt = fmt.Sprintf(
+							"Stale ~/.gemini/config/plugins PreToolUse hook directory has been sanitized by iazio-harness and tool execution is restored. Continue and complete /autonomous-story-execution for %s on conversation %s (branch=%s, dirty_files=%d, unpushed_commits=%d): finish remaining tasks, commit all worktree changes cleanly, mark story status: DONE, run autopilot-git-flow land --story %s --status-done --record-reviews, and settle the worktree on main.",
+							storyTarget, curConv, nonMainBranchName, len(nonEphemeralModified), unpushedCnt, storyTarget,
+						)
+					}
+					execStatus, exitCode, waitErr, bgDrainReaped, printTimedOut = runSingleTurn(resumePrompt, curConv, true)
+				}
+				continue
+			}
 			if fallbackToNewConv {
 				prevConv := curConv
 				curConv = ""
@@ -2556,6 +2668,14 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		failureCategory = "PERMISSION_DENIED"
 		failureStage = "TOOL_EXECUTION"
 		waitErr = fmt.Errorf("PERMISSION_DENIED: headless agent tool permission was auto-denied: %s", summary)
+	} else if lastTurnStaleHook {
+		execStatus = "failed"
+		if exitCode == 0 {
+			exitCode = 1
+		}
+		failureCategory = "STALE_PLUGIN_HOOK_DIR"
+		failureStage = "TOOL_EXECUTION"
+		waitErr = fmt.Errorf("STALE_PLUGIN_HOOK_DIR: Antigravity PreToolUse plugin hook (%s) failed with missing plugin directory", lastTurnStalePlugin)
 	}
 
 	detectedStoryID := curBoundStory
@@ -2626,7 +2746,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		_ = controlplane.PostStoryBinding(ctx, apiURL, resolveToken(), jobID, detectedStoryID, detectedStoryTitle, detectedStoryPath, fencingToken)
 	}
 
-	if !hasHeadlessPermissionDenial(combinedOutput) && isASEFlowCompletedInWorktree(opts.WorkingDir, detectedStoryID, combinedOutput, gitBin) {
+	if !lastTurnStaleHook && !hasHeadlessPermissionDenial(combinedOutput) && isASEFlowCompletedInWorktree(opts.WorkingDir, detectedStoryID, combinedOutput, gitBin) {
 		execStatus = "completed"
 		exitCode = 0
 		waitErr = nil

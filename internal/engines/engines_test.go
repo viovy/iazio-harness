@@ -1446,3 +1446,59 @@ func TestRawWriter_OnStoryAllocated(t *testing.T) {
 		t.Fatalf("expected STORY-GOV-9999, got %q", got)
 	}
 }
+
+func TestExecute_AgySanitizesBaseEnvGeminiHooksPreSpawn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping shell script test on Windows")
+	}
+	tmpHome := t.TempDir()
+	cfgDir := filepath.Join(tmpHome, ".gemini", "config")
+	dtDir := filepath.Join(cfgDir, "plugins", "googlecloudtools.datacloud_telemetry")
+	if err := os.MkdirAll(dtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(cfgDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"plugins":{"googlecloudtools.datacloud_telemetry":{"enabled":true}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	mockBin := filepath.Join(t.TempDir(), "mock-agy")
+	script := "#!/bin/sh\nif [ -d \"$HOME/.gemini/config/plugins/googlecloudtools.datacloud_telemetry\" ]; then exit 9; fi\necho ok\nexit 0\n"
+	if err := os.WriteFile(mockBin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cli := CLI{Engine: "agy"}
+	res, err := cli.Execute(context.Background(), ExecutionRequest{
+		Engine:  "agy",
+		Argv:    []string{mockBin},
+		BaseEnv: []string{"PATH=" + os.Getenv("PATH"), "HOME=" + tmpHome},
+	}, &testCaptureStream{})
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("expected pre-spawn sanitization before agy execution, got res=%+v err=%v", res, err)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"enabled": false`) {
+		t.Fatalf("expected googlecloudtools.datacloud_telemetry enabled=false in config.json, got:\n%s", string(raw))
+	}
+
+	// Verify mock-agy basename triggers pre-spawn sanitization even under non-agy engine label
+	if err := os.MkdirAll(dtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"plugins":{"googlecloudtools.datacloud_telemetry":{"enabled":true}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cliOther := CLI{Engine: "claude"}
+	res2, err := cliOther.Execute(context.Background(), ExecutionRequest{
+		Engine:  "claude",
+		Argv:    []string{mockBin},
+		BaseEnv: []string{"PATH=" + os.Getenv("PATH"), "HOME=" + tmpHome},
+	}, &testCaptureStream{})
+	if err != nil || res2.ExitCode != 0 {
+		t.Fatalf("expected mock-agy basename pre-spawn sanitization, got res=%+v err=%v", res2, err)
+	}
+}
