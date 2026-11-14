@@ -388,3 +388,70 @@ func TestVerify_MultiRepoSuperprojectAndSiblingSubmodule(t *testing.T) {
 		t.Fatalf("expected Verify to PASS once leaf, sibling hub, and superproject are all clean on main with honest story, got %+v", resOK)
 	}
 }
+
+func TestCountUnpushedCommitsAndIsNonMainBranch_FailClosed(t *testing.T) {
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "")
+
+	// 1. Non-git directory returns (false, "") cleanly
+	nonGit := t.TempDir()
+	if nonMain, br := IsNonMainBranch(nonGit, "git"); nonMain || br != "" {
+		t.Fatalf("expected non-git dir to return (false, ''), got (%v, %q)", nonMain, br)
+	}
+
+	// 2. Unborn main vs unborn feat/x via symbolic-ref fallback
+	unbornMain := t.TempDir()
+	if out, err := exec.Command("git", "init", "-b", "main", unbornMain).CombinedOutput(); err != nil {
+		t.Fatalf("git init main: %v: %s", err, string(out))
+	}
+	if nonMain, br := IsNonMainBranch(unbornMain, "git"); nonMain || br != "main" {
+		t.Fatalf("expected unborn main to return (false, 'main'), got (%v, %q)", nonMain, br)
+	}
+	if nonMain, br := IsNonMainBranch(unbornMain, "/nonexistent-git-bin-0206"); !nonMain || !strings.Contains(br, "probe_error") {
+		t.Fatalf("expected unprobeable .git repo to fail closed with probe_error, got (%v, %q)", nonMain, br)
+	}
+
+	unbornFeat := t.TempDir()
+	if out, err := exec.Command("git", "init", "-b", "feat/demo", unbornFeat).CombinedOutput(); err != nil {
+		t.Fatalf("git init feat/demo: %v: %s", err, string(out))
+	}
+	if nonMain, br := IsNonMainBranch(unbornFeat, "git"); !nonMain || br != "feat/demo" {
+		t.Fatalf("expected unborn feat/demo to return (true, 'feat/demo'), got (%v, %q)", nonMain, br)
+	}
+
+	// 3. Committed git repo with NO remote fails closed in CountUnpushedCommits and Verify
+	noRemote := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", noRemote}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v: %s", args, err, string(out))
+		}
+	}
+	runGit("init", "-b", "main")
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	_ = os.MkdirAll(filepath.Join(noRemote, "docs", "stories"), 0o755)
+	_ = os.WriteFile(filepath.Join(noRemote, "docs", "stories", "2026-11-14-gov-5282.story.md"), []byte("---\nid: STORY-GOV-5282\nstatus: DONE\n---\n\n## Definition of Done\n- [x] Landed\n"), 0o644)
+	runGit("add", ".")
+	runGit("commit", "-m", "init no remote")
+
+	if _, err := CountUnpushedCommits(noRemote, "git"); err == nil || !strings.Contains(err.Error(), "no git remotes configured") {
+		t.Fatalf("expected empty-remote repo to fail closed, got err=%v", err)
+	}
+	res := Verify(GateOptions{
+		WorktreePath:           noRemote,
+		StoryID:                "STORY-GOV-5282",
+		RequireGitClean:        true,
+		RequireSubmodulesClean: true,
+	})
+	if res.Passed || res.BranchClean {
+		t.Fatalf("expected Verify on empty-remote repo to fail closed with BranchClean=false, got %+v", res)
+	}
+
+	// 4. IAZIO_TEST_SKIP_REMOTE=1 bypasses missing remote in isolated unit test fixtures
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
+	cnt, err := CountUnpushedCommits(noRemote, "git")
+	if err != nil || cnt != 0 {
+		t.Fatalf("expected IAZIO_TEST_SKIP_REMOTE=1 to return (0, nil), got (%d, %v)", cnt, err)
+	}
+}

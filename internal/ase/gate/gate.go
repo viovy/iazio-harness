@@ -185,7 +185,7 @@ func Verify(opts GateOptions) GateResult {
 					res.UnmetGates = append(res.UnmetGates, "branch_not_detached")
 				}
 			}
-			if unpushed, uErr := CountUnpushedCommits(dir, "git"); uErr == nil && unpushed > 0 && res.BranchClean {
+			if unpushed, uErr := CountUnpushedCommits(dir, "git"); (uErr != nil || unpushed > 0) && res.BranchClean {
 				res.BranchClean = false
 				res.UnmetGates = append(res.UnmetGates, "branch_not_detached")
 			}

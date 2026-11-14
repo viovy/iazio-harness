@@ -416,7 +416,7 @@ func ResolveScopedRepoDirs(worktreePath, spRoot string, storySubmodules []string
 	return dirs
 }
 
-// IsNonMainBranch returns (true, branch) if dir is checked out on a feature/fix/non-main branch or detached HEAD.
+// IsNonMainBranch returns (true, branch) if dir is checked out on a feature/fix/non-main branch, detached HEAD, or unprobeable git state.
 func IsNonMainBranch(dir, gitBin string) (bool, string) {
 	if strings.TrimSpace(dir) == "" {
 		return false, ""
@@ -428,11 +428,29 @@ func IsNonMainBranch(dir, gitBin string) (bool, string) {
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
-		return false, ""
+		// Handle freshly initialized repos with unborn HEAD (e.g. `git init -b main` before first commit).
+		symCmd := procutil.Command(gitBin, "symbolic-ref", "-q", "--short", "HEAD")
+		symCmd.Dir = dir
+		if symOut, symErr := symCmd.Output(); symErr == nil {
+			symBr := strings.TrimSpace(string(symOut))
+			if symBr == "main" || symBr == "master" {
+				return false, symBr
+			}
+			if symBr != "" {
+				return true, symBr
+			}
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, ".git")); statErr != nil {
+			return false, ""
+		}
+		return true, fmt.Sprintf("probe_error(%v)", err)
 	}
 	br := strings.TrimSpace(string(out))
-	if br == "" || br == "main" || br == "master" {
+	if br == "main" || br == "master" {
 		return false, br
+	}
+	if br == "" {
+		return true, "empty_branch"
 	}
 	return true, br
 }
