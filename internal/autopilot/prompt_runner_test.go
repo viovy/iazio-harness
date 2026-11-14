@@ -2361,3 +2361,212 @@ esac
 	}
 }
 
+func TestClassifyPromptFailure_StalePluginHookDir(t *testing.T) {
+	hookErrOut := `JSON hook "jsonhook__googlecloudtools.datacloud_telemetry_PreToolUse_0_0" failed:
+command failed: chdir /Users/romeo/.gemini/config/plugins/googlecloudtools.datacloud_telemetry: no such file or directory`
+
+	cat, stage, dir, svc := ClassifyPromptFailure("failed", "", "", hookErrOut, nil)
+	if cat != "STALE_PLUGIN_HOOK_DIR" || stage != "TOOL_EXECUTION" || dir != "LOCAL_EXECUTION" || svc != "agy-cli/plugin-hooks" {
+		t.Fatalf("unexpected classification from hook output: cat=%q stage=%q dir=%q svc=%q", cat, stage, dir, svc)
+	}
+
+	cat2, stage2, dir2, svc2 := ClassifyPromptFailure("failed", "STALE_PLUGIN_HOOK_DIR", "", "exit status 1", nil)
+	if cat2 != "STALE_PLUGIN_HOOK_DIR" || stage2 != "TOOL_EXECUTION" || dir2 != "LOCAL_EXECUTION" || svc2 != "agy-cli/plugin-hooks" {
+		t.Fatalf("unexpected classification from explicit failureCategory: cat=%q stage=%q dir=%q svc=%q", cat2, stage2, dir2, svc2)
+	}
+}
+
+func TestRunPrompt_StalePluginHookPreToolUseAutoResume(t *testing.T) {
+	binDir := t.TempDir()
+	mockAgyBin := filepath.Join(binDir, "mock-agy")
+	if runtime.GOOS == "windows" {
+		mockAgyBin += ".exe"
+	}
+	buildCmd := exec.Command("go", "build", "-buildvcs=false", "-o", mockAgyBin, "../../cmd/mock-agy")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("build mock-agy failed: %v\n%s", err, string(out))
+	}
+
+	t.Setenv("IAZIO_TEST_SKIP_REMOTE", "1")
+	t.Setenv("MOCK_AGY_SCENARIO", "stale_plugin_hook_pretooluse_auto_resume")
+	t.Setenv("MOCK_AGY_FAST", "1")
+
+	assertSanitizedConfig := func(t *testing.T, homeDir string) {
+		t.Helper()
+		dtDir := filepath.Join(homeDir, ".gemini", "config", "plugins", "googlecloudtools.datacloud_telemetry")
+		if _, err := os.Stat(dtDir); !os.IsNotExist(err) {
+			t.Fatalf("expected stale plugin dir %s to be deleted, stat err=%v", dtDir, err)
+		}
+		cfgPath := filepath.Join(homeDir, ".gemini", "config", "config.json")
+		info, err := os.Stat(cfgPath)
+		if err != nil {
+			t.Fatalf("stat %s: %v", cfgPath, err)
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+			t.Fatalf("expected config.json mode 0600, got %o", info.Mode().Perm())
+		}
+		raw, err := os.ReadFile(cfgPath)
+		if err != nil {
+			t.Fatalf("read %s: %v", cfgPath, err)
+		}
+		var cfg map[string]any
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			t.Fatalf("unmarshal %s: %v", cfgPath, err)
+		}
+		pluginsMap, _ := cfg["plugins"].(map[string]any)
+		dtEntry, _ := pluginsMap["googlecloudtools.datacloud_telemetry"].(map[string]any)
+		enabled, hasEnabled := dtEntry["enabled"].(bool)
+		if !hasEnabled || enabled {
+			t.Fatalf("expected googlecloudtools.datacloud_telemetry enabled=false, got %#v", dtEntry)
+		}
+	}
+
+	t.Run("non_ase_prompt_auto_resumes_in_place", func(t *testing.T) {
+		homeDir := t.TempDir()
+		workDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		t.Setenv("USERPROFILE", homeDir)
+		t.Setenv("IAZIO_BRAIN_DIR", filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain"))
+
+		runner := NewPromptRunner("autopilot")
+		runner.GracePeriod = 50 * time.Millisecond
+		res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+			PromptID:    "prompt_stale_hook_non_ase",
+			JobID:       "job_stale_hook_non_ase",
+			Repo:        "meta-repo",
+			Prompt:      "Inspect repository status and run verification checks.",
+			TargetAgent: mockAgyBin,
+			WorkingDir:  workDir,
+			Timeout:     15 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("expected auto-resume to recover from PreToolUse stale plugin hook, got err=%v (status=%q cat=%q summary=%q)", err, res.Status, res.FailureCategory, res.Summary)
+		}
+		if res.Status != "completed" || res.ExitCode != 0 {
+			t.Fatalf("expected completed/0 after auto-resume, got status=%q exit=%d cat=%q", res.Status, res.ExitCode, res.FailureCategory)
+		}
+		if res.ResumeAttempts != 1 {
+			t.Fatalf("expected ResumeAttempts == 1 (per-turn slice prevents Turn 2 re-trigger), got %d", res.ResumeAttempts)
+		}
+		if res.ConversationID != "c0ffee00-1234-5678-9abc-000000000205" {
+			t.Fatalf("expected ConversationID c0ffee00-1234-5678-9abc-000000000205, got %q", res.ConversationID)
+		}
+		assertSanitizedConfig(t, homeDir)
+	})
+
+	t.Run("ase_prompt_auto_resumes_before_completion_shortcircuit", func(t *testing.T) {
+		homeDir := t.TempDir()
+		repoDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		t.Setenv("USERPROFILE", homeDir)
+		t.Setenv("IAZIO_BRAIN_DIR", filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain"))
+
+		for _, args := range [][]string{
+			{"init", "-b", "main"},
+			{"config", "user.email", "test@example.com"},
+			{"config", "user.name", "Test User"},
+		} {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = repoDir
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+			}
+		}
+		storyDir := filepath.Join(repoDir, "docs", "stories")
+		if err := os.MkdirAll(storyDir, 0o755); err != nil {
+			t.Fatalf("mkdir stories: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(storyDir, "2026-11-14-gov-5291-test.story.md"), []byte("---\nid: STORY-GOV-5291\nstatus: DONE\n---\n# Story\n"), 0o644); err != nil {
+			t.Fatalf("write story: %v", err)
+		}
+		for _, args := range [][]string{
+			{"add", "."},
+			{"commit", "-m", "chore: seed story"},
+		} {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = repoDir
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+			}
+		}
+
+		runner := NewPromptRunner("autopilot")
+		runner.GracePeriod = 50 * time.Millisecond
+		res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+			PromptID:    "prompt_stale_hook_ase",
+			JobID:       "job_stale_hook_ase",
+			Repo:        "meta-repo",
+			StoryID:     "STORY-GOV-5291",
+			Prompt:      "/autonomous-story-execution STORY-GOV-5291",
+			TargetAgent: mockAgyBin,
+			WorkingDir:  repoDir,
+			Timeout:     15 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("expected ASE prompt auto-resume to recover, got err=%v (status=%q cat=%q summary=%q)", err, res.Status, res.FailureCategory, res.Summary)
+		}
+		if res.Status != "completed" || res.ExitCode != 0 {
+			t.Fatalf("expected completed/0 for ASE prompt after auto-resume, got status=%q exit=%d", res.Status, res.ExitCode)
+		}
+		if res.ResumeAttempts != 1 {
+			t.Fatalf("expected ResumeAttempts == 1 for ASE prompt, got %d", res.ResumeAttempts)
+		}
+		if res.ConversationID != "c0ffee00-1234-5678-9abc-000000000205" {
+			t.Fatalf("expected ConversationID c0ffee00-1234-5678-9abc-000000000205, got %q", res.ConversationID)
+		}
+		assertSanitizedConfig(t, homeDir)
+	})
+
+	t.Run("exhausted_retries_classify_stale_plugin_hook_dir", func(t *testing.T) {
+		homeDir := t.TempDir()
+		workDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		t.Setenv("USERPROFILE", homeDir)
+		t.Setenv("IAZIO_BRAIN_DIR", filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain"))
+
+		stubDir := t.TempDir()
+		var persistentMock string
+		if runtime.GOOS == "windows" {
+			persistentMock = filepath.Join(stubDir, "mock-agy-always-hook-err.cmd")
+			winScript := "@echo off\r\necho Created conversation c0ffee00-1234-5678-9abc-000000000299\r\necho JSON hook \"jsonhook__googlecloudtools.datacloud_telemetry_PreToolUse_0_0\" failed:\r\necho command failed: chdir /Users/romeo/.gemini/config/plugins/googlecloudtools.datacloud_telemetry: no such file or directory\r\nexit /b 0\r\n"
+			if err := os.WriteFile(persistentMock, []byte(winScript), 0o755); err != nil {
+				t.Fatalf("write windows persistent mock: %v", err)
+			}
+		} else {
+			persistentMock = filepath.Join(stubDir, "mock-agy-always-hook-err")
+			shScript := `#!/bin/sh
+echo "Created conversation c0ffee00-1234-5678-9abc-000000000299"
+echo 'JSON hook "jsonhook__googlecloudtools.datacloud_telemetry_PreToolUse_0_0" failed:'
+echo 'command failed: chdir /Users/romeo/.gemini/config/plugins/googlecloudtools.datacloud_telemetry: no such file or directory'
+exit 0
+`
+			if err := os.WriteFile(persistentMock, []byte(shScript), 0o755); err != nil {
+				t.Fatalf("write persistent mock: %v", err)
+			}
+		}
+
+		maxResumes := 1
+		runner := NewPromptRunner("autopilot")
+		runner.GracePeriod = 50 * time.Millisecond
+		res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+			PromptID:              "prompt_stale_hook_exhausted",
+			JobID:                 "job_stale_hook_exhausted",
+			Repo:                  "meta-repo",
+			Prompt:                "Check plugin resilience when retries exhaust.",
+			TargetAgent:           persistentMock,
+			WorkingDir:            workDir,
+			Timeout:               15 * time.Second,
+			MaxAutoResumeAttempts: &maxResumes,
+		})
+		if err == nil {
+			t.Fatalf("expected error when stale plugin hook error persists past max retries, got completed summary=%q", res.Summary)
+		}
+		if res.Status != "failed" {
+			t.Fatalf("expected status=failed on exhausted retries, got %q", res.Status)
+		}
+		if res.FailureCategory != "STALE_PLUGIN_HOOK_DIR" {
+			t.Fatalf("expected FailureCategory=STALE_PLUGIN_HOOK_DIR, got %q (err=%v)", res.FailureCategory, err)
+		}
+	})
+}
+
