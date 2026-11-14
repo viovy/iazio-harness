@@ -1484,4 +1484,21 @@ func TestExecute_AgySanitizesBaseEnvGeminiHooksPreSpawn(t *testing.T) {
 	if !strings.Contains(string(raw), `"enabled": false`) {
 		t.Fatalf("expected googlecloudtools.datacloud_telemetry enabled=false in config.json, got:\n%s", string(raw))
 	}
+
+	// Verify mock-agy basename triggers pre-spawn sanitization even under non-agy engine label
+	if err := os.MkdirAll(dtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"plugins":{"googlecloudtools.datacloud_telemetry":{"enabled":true}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cliOther := CLI{Engine: "claude"}
+	res2, err := cliOther.Execute(context.Background(), ExecutionRequest{
+		Engine:  "claude",
+		Argv:    []string{mockBin},
+		BaseEnv: []string{"PATH=" + os.Getenv("PATH"), "HOME=" + tmpHome},
+	}, &testCaptureStream{})
+	if err != nil || res2.ExitCode != 0 {
+		t.Fatalf("expected mock-agy basename pre-spawn sanitization, got res=%+v err=%v", res2, err)
+	}
 }

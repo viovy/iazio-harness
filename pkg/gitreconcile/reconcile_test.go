@@ -194,3 +194,106 @@ type execError struct {
 func (e *execError) Error() string {
 	return e.msg
 }
+
+func TestReconciler_AndLeaseClient_EdgeBranches(t *testing.T) {
+	// DefaultGitRunner smoke check against git --version
+	if out, err := DefaultGitRunner(t.TempDir(), "--version"); err != nil || !strings.Contains(out, "git") {
+		t.Fatalf("expected DefaultGitRunner --version success, got out=%q err=%v", out, err)
+	}
+
+	// Up-to-date submodule returns nil without rebasing
+	recUpToDate := NewReconciler(nil)
+	recUpToDate.RunGit = func(dir string, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "rev-list" {
+			return "0\n", nil
+		}
+		return "", nil
+	}
+	if err := recUpToDate.RebaseAndVerifySubmodule(context.Background(), t.TempDir(), "cid-1", ""); err != nil {
+		t.Fatalf("expected up-to-date submodule nil, got %v", err)
+	}
+
+	// Clean rebase + passing verifyCmd and failing verifyCmd
+	recVerify := NewReconciler(nil)
+	recVerify.RunGit = func(dir string, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "rev-list" {
+			return "1\n", nil
+		}
+		return "", nil
+	}
+	if err := recVerify.RebaseAndVerifySubmodule(context.Background(), t.TempDir(), "cid-2", "git --version"); err != nil {
+		t.Fatalf("expected clean rebase + git --version verify success, got %v", err)
+	}
+	if err := recVerify.RebaseAndVerifySubmodule(context.Background(), t.TempDir(), "cid-3", "git invalid-subcommand-xyz"); err == nil {
+		t.Fatal("expected verifyCmd failure error")
+	}
+
+	// Fetch failure in RebaseAndVerifySubmodule & ReconcileSuperprojectGitlinks
+	recErr := NewReconciler(nil)
+	recErr.RunGit = func(dir string, args ...string) (string, error) {
+		return "", &execError{msg: "git failed"}
+	}
+	if err := recErr.RebaseAndVerifySubmodule(context.Background(), t.TempDir(), "", ""); err == nil {
+		t.Fatal("expected fetch failure in RebaseAndVerifySubmodule")
+	}
+	if err := recErr.ReconcileSuperprojectGitlinks(context.Background(), t.TempDir(), map[string]string{"sub": "abc"}); err == nil {
+		t.Fatal("expected fetch failure in ReconcileSuperprojectGitlinks")
+	}
+	recUpdateErr := NewReconciler(nil)
+	recUpdateErr.RunGit = func(dir string, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "update-index" {
+			return "", &execError{msg: "update-index fail"}
+		}
+		return "", nil
+	}
+	if err := recUpdateErr.ReconcileSuperprojectGitlinks(context.Background(), t.TempDir(), map[string]string{"sub": "abc"}); err == nil {
+		t.Fatal("expected update-index error")
+	}
+
+	// ConflictError.Error formatting
+	ce := &ConflictError{SubmodulePath: "/tmp/sub", ConflictedFiles: []string{"a.go"}, ActiveConversationID: "cid-x"}
+	if !strings.Contains(ce.Error(), "/tmp/sub") || !strings.Contains(ce.Error(), "cid-x") {
+		t.Fatalf("unexpected ConflictError.Error(): %q", ce.Error())
+	}
+
+	// LeaseClient renewLease, idempotent Release, conflict timeout, and non-200 handling
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/git-leases/acquire":
+			if r.Header.Get("X-Mode") == "" && strings.Contains(r.URL.RawQuery, "") {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+		case "/api/v1/git-leases/renew":
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	client := NewLeaseClient(ts.URL)
+	if err := client.renewLease(context.Background(), "repo", "holder", "lease-1", 10); err != nil {
+		t.Fatalf("renewLease failed: %v", err)
+	}
+	// Double release returns nil idempotently
+	h := &LeaseHandle{client: client, info: LeaseInfo{Repo: "repo", Holder: "h", LeaseID: "l"}}
+	if err := h.Release(context.Background()); err != nil {
+		t.Fatalf("first Release error: %v", err)
+	}
+	if err := h.Release(context.Background()); err != nil {
+		t.Fatalf("second idempotent Release error: %v", err)
+	}
+
+	ctxTimeout, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := client.AcquireWithRetry(ctxTimeout, "repo", "holder", 10); err != ErrLeaseAcquisitionTimeout {
+		t.Fatalf("expected ErrLeaseAcquisitionTimeout, got %v", err)
+	}
+
+	ts500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts500.Close()
+	if _, _, err := NewLeaseClient(ts500.URL).acquireOnce(context.Background(), "repo", "holder", 10); err == nil {
+		t.Fatal("expected error on 500 status")
+	}
+}

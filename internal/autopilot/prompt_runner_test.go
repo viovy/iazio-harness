@@ -2568,5 +2568,57 @@ exit 0
 			t.Fatalf("expected FailureCategory=STALE_PLUGIN_HOOK_DIR, got %q (err=%v)", res.FailureCategory, err)
 		}
 	})
+
+	t.Run("ase_fallback_new_conversation_after_same_conv_retry", func(t *testing.T) {
+		homeDir := t.TempDir()
+		workDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		t.Setenv("USERPROFILE", homeDir)
+		t.Setenv("IAZIO_BRAIN_DIR", filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain"))
+
+		stubDir := t.TempDir()
+		var persistentMock string
+		if runtime.GOOS == "windows" {
+			persistentMock = filepath.Join(stubDir, "mock-agy-always-hook-err.cmd")
+			winScript := "@echo off\r\necho Created conversation c0ffee00-1234-5678-9abc-000000000311\r\necho JSON hook \"jsonhook__googlecloudtools.datacloud_telemetry_PreToolUse_0_0\" failed:\r\necho command failed: chdir /Users/romeo/.gemini/config/plugins/googlecloudtools.datacloud_telemetry: no such file or directory\r\nexit /b 0\r\n"
+			if err := os.WriteFile(persistentMock, []byte(winScript), 0o755); err != nil {
+				t.Fatalf("write windows persistent mock: %v", err)
+			}
+		} else {
+			persistentMock = filepath.Join(stubDir, "mock-agy-always-hook-err")
+			shScript := `#!/bin/sh
+echo "Created conversation c0ffee00-1234-5678-9abc-000000000311"
+echo 'JSON hook "jsonhook__googlecloudtools.datacloud_telemetry_PreToolUse_0_0" failed:'
+echo 'command failed: chdir /Users/romeo/.gemini/config/plugins/googlecloudtools.datacloud_telemetry: no such file or directory'
+exit 0
+`
+			if err := os.WriteFile(persistentMock, []byte(shScript), 0o755); err != nil {
+				t.Fatalf("write persistent mock: %v", err)
+			}
+		}
+
+		maxResumes := 2
+		runner := NewPromptRunner("autopilot")
+		runner.GracePeriod = 50 * time.Millisecond
+		res, err := runner.RunPrompt(context.Background(), RunPromptOptions{
+			PromptID:              "prompt_stale_hook_ase_fallback",
+			JobID:                 "job_stale_hook_ase_fallback",
+			Repo:                  "meta-repo",
+			Prompt:                "/autonomous-story-execution STORY-GOV-5291",
+			TargetAgent:           persistentMock,
+			WorkingDir:            workDir,
+			Timeout:               15 * time.Second,
+			MaxAutoResumeAttempts: &maxResumes,
+		})
+		if err == nil {
+			t.Fatalf("expected error after exhausting retries, got completed summary=%q", res.Summary)
+		}
+		if res.Status != "failed" || res.FailureCategory != "STALE_PLUGIN_HOOK_DIR" {
+			t.Fatalf("expected failed/STALE_PLUGIN_HOOK_DIR, got status=%q category=%q", res.Status, res.FailureCategory)
+		}
+		if res.ResumeAttempts != 2 {
+			t.Fatalf("expected 2 resume attempts (in-place + ASE new-conv fallback), got %d", res.ResumeAttempts)
+		}
+	})
 }
 

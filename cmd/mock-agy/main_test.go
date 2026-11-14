@@ -536,4 +536,63 @@ func TestMockAgy_ScenariosUnit(t *testing.T) {
 			t.Fatalf("expected complete_story exit 0, got %d: %s", code1, stdout.String())
 		}
 	})
+
+	t.Run("Scenario23_StalePluginHookPreToolUseAutoResume", func(t *testing.T) {
+		tmpHome := t.TempDir()
+		t.Setenv("HOME", tmpHome)
+		t.Setenv("USERPROFILE", tmpHome)
+		t.Setenv("IAZIO_BRAIN_DIR", filepath.Join(tmpHome, "brain"))
+
+		targetCID := "c0ffee00-1234-5678-9abc-000000000205"
+		dtPluginDir := filepath.Join(tmpHome, ".gemini", "config", "plugins", "googlecloudtools.datacloud_telemetry")
+		cfgPath := filepath.Join(tmpHome, ".gemini", "config", "config.json")
+
+		// Turn 1 seeds stale plugin dir, enabled config, and PreToolUse transcript error while exiting 0
+		var stdout, stderr bytes.Buffer
+		code1 := run([]string{"--print=initial run"}, "stale_plugin_hook_pretooluse_auto_resume", &stdout, &stderr)
+		if code1 != 0 || !strings.Contains(stdout.String(), targetCID) {
+			t.Fatalf("turn 1 expected exit 0 with targetCID, got code=%d out=%q err=%q", code1, stdout.String(), stderr.String())
+		}
+
+		// Turn 2 rejects mismatched conversation
+		stdout.Reset()
+		stderr.Reset()
+		if code := run([]string{"--conversation=wrong-cid", "--print=sanitized resume"}, "stale_plugin_hook_pretooluse_auto_resume", &stdout, &stderr); code != 2 {
+			t.Fatalf("expected exit 2 for wrong conversation, got %d", code)
+		}
+
+		// Turn 2 rejects un-removed stale plugin directory
+		stdout.Reset()
+		stderr.Reset()
+		if code := run([]string{"--conversation=" + targetCID, "--print=sanitized resume"}, "stale_plugin_hook_pretooluse_auto_resume", &stdout, &stderr); code != 2 {
+			t.Fatalf("expected exit 2 when stale plugin dir still present, got %d", code)
+		}
+
+		// Remove stale dir, verify still-enabled / invalid / missing config gates fail closed
+		if err := os.RemoveAll(dtPluginDir); err != nil {
+			t.Fatal(err)
+		}
+		if code := run([]string{"--conversation=" + targetCID, "--print=sanitized resume"}, "stale_plugin_hook_pretooluse_auto_resume", &stdout, &stderr); code != 2 {
+			t.Fatalf("expected exit 2 when enabled=true in config.json, got %d", code)
+		}
+		_ = os.WriteFile(cfgPath, []byte(`{invalid`), 0o600)
+		if code := run([]string{"--conversation=" + targetCID, "--print=sanitized resume"}, "stale_plugin_hook_pretooluse_auto_resume", &stdout, &stderr); code != 2 {
+			t.Fatalf("expected exit 2 on invalid config.json, got %d", code)
+		}
+		_ = os.Remove(cfgPath)
+		if code := run([]string{"--conversation=" + targetCID, "--print=sanitized resume"}, "stale_plugin_hook_pretooluse_auto_resume", &stdout, &stderr); code != 2 {
+			t.Fatalf("expected exit 2 when config.json missing, got %d", code)
+		}
+
+		// Write sanitized config and verify clean Turn 2 recovery
+		if err := os.WriteFile(cfgPath, []byte(`{"plugins":{"googlecloudtools.datacloud_telemetry":{"enabled":false}}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stdout.Reset()
+		stderr.Reset()
+		code2 := run([]string{"--conversation=" + targetCID, "--print=sanitized resume"}, "stale_plugin_hook_pretooluse_auto_resume", &stdout, &stderr)
+		if code2 != 0 || !strings.Contains(stdout.String(), "Turn 2 completed cleanly") {
+			t.Fatalf("expected exit 0 after sanitization, got code=%d out=%q err=%q", code2, stdout.String(), stderr.String())
+		}
+	})
 }

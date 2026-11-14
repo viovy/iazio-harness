@@ -255,3 +255,197 @@ command failed: chdir /Users/romeo/.gemini/config/plugins/googlecloudtools.datac
 		t.Fatalf("expected Turn 2 transcript slice not to re-trigger on Turn 1 error, got matched=%v plugin=%q", m2, p2)
 	}
 }
+
+func TestSanitizeEnv_UserProfileAndPluginEdgeCases(t *testing.T) {
+	tmpHome := t.TempDir()
+	cfgDir := filepath.Join(tmpHome, ".gemini", "config")
+	pluginsDir := filepath.Join(cfgDir, "plugins")
+
+	// Valid plugin whose command uses quoted path with shell operator and an existing script
+	validDir := filepath.Join(pluginsDir, "quoted-valid-plugin")
+	if err := os.MkdirAll(filepath.Join(validDir, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(validDir, "scripts", "ok.sh"), []byte("#!/bin/sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	validHooks := `{"PreToolUse":[{"hooks":[{"command":"sh 'scripts/ok.sh' && echo ok"}]}]}`
+	if err := os.WriteFile(filepath.Join(validDir, "hooks.json"), []byte(validHooks), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Broken plugin whose relative script target is missing
+	brokenQuotedDir := filepath.Join(pluginsDir, "broken-quoted-plugin")
+	if err := os.MkdirAll(brokenQuotedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	brokenHooks := `{"PreToolUse":[{"command":"python3 \"scripts/missing.py\"; echo fallback"}]}`
+	if err := os.WriteFile(filepath.Join(brokenQuotedDir, "hooks.json"), []byte(brokenHooks), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Plugin with malformed hooks.json should be preserved safely
+	badJSONPlugin := filepath.Join(pluginsDir, "bad-hooks-json-plugin")
+	if err := os.MkdirAll(badJSONPlugin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(badJSONPlugin, "hooks.json"), []byte(`{not-json`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// config.json with no "plugins" section initially
+	cfgPath := filepath.Join(cfgDir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Extract home from USERPROFILE when HOME is empty; ignore blank/malformed env pairs
+	res, err := SanitizeEnv([]string{"", "INVALID_PAIR", "HOME=   ", "USERPROFILE=" + tmpHome})
+	if err != nil {
+		t.Fatalf("SanitizeEnv error: %v", err)
+	}
+	if !res.Changed {
+		t.Fatal("expected USERPROFILE sanitization to mutate")
+	}
+	if _, err := os.Stat(validDir); err != nil {
+		t.Fatalf("expected valid quoted plugin preserved, got %v", err)
+	}
+	if _, err := os.Stat(badJSONPlugin); err != nil {
+		t.Fatalf("expected invalid hooks.json plugin preserved conservatively, got %v", err)
+	}
+	if _, err := os.Stat(brokenQuotedDir); !os.IsNotExist(err) {
+		t.Fatalf("expected broken quoted plugin removed, got %v", err)
+	}
+
+	// Verify malformed config.json surfaces an error
+	if err := os.WriteFile(cfgPath, []byte(`{broken`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SanitizeHome(tmpHome); err == nil {
+		t.Fatal("expected error on invalid config.json")
+	}
+}
+
+func TestDetectAndScanTranscriptSliceForStaleHook_EdgeCases(t *testing.T) {
+	if m, _ := ScanTranscriptSliceForStaleHook("", 0); m {
+		t.Fatal("expected false for empty transcript path")
+	}
+	if m, _ := ScanTranscriptSliceForStaleHook(filepath.Join(t.TempDir(), "missing.jsonl"), 0); m {
+		t.Fatal("expected false for missing transcript file")
+	}
+
+	chdirOnly := `command failed: chdir /Users/romeo/.gemini/config/plugins/googlecloudtools.datacloud_telemetry: no such file or directory`
+	if m, p := DetectStalePluginHookFailure("", "   ", chdirOnly); !m || p != "googlecloudtools.datacloud_telemetry" {
+		t.Fatalf("expected chdir pattern match, got m=%v p=%q", m, p)
+	}
+
+	tp := filepath.Join(t.TempDir(), "transcript.jsonl")
+	nestedLine := `{"step_index":0,"type":"PLANNER_RESPONSE","nested":{"items":["ok","command failed: chdir /Users/romeo/.gemini/config/plugins/custom.plugin: no such file or directory"]}}` + "\n"
+	if err := os.WriteFile(tp, []byte(nestedLine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Negative startOffset and past-EOF startOffset both clamp/reset cleanly to 0
+	if m, p := ScanTranscriptSliceForStaleHook(tp, -10); !m || p != "custom.plugin" {
+		t.Fatalf("expected negative offset reset to detect custom.plugin, got m=%v p=%q", m, p)
+	}
+	if m, p := ScanTranscriptSliceForStaleHook(tp, 999999); !m || p != "custom.plugin" {
+		t.Fatalf("expected past-EOF offset reset to detect custom.plugin, got m=%v p=%q", m, p)
+	}
+
+	// Raw malformed JSONL line fallback
+	rawPath := filepath.Join(t.TempDir(), "raw.jsonl")
+	if err := os.WriteFile(rawPath, []byte("not-json\n"+chdirOnly+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if m, p := ScanTranscriptSliceForStaleHook(rawPath, 0); !m || p != "googlecloudtools.datacloud_telemetry" {
+		t.Fatalf("expected raw fallback match, got m=%v p=%q", m, p)
+	}
+
+	// Unreadable transcript path (directory instead of regular file)
+	if m, _ := ScanTranscriptSliceForStaleHook(t.TempDir(), 0); m {
+		t.Fatal("expected false when transcript path is a directory")
+	}
+
+	// Primary JSON hook regex without full chdir suffix line, plus whitespace-only inputs
+	hookQuoteOnly := `JSON hook "jsonhook__foo.bar_PreToolUse_0_0" failed: chdir /missing: no such file or directory`
+	if m, p := DetectStalePluginHookFailure("", "  ", hookQuoteOnly); !m || p != "foo.bar" {
+		t.Fatalf("expected foo.bar from primary hook regex, got m=%v p=%q", m, p)
+	}
+	if m, _ := DetectStalePluginHookFailure("", "   "); m {
+		t.Fatal("expected false for empty/whitespace texts")
+	}
+}
+
+func TestSanitizeHome_CreatesConfigWhenMissingAndEdgeBranches(t *testing.T) {
+	tmpHome := t.TempDir()
+	cfgDir := filepath.Join(tmpHome, ".gemini", "config")
+	pluginsDir := filepath.Join(cfgDir, "plugins")
+	dtDir := filepath.Join(pluginsDir, "googlecloudtools.datacloud_telemetry")
+	if err := os.MkdirAll(dtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-directory entry in plugins/, empty hooks.json command list, shell pipe/|| cutoffs,
+	// escaping relative path, bare relative .js path, and abs path inside pluginDir
+	if err := os.WriteFile(filepath.Join(pluginsDir, "README.txt"), []byte("keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	noCmdDir := filepath.Join(pluginsDir, "empty-cmds-plugin")
+	if err := os.MkdirAll(noCmdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(noCmdDir, "hooks.json"), []byte(`{"PreToolUse":[]}`), 0o644)
+
+	escapeDir := filepath.Join(pluginsDir, "escape-path-plugin")
+	_ = os.MkdirAll(escapeDir, 0o755)
+	_ = os.WriteFile(filepath.Join(escapeDir, "hooks.json"), []byte(`{"PreToolUse":[{"command":"node ../outside.js || echo ok"}]}`), 0o644)
+
+	pipeOkDir := filepath.Join(pluginsDir, "pipe-ok-plugin")
+	_ = os.MkdirAll(pipeOkDir, 0o755)
+	_ = os.WriteFile(filepath.Join(pipeOkDir, "run.js"), []byte("console.log(1);\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(pipeOkDir, "hooks.json"), []byte(`{"PreToolUse":[{"command":"node run.js | cat"}]}`), 0o644)
+
+	absBrokenDir := filepath.Join(pluginsDir, "abs-broken-plugin")
+	_ = os.MkdirAll(absBrokenDir, 0o755)
+	missingAbs := filepath.Join(absBrokenDir, "hooks", "missing.js")
+	_ = os.WriteFile(filepath.Join(absBrokenDir, "hooks.json"), []byte(`{"PreToolUse":[{"command":"node \"`+filepath.ToSlash(missingAbs)+`\""}]}`), 0o644)
+
+	// config.json does NOT exist initially -> SanitizeHome creates it with mode 0600 and datacloud_telemetry disabled
+	res, err := SanitizeHome(tmpHome)
+	if err != nil {
+		t.Fatalf("SanitizeHome error: %v", err)
+	}
+	if !res.Changed {
+		t.Fatal("expected Changed=true when creating missing config.json after removing datacloud_telemetry")
+	}
+	cfgPath := filepath.Join(cfgDir, "config.json")
+	cfgRaw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("expected created config.json, got err=%v", err)
+	}
+	if !strings.Contains(string(cfgRaw), `"enabled": false`) {
+		t.Fatalf("expected datacloud_telemetry enabled=false in created config.json, got:\n%s", string(cfgRaw))
+	}
+	if _, err := os.Stat(absBrokenDir); !os.IsNotExist(err) {
+		t.Fatalf("expected abs-broken-plugin removed, got %v", err)
+	}
+	if _, err := os.Stat(pipeOkDir); err != nil {
+		t.Fatalf("expected pipe-ok-plugin preserved, got %v", err)
+	}
+	if _, err := os.Stat(escapeDir); err != nil {
+		t.Fatalf("expected escape-path-plugin preserved, got %v", err)
+	}
+	if _, err := os.Stat(noCmdDir); err != nil {
+		t.Fatalf("expected empty-cmds-plugin preserved, got %v", err)
+	}
+
+	// Non-map plugin entry inside config.json plugins map is ignored without failing
+	_ = os.WriteFile(cfgPath, []byte(`{"plugins":{"nonMapValue":"ignored","googlecloudtools.datacloud_telemetry":{"enabled":false}}}`), 0o600)
+	res2, err := SanitizeHome(tmpHome)
+	if err != nil {
+		t.Fatalf("SanitizeHome with non-map plugin entry failed: %v", err)
+	}
+	if res2.Changed {
+		t.Fatalf("expected idempotent no-op, got %+v", res2)
+	}
+}
