@@ -778,3 +778,30 @@ func TestDiagnose_StalePluginHookDirAutoHealable(t *testing.T) {
 		t.Fatalf("expected AutoHealable SIR with category %s, got %+v", CodeStalePluginHook, rep.SIR)
 	}
 }
+
+func TestCheckASECompletion_RejectsDishonestDoneStory(t *testing.T) {
+	dir := t.TempDir()
+	storiesDir := filepath.Join(dir, "docs", "stories")
+	if err := os.MkdirAll(storiesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dishonestStory := "---\nid: STORY-IAZIO-0206\nstatus: DONE\nreview_scheme_scope: full\n---\n\n## Tasks\n- [x] Code done\n\n## Definition of Done\n- [ ] PR merged cleanly\n\n## 7. Reviews\n| # | Tool | Outcome | Artifact |\n|---|---|---|---|\n| 1 | opencode | _pending_ | _pending_ |\n"
+	if err := os.WriteFile(filepath.Join(storiesDir, "2026-11-14-iazio-0206.story.md"), []byte(dishonestStory), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunner := func(args ...string) (string, error) {
+		cmdStr := strings.Join(args, " ")
+		switch {
+		case strings.HasPrefix(cmdStr, "status --porcelain"):
+			return "", nil
+		case strings.HasPrefix(cmdStr, "rev-parse --abbrev-ref HEAD"):
+			return "main\n", nil
+		default:
+			return "", nil
+		}
+	}
+	complete, _, _ := CheckASECompletion(dir, "STORY-IAZIO-0206", gitRunner)
+	if complete {
+		t.Fatalf("expected CheckASECompletion=false when story has status: DONE with unchecked DoD and _pending_ reviews")
+	}
+}

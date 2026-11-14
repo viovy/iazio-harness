@@ -2622,3 +2622,139 @@ exit 0
 	})
 }
 
+func TestStoryIazio0206_MultiTurnCraftSummaryAndTranscriptDelta(t *testing.T) {
+	// 1. BuildConcisePromptSummary must extract only the terminal CRAFT Closeout block, dropping Turn-1 wait chatter.
+	rawOut := "Turn 1: Launched autopilot-git-flow land; waiting for CI checks...\n[agy step #12] thinking: still waiting for PR merge\n"
+	rawTranscript := "[2026-11-14T10:00:00Z] [agy step #1] output: Launched autopilot-git-flow land; waiting for CI.\n" +
+		"[2026-11-14T10:15:00Z] [agy step #20] output: ## CRAFT Closeout\nAll PRs merged cleanly on main and autopilot-git-flow assert passed.\n"
+	summary := BuildConcisePromptSummary(rawOut, rawTranscript, "", nil)
+	if !strings.Contains(summary, "## CRAFT Closeout") || !strings.Contains(summary, "All PRs merged") {
+		t.Fatalf("expected terminal CRAFT Closeout in summary, got %q", summary)
+	}
+	if strings.Contains(strings.ToLower(summary), "waiting for ci") {
+		t.Fatalf("expected Turn-1 waiting prose not to leak into terminal CRAFT summary, got %q", summary)
+	}
+
+	// 2. summarizeStepOutput must preserve ## CRAFT Closeout heading when output follows ## Discard Log.
+	longStepText := "## Discard Log\n- Skipped idea A\n\n## CRAFT Closeout\nAutonomous story execution is complete; autopilot-git-flow assert passed."
+	delta := summarizeStepOutput(longStepText, 360)
+	if !strings.Contains(delta, "## CRAFT Closeout") {
+		t.Fatalf("expected summarizeStepOutput to preserve ## CRAFT Closeout after ## Discard Log, got %q", delta)
+	}
+}
+
+func TestStoryIazio0206_MultiRepoASEGateAndTelemetry(t *testing.T) {
+	t.Setenv("IAZIO_BRAIN_DIR", filepath.Join(t.TempDir(), ".gemini", "antigravity-cli", "brain"))
+	base := t.TempDir()
+	runGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v in %s failed: %v: %s", args, dir, err, string(out))
+		}
+	}
+	initPushRepo := func(name string) (string, string) {
+		bare := filepath.Join(base, name+".git")
+		if out, err := exec.Command("git", "init", "--bare", "-b", "main", bare).CombinedOutput(); err != nil {
+			t.Fatalf("git init bare %s: %v: %s", name, err, string(out))
+		}
+		dir := filepath.Join(base, name)
+		_ = os.MkdirAll(dir, 0o755)
+		runGit(dir, "init", "-b", "main")
+		runGit(dir, "config", "user.email", "test@example.com")
+		runGit(dir, "config", "user.name", "Test")
+		runGit(dir, "remote", "add", "origin", bare)
+		_ = os.WriteFile(filepath.Join(dir, "README.md"), []byte(name+"\n"), 0o644)
+		runGit(dir, "add", ".")
+		runGit(dir, "commit", "-m", "init "+name)
+		runGit(dir, "push", "-u", "origin", "main")
+		return dir, bare
+	}
+
+	spDir, _ := initPushRepo("meta-repo")
+	_, leafBare := initPushRepo("iazio-mcp")
+	_, hubBare := initPushRepo("iazio-infra")
+	if out, err := exec.Command("git", "-c", "protocol.file.allow=always", "-C", spDir, "submodule", "add", leafBare, "iazio-mcp").CombinedOutput(); err != nil {
+		t.Fatalf("submodule add iazio-mcp: %v: %s", err, string(out))
+	}
+	if out, err := exec.Command("git", "-c", "protocol.file.allow=always", "-C", spDir, "submodule", "add", hubBare, "iazio-infra").CombinedOutput(); err != nil {
+		t.Fatalf("submodule add iazio-infra: %v: %s", err, string(out))
+	}
+	leafDir := filepath.Join(spDir, "iazio-mcp")
+	hubDir := filepath.Join(spDir, "iazio-infra")
+	runGit(leafDir, "checkout", "main")
+	runGit(hubDir, "checkout", "main")
+
+	// Start with dishonest DONE in story (unchecked DoD + _pending_ Reviews) while superproject is also on feature branch.
+	dishonestStory := "---\nid: STORY-GOV-5282\nstatus: DONE\nreview_scheme_scope: full\nsubmodules:\n  - iazio-mcp\n  - iazio-infra\n---\n\n## Tasks\n- [x] Implemented\n\n## Definition of Done\n- [ ] PR merged\n\n## 7. Reviews\n| # | Tool | Outcome | Artifact |\n|---|---|---|---|\n| 1 | opencode | _pending_ | _pending_ |\n"
+	_ = os.MkdirAll(filepath.Join(spDir, "docs", "stories"), 0o755)
+	_ = os.WriteFile(filepath.Join(spDir, "docs", "stories", "2026-11-14-gov-5282.story.md"), []byte(dishonestStory), 0o644)
+	_ = os.MkdirAll(filepath.Join(hubDir, "docs", "stories"), 0o755)
+	_ = os.WriteFile(filepath.Join(hubDir, "docs", "stories", "2026-11-14-gov-5282.story.md"), []byte(dishonestStory), 0o644)
+	runGit(hubDir, "add", ".")
+	runGit(hubDir, "commit", "-m", "dishonest hub story")
+	runGit(hubDir, "push", "origin", "main")
+	runGit(spDir, "checkout", "-b", "feat/gov-5282")
+	runGit(spDir, "add", ".")
+	runGit(spDir, "commit", "-m", "dishonest root story")
+	runGit(spDir, "push", "-u", "origin", "feat/gov-5282")
+
+	mockBin := filepath.Join(t.TempDir(), "mock-agy")
+	script := "#!/bin/sh\necho \"Created conversation conv-0206-multi-1\"\necho \"## CRAFT Closeout\"\necho \"Autonomous story execution is complete for STORY-GOV-5282.\"\nexit 0\n"
+	if err := os.WriteFile(mockBin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	zeroResumes := 0
+	runner := NewPromptRunner("autopilot")
+	runner.GracePeriod = 50 * time.Millisecond
+	resFail, errFail := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:              "prompt_0206_fail",
+		JobID:                 "job_0206_fail",
+		Repo:                  "meta-repo",
+		StoryID:               "STORY-GOV-5282",
+		Prompt:                "/autonomous-story-execution STORY-GOV-5282",
+		TargetAgent:           mockBin,
+		WorkingDir:            leafDir,
+		Timeout:               10 * time.Second,
+		MaxAutoResumeAttempts: &zeroResumes,
+	})
+	if errFail == nil || resFail.Status != "failed" || resFail.FailureCategory != "ASE_GATE_INCOMPLETE" {
+		t.Fatalf("expected ASE_GATE_INCOMPLETE for dishonest story + unmerged superproject, got err=%v status=%s cat=%s", errFail, resFail.Status, resFail.FailureCategory)
+	}
+	if resFail.ASEComplete || resFail.ASEGateStatus["story_done"] || resFail.ASEGateStatus["branch_clean"] {
+		t.Fatalf("expected ASEComplete=false and failed story_done/branch_clean in ASEGateStatus, got complete=%v gates=%+v", resFail.ASEComplete, resFail.ASEGateStatus)
+	}
+
+	// Fix story copies cleanly, settle superproject onto main, push everything -> must pass with ASEComplete=true and 6/6 gates true.
+	honestStory := "---\nid: STORY-GOV-5282\nstatus: DONE\nreview_scheme_scope: full\nsubmodules:\n  - iazio-mcp\n  - iazio-infra\n---\n\n## Tasks\n- [x] Implemented\n\n## Definition of Done\n- [x] PR merged\n\n## 7. Reviews\n| # | Tool | Outcome | Artifact |\n|---|---|---|---|\n| 1 | opencode | CLEAN | docs/reviews/2026-11-14-gov-5282-opencode.md |\n| 2 | agy | CLEAN | docs/reviews/2026-11-14-gov-5282-agy.md |\n"
+	_ = os.WriteFile(filepath.Join(hubDir, "docs", "stories", "2026-11-14-gov-5282.story.md"), []byte(honestStory), 0o644)
+	runGit(hubDir, "add", ".")
+	runGit(hubDir, "commit", "-m", "honest hub story")
+	runGit(hubDir, "push", "origin", "main")
+	runGit(spDir, "checkout", "main")
+	_ = os.WriteFile(filepath.Join(spDir, "docs", "stories", "2026-11-14-gov-5282.story.md"), []byte(honestStory), 0o644)
+	runGit(spDir, "add", ".")
+	runGit(spDir, "commit", "-m", "honest root story + hub pointer")
+	runGit(spDir, "push", "origin", "main")
+
+	resOK, errOK := runner.RunPrompt(context.Background(), RunPromptOptions{
+		PromptID:              "prompt_0206_ok",
+		JobID:                 "job_0206_ok",
+		Repo:                  "meta-repo",
+		StoryID:               "STORY-GOV-5282",
+		Prompt:                "/autonomous-story-execution STORY-GOV-5282",
+		TargetAgent:           mockBin,
+		WorkingDir:            leafDir,
+		Timeout:               10 * time.Second,
+		MaxAutoResumeAttempts: &zeroResumes,
+	})
+	if errOK != nil || resOK.Status != "completed" || !resOK.ASEComplete {
+		t.Fatalf("expected completed with ASEComplete=true when all scoped repos & stories are honest, got err=%v status=%s complete=%v gates=%+v", errOK, resOK.Status, resOK.ASEComplete, resOK.ASEGateStatus)
+	}
+	for _, k := range []string{"git_clean", "branch_clean", "submodules_clean", "tests_passed", "release_verified", "story_done"} {
+		if !resOK.ASEGateStatus[k] {
+			t.Fatalf("expected gate %q=true, got %+v", k, resOK.ASEGateStatus)
+		}
+	}
+}
+

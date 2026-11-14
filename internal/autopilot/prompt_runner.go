@@ -23,6 +23,7 @@ import (
 
 	"github.com/viovy/iazio-core/pkg/procutil"
 	"github.com/viovy/iazio-harness/internal/agyhooks"
+	asegate "github.com/viovy/iazio-harness/internal/ase/gate"
 	"github.com/viovy/iazio-harness/internal/auth"
 	"github.com/viovy/iazio-harness/internal/controlplane"
 	"github.com/viovy/iazio-harness/internal/engines"
@@ -264,12 +265,14 @@ type PromptResult struct {
 	ExitCode             int      `json:"exit_code"`
 	PreGitHeadSHA        string   `json:"pre_git_head_sha,omitempty"`
 	PreGitTreeSHA        string   `json:"pre_git_tree_sha,omitempty"`
-	GitHeadSHA           string   `json:"git_head_sha"`
-	GitTreeSHA           string   `json:"git_tree_sha"`
-	ModifiedFiles        []string `json:"modified_files"`
-	Summary              string   `json:"summary"`
-	Output               string   `json:"output,omitempty"`
-	DurationMs           int64    `json:"duration_ms"`
+	GitHeadSHA           string          `json:"git_head_sha"`
+	GitTreeSHA           string          `json:"git_tree_sha"`
+	ModifiedFiles        []string        `json:"modified_files"`
+	Summary              string          `json:"summary"`
+	Output               string          `json:"output,omitempty"`
+	DurationMs           int64           `json:"duration_ms"`
+	ASEComplete          bool            `json:"ase_complete"`
+	ASEGateStatus        map[string]bool `json:"ase_gate_status,omitempty"`
 }
 
 // MaxPromptSummaryChars is the maximum length of PromptResult.Summary (AC3: <= 500 chars).
@@ -322,9 +325,56 @@ func extractCraftOrTerminalHeadline(sources ...string) string {
 	return headline
 }
 
+// extractLastCraftCloseoutBlock extracts only the terminal CRAFT Closeout markdown section
+// (when followed by substantive non-empty lines) so intermediate multi-turn "waiting for..."
+// progress messages are never stitched into the executive summary.
+func extractLastCraftCloseoutBlock(sources ...string) string {
+	var best string
+	for _, src := range sources {
+		if strings.TrimSpace(src) == "" {
+			continue
+		}
+		lines := strings.Split(src, "\n")
+		lastIdx := -1
+		for i, rawLine := range lines {
+			trimmed := strings.TrimSpace(strings.TrimRight(rawLine, "\r"))
+			if m := agyStepOutputPrefixRegex.FindStringSubmatch(trimmed); len(m) > 1 {
+				trimmed = strings.TrimSpace(m[1])
+			}
+			lower := strings.ToLower(trimmed)
+			if strings.HasPrefix(lower, "## craft closeout") || strings.HasPrefix(lower, "# craft closeout") {
+				lastIdx = i
+			}
+		}
+		if lastIdx < 0 {
+			continue
+		}
+		var block []string
+		hasBody := false
+		for i := lastIdx; i < len(lines) && len(block) < 12; i++ {
+			trimmed := strings.TrimRight(lines[i], "\r")
+			if m := agyStepOutputPrefixRegex.FindStringSubmatch(strings.TrimSpace(trimmed)); len(m) > 1 {
+				trimmed = strings.TrimSpace(m[1])
+			}
+			t := strings.TrimSpace(trimmed)
+			if t == "" || strings.Contains(t, "[agy step #") || strings.Contains(t, "[ASE-SUPERVISOR]") {
+				continue
+			}
+			if i > lastIdx {
+				hasBody = true
+			}
+			block = append(block, t)
+		}
+		if hasBody && len(block) > 1 {
+			best = strings.Join(block, "\n")
+		}
+	}
+	return best
+}
+
 // BuildConcisePromptSummary builds a concise executive summary (<=500 chars)
 // stripped of [agy step #...] trace lines and [ASE-SUPERVISOR] log lines,
-// prioritizing CRAFT closeout headlines or terminal status lines rather than duplicating output.
+// prioritizing the terminal CRAFT closeout block rather than stitching earlier multi-turn waits.
 func BuildConcisePromptSummary(rawOut, rawTranscript, rawErr string, waitErr error) string {
 	filterCleanLines := func(s string) string {
 		if strings.TrimSpace(s) == "" {
@@ -342,6 +392,14 @@ func BuildConcisePromptSummary(rawOut, rawTranscript, rawErr string, waitErr err
 			kept = append(kept, trimmed)
 		}
 		return strings.TrimSpace(strings.Join(kept, "\n"))
+	}
+
+	if terminalCraft := extractLastCraftCloseoutBlock(rawOut, rawTranscript); terminalCraft != "" {
+		summary := redact.Egress(strings.TrimSpace(terminalCraft))
+		if len(summary) > MaxPromptSummaryChars {
+			summary = strings.TrimSpace(summary[:MaxPromptSummaryChars-3]) + "..."
+		}
+		return summary
 	}
 
 	var lastStepOutput string
@@ -755,6 +813,49 @@ func firstNonEmptyLine(s string, maxLen int) string {
 	return ""
 }
 
+func summarizeStepOutput(s string, maxLen int) string {
+	first := ""
+	craftHeading := ""
+	craftDetail := ""
+	lines := strings.Split(s, "\n")
+	for i, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		if first == "" {
+			first = trimmed
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "## craft closeout") || strings.HasPrefix(lower, "# craft closeout") {
+			craftHeading = trimmed
+			for j := i + 1; j < len(lines); j++ {
+				cand := strings.TrimSpace(lines[j])
+				if cand != "" && !strings.HasPrefix(cand, "#") {
+					craftDetail = cand
+					break
+				}
+			}
+		}
+	}
+	out := first
+	if craftHeading != "" {
+		craftSummary := craftHeading
+		if craftDetail != "" {
+			craftSummary += " — " + craftDetail
+		}
+		if first != "" && first != craftHeading {
+			out = first + " | " + craftSummary
+		} else {
+			out = craftSummary
+		}
+	}
+	if len(out) > maxLen && maxLen > 3 {
+		return out[:maxLen-3] + "..."
+	}
+	return out
+}
+
 func tailBrainTranscriptSteps(convID string, seenSteps map[int]bool) string {
 	if strings.TrimSpace(convID) == "" || !sessionstore.IsValidConversationID(convID) {
 		return ""
@@ -812,7 +913,7 @@ func tailBrainTranscriptSteps(convID string, seenSteps map[int]bool) string {
 				sb.WriteString(fmt.Sprintf("[%s] [agy step #%d] tool %s\n", ts, step.StepIndex, tc.Name))
 			}
 		}
-		if contentLine := firstNonEmptyLine(step.Content, 240); contentLine != "" {
+		if contentLine := summarizeStepOutput(step.Content, 360); contentLine != "" {
 			sb.WriteString(fmt.Sprintf("[%s] [agy step #%d] output: %s\n", ts, step.StepIndex, redact.Egress(contentLine)))
 		}
 	}
@@ -966,175 +1067,105 @@ func hasPrintTimeoutLog(logPath, stdoutText, stderrText string) bool {
 	return false
 }
 
-func storyFrontmatterStatus(workingDir, storyID string) (found bool, status string) {
-	targetSID := strings.TrimSpace(storyID)
-	if strings.TrimSpace(workingDir) == "" || targetSID == "" {
-		return false, ""
+func inspectStoryHonestySplit(workingDir, spRoot, storyID string) (wtRep asegate.StoryHonestyReport, externalFiles []asegate.StoryMarkdownMetadata, externalAllHonest bool, externalIncomplete bool) {
+	wtRep = asegate.InspectStoryHonesty([]string{workingDir}, storyID)
+	spClean := strings.TrimSpace(spRoot)
+	if spClean == "" {
+		return wtRep, nil, false, false
 	}
-	storyGlobs := []string{
-		filepath.Join(workingDir, "docs", "stories", "*.story.md"),
-		filepath.Join(workingDir, "*", "docs", "stories", "*.story.md"),
+	wtStoriesDir := filepath.Clean(filepath.Join(workingDir, "docs", "stories"))
+	if abs, err := filepath.Abs(wtStoriesDir); err == nil {
+		wtStoriesDir = abs
 	}
-	for _, pattern := range storyGlobs {
-		matches, err := filepath.Glob(pattern)
-		if err != nil {
+	if eval, err := filepath.EvalSymlinks(wtStoriesDir); err == nil {
+		wtStoriesDir = eval
+	}
+	spRep := asegate.InspectStoryHonesty([]string{spClean}, storyID)
+	externalAllHonest = true
+	for _, f := range spRep.Files {
+		fDir := filepath.Clean(filepath.Dir(f.FilePath))
+		if fDir == wtStoriesDir {
 			continue
 		}
-		for _, mPath := range matches {
-			b, errR := os.ReadFile(mPath)
-			if errR != nil {
-				continue
-			}
-			content := string(b)
-			lines := strings.Split(content, "\n")
-			inFrontmatter := false
-			var fmID, fmStatus string
-			for idx, rawLine := range lines {
-				trimmed := strings.TrimSpace(rawLine)
-				if idx == 0 && trimmed == "---" {
-					inFrontmatter = true
-					continue
-				}
-				if inFrontmatter && trimmed == "---" {
-					break
-				}
-				if inFrontmatter || idx < 25 {
-					if strings.HasPrefix(trimmed, "id:") && fmID == "" {
-						fmID = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "id:")), `"'`)
-					} else if strings.HasPrefix(trimmed, "status:") && fmStatus == "" {
-						fmStatus = strings.ToUpper(strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "status:")), `"'`))
-					}
-				}
-			}
-			idMatched := strings.EqualFold(fmID, targetSID) ||
-				(fmID == "" && strings.Contains(strings.ToUpper(filepath.Base(mPath)), strings.ToUpper(targetSID)))
-			if !idMatched {
-				continue
-			}
-			return true, fmStatus
+		externalFiles = append(externalFiles, f)
+		if !f.HonestDone {
+			externalAllHonest = false
+			externalIncomplete = true
 		}
 	}
-	return false, ""
+	if len(externalFiles) == 0 {
+		externalAllHonest = false
+	}
+	return wtRep, externalFiles, externalAllHonest, externalIncomplete
+}
+
+func storyFrontmatterStatus(workingDir, storyID string) (found bool, status string) {
+	rep := asegate.InspectStoryHonesty([]string{workingDir}, storyID)
+	if !rep.Found || len(rep.Files) == 0 {
+		return false, ""
+	}
+	return true, rep.Files[0].Status
 }
 
 func isStoryIncompleteInWorktree(workingDir, storyID string) bool {
-	found, fmStatus := storyFrontmatterStatus(workingDir, storyID)
-	if !found {
-		return false
-	}
-	return fmStatus == "IN_PROGRESS" || fmStatus == "READY" || fmStatus == "TODO" || fmStatus == "BLOCKED"
+	rep := asegate.InspectStoryHonesty([]string{workingDir}, storyID)
+	return rep.Found && !rep.AllHonestDone
 }
 
 func isStoryDoneInWorktree(workingDir, storyID string) bool {
-	found, fmStatus := storyFrontmatterStatus(workingDir, storyID)
-	if !found {
-		return false
-	}
-	return fmStatus == "DONE" || fmStatus == "COMPLETED" || fmStatus == "COMPLETE"
+	rep := asegate.InspectStoryHonesty([]string{workingDir}, storyID)
+	return rep.Found && rep.AllHonestDone
 }
 
 func resolveSuperprojectRoot(dir, gitBin string) string {
-	if dir == "" {
-		return ""
-	}
-	if gitBin == "" {
-		gitBin = "git"
-	}
-	cmd := procutil.Command(gitBin, "rev-parse", "--show-superproject-working-tree")
-	cmd.Dir = dir
-	if out, err := cmd.Output(); err == nil {
-		sp := strings.TrimSpace(string(out))
-		if sp != "" {
-			return sp
-		}
-	}
-	// Only use .gitmodules ancestor walk if dir/.git is a gitlink file (submodule),
-	// avoiding false positives for standalone repos located in child/temporary directories.
-	gitPath := filepath.Join(dir, ".git")
-	gitEntry, err := os.Stat(gitPath)
-	if err == nil && !gitEntry.IsDir() {
-		parent := filepath.Dir(filepath.Clean(dir))
-		for parent != "" && parent != "/" && parent != "." {
-			if _, err := os.Stat(filepath.Join(parent, ".gitmodules")); err == nil {
-				return parent
-			}
-			newParent := filepath.Dir(parent)
-			if newParent == parent {
-				break
-			}
-			parent = newParent
-		}
-	}
-	return ""
+	return asegate.ResolveSuperprojectRoot(dir, gitBin)
 }
 
 func countUnpushedCommits(dir, gitBin string) (int, error) {
-	if dir == "" {
-		return 0, nil
-	}
-	if gitBin == "" {
-		gitBin = "git"
-	}
-	cmdRemote := procutil.Command(gitBin, "remote")
-	cmdRemote.Dir = dir
-	remoteOut, remoteErr := cmdRemote.Output()
-	if remoteErr != nil {
-		return 0, fmt.Errorf("git remote check failed in %s: %w", dir, remoteErr)
-	}
-	if strings.TrimSpace(string(remoteOut)) == "" {
-		if os.Getenv("IAZIO_TEST_SKIP_REMOTE") == "1" {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("no git remotes configured in %s", dir)
-	}
-	cmdUpstream := procutil.Command(gitBin, "rev-list", "--count", "@{u}..HEAD")
-	cmdUpstream.Dir = dir
-	if out, err := cmdUpstream.Output(); err == nil {
-		if c, cErr := strconv.Atoi(strings.TrimSpace(string(out))); cErr == nil {
-			return c, nil
-		}
-	}
-	cmdOriginMain := procutil.Command(gitBin, "rev-list", "--count", "origin/main..HEAD")
-	cmdOriginMain.Dir = dir
-	if out, err := cmdOriginMain.Output(); err == nil {
-		if c, cErr := strconv.Atoi(strings.TrimSpace(string(out))); cErr == nil {
-			return c, nil
-		}
-	}
-	cmdOriginMaster := procutil.Command(gitBin, "rev-list", "--count", "origin/master..HEAD")
-	cmdOriginMaster.Dir = dir
-	if out, err := cmdOriginMaster.Output(); err == nil {
-		if c, cErr := strconv.Atoi(strings.TrimSpace(string(out))); cErr == nil {
-			return c, nil
-		}
-	}
-	return 0, fmt.Errorf("no upstream tracking ref or remote origin branch found in %s", dir)
+	return asegate.CountUnpushedCommits(dir, gitBin)
 }
 
 func isStoryDoneAnywhere(workingDir, superprojectRoot, storyID string) bool {
-	if isStoryDoneInWorktree(workingDir, storyID) {
-		return true
+	wtRep, extFiles, extAllHonest, extIncomplete := inspectStoryHonestySplit(workingDir, superprojectRoot, storyID)
+	if extIncomplete {
+		return false
 	}
-	if superprojectRoot != "" && isStoryDoneInWorktree(superprojectRoot, storyID) {
-		return true
+	if !wtRep.Found && len(extFiles) == 0 {
+		return false
 	}
-	return false
+	// Dishonest DONE copy in workingDir always blocks completion even if superproject looks clean.
+	for _, f := range wtRep.Files {
+		if len(f.DishonestReasons) > 0 {
+			return false
+		}
+	}
+	if len(extFiles) > 0 && extAllHonest {
+		onNonMain, _ := asegate.IsNonMainBranch(workingDir, "git")
+		if !onNonMain {
+			return true
+		}
+	}
+	return wtRep.Found && wtRep.AllHonestDone
 }
 
 func isStoryIncompleteAnywhere(workingDir, superprojectRoot, storyID string) bool {
-	if superprojectRoot != "" && isStoryDoneInWorktree(superprojectRoot, storyID) && !isStoryIncompleteInWorktree(superprojectRoot, storyID) {
-		onNonMain, _ := isNonMainWorktreeBranch(workingDir, "git")
+	wtRep, extFiles, extAllHonest, extIncomplete := inspectStoryHonestySplit(workingDir, superprojectRoot, storyID)
+	if extIncomplete {
+		return true
+	}
+	for _, f := range wtRep.Files {
+		if len(f.DishonestReasons) > 0 {
+			return true
+		}
+	}
+	// Preserve authoritative superproject DONE when a standalone leaf submodule copy on main has stale IN_PROGRESS.
+	if len(extFiles) > 0 && extAllHonest {
+		onNonMain, _ := asegate.IsNonMainBranch(workingDir, "git")
 		if !onNonMain {
 			return false
 		}
 	}
-	if isStoryIncompleteInWorktree(workingDir, storyID) {
-		return true
-	}
-	if superprojectRoot != "" && isStoryIncompleteInWorktree(superprojectRoot, storyID) {
-		return true
-	}
-	return false
+	return wtRep.Found && !wtRep.AllHonestDone
 }
 
 func isEphemeralHarnessFile(relPath string) bool {
@@ -1162,14 +1193,39 @@ func filterNonEphemeralModified(modified []string) []string {
 	return out
 }
 
-func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gitBin string) bool {
-	if strings.TrimSpace(workingDir) == "" {
-		return false
+type aseMultiRepoReport struct {
+	Complete              bool
+	HasCompletionEvidence bool
+	StoryDone             bool
+	StoryIncomplete       bool
+	GitClean              bool
+	BranchClean           bool
+	SubmodulesClean       bool
+	AnyNonMainBranch      bool
+	FirstNonMainBranch    string
+	BranchSummary         string
+	DirtyFiles            []string
+	UnpushedTotal         int
+	UnpushedProbeErr      error
+	SubmoduleReason       string
+	UnmetReasons          []string
+	StoryReport           asegate.StoryHonestyReport
+	RepoDirs              []string
+}
+
+func evaluateMultiRepoASEGates(workingDir, primaryStoryID, combinedOutput, gitBin string) aseMultiRepoReport {
+	rep := aseMultiRepoReport{
+		GitClean:        true,
+		BranchClean:     true,
+		SubmodulesClean: true,
 	}
-	if gitBin == "" {
+	if strings.TrimSpace(workingDir) == "" {
+		return rep
+	}
+	if strings.TrimSpace(gitBin) == "" {
 		gitBin = "git"
 	}
-	spRoot := resolveSuperprojectRoot(workingDir, gitBin)
+	spRoot := asegate.ResolveSuperprojectRoot(workingDir, gitBin)
 
 	var candidateStories []string
 	seenStory := make(map[string]bool)
@@ -1181,14 +1237,16 @@ func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gi
 		}
 	}
 	addStory(primaryStoryID)
-	primaryFoundInWorktree := false
-	if strings.TrimSpace(primaryStoryID) != "" {
-		primaryFoundInWorktree, _ = storyFrontmatterStatus(workingDir, primaryStoryID)
-		if !primaryFoundInWorktree && spRoot != "" {
-			primaryFoundInWorktree, _ = storyFrontmatterStatus(spRoot, primaryStoryID)
-		}
+
+	var inspectDirs []string
+	inspectDirs = append(inspectDirs, workingDir)
+	if spRoot != "" {
+		inspectDirs = append(inspectDirs, spRoot)
 	}
-	if !primaryFoundInWorktree {
+	if strings.TrimSpace(primaryStoryID) != "" {
+		rep.StoryReport = asegate.InspectStoryHonesty(inspectDirs, primaryStoryID)
+	}
+	if !rep.StoryReport.Found {
 		for _, m := range storyIDRegex.FindAllStringSubmatch(combinedOutput, -1) {
 			if len(m) > 1 {
 				addStory(m[1])
@@ -1196,57 +1254,122 @@ func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gi
 		}
 	}
 
-	for _, sid := range candidateStories {
-		if isStoryIncompleteAnywhere(workingDir, spRoot, sid) {
-			return false
+	seenSub := make(map[string]bool)
+	var scopedSubmodules []string
+	for _, s := range rep.StoryReport.Submodules {
+		if !seenSub[s] {
+			seenSub[s] = true
+			scopedSubmodules = append(scopedSubmodules, s)
 		}
 	}
+	for _, sid := range candidateStories {
+		if isStoryIncompleteAnywhere(workingDir, spRoot, sid) {
+			rep.StoryIncomplete = true
+		}
+		if sid != strings.ToUpper(strings.TrimSpace(primaryStoryID)) {
+			cRep := asegate.InspectStoryHonesty(inspectDirs, sid)
+			for _, s := range cRep.Submodules {
+				if !seenSub[s] {
+					seenSub[s] = true
+					scopedSubmodules = append(scopedSubmodules, s)
+				}
+			}
+			for _, r := range cRep.Reasons {
+				rep.UnmetReasons = append(rep.UnmetReasons, r)
+			}
+		}
+	}
+	rep.UnmetReasons = append(rep.UnmetReasons, rep.StoryReport.Reasons...)
 
-	hasCompletionEvidence := false
-	if strings.TrimSpace(primaryStoryID) != "" && isStoryDoneAnywhere(workingDir, spRoot, primaryStoryID) {
-		hasCompletionEvidence = true
-	} else if aseCompletionRegex.MatchString(combinedOutput) {
-		if len(candidateStories) == 0 {
-			hasCompletionEvidence = true
+	if !rep.StoryIncomplete {
+		if strings.TrimSpace(primaryStoryID) != "" && isStoryDoneAnywhere(workingDir, spRoot, primaryStoryID) {
+			rep.StoryDone = true
+			rep.HasCompletionEvidence = true
 		} else {
 			for _, sid := range candidateStories {
 				if isStoryDoneAnywhere(workingDir, spRoot, sid) {
-					hasCompletionEvidence = true
+					rep.StoryDone = true
+					rep.HasCompletionEvidence = true
 					break
 				}
 			}
-			if !hasCompletionEvidence {
-				if strings.TrimSpace(primaryStoryID) == "" {
-					hasCompletionEvidence = true
-				} else if found, _ := storyFrontmatterStatus(workingDir, primaryStoryID); !found {
-					if spRoot != "" {
-						if spFound, _ := storyFrontmatterStatus(spRoot, primaryStoryID); !spFound {
-							hasCompletionEvidence = true
+			if !rep.HasCompletionEvidence && aseCompletionRegex.MatchString(combinedOutput) {
+				if len(candidateStories) == 0 || !rep.StoryReport.Found {
+					allMissing := true
+					for _, sid := range candidateStories {
+						if r := asegate.InspectStoryHonesty(inspectDirs, sid); r.Found {
+							allMissing = false
+							break
 						}
-					} else {
-						hasCompletionEvidence = true
+					}
+					if allMissing {
+						rep.HasCompletionEvidence = true
 					}
 				}
 			}
 		}
 	}
-	if !hasCompletionEvidence {
-		return false
+
+	rep.RepoDirs = asegate.ResolveScopedRepoDirs(workingDir, spRoot, scopedSubmodules)
+	if len(rep.RepoDirs) == 0 {
+		rep.RepoDirs = []string{workingDir}
 	}
 
-	_, _, rawModified := captureGitSnapshot(workingDir, gitBin)
-	dirtyFiles := filterNonEphemeralModified(rawModified)
-	if len(dirtyFiles) > 0 {
-		return false
+	var branchNotes []string
+	for _, repoDir := range rep.RepoDirs {
+		repoLabel := filepath.Base(repoDir)
+		_, _, rawModified := captureGitSnapshot(repoDir, gitBin)
+		dirty := filterNonEphemeralModified(rawModified)
+		if len(dirty) > 0 {
+			rep.GitClean = false
+			for _, f := range dirty {
+				if filepath.Clean(repoDir) == filepath.Clean(workingDir) {
+					rep.DirtyFiles = append(rep.DirtyFiles, f)
+				} else {
+					rep.DirtyFiles = append(rep.DirtyFiles, repoLabel+"/"+f)
+				}
+			}
+			rep.UnmetReasons = append(rep.UnmetReasons, fmt.Sprintf("dirty_worktree(%s:%d)", repoLabel, len(dirty)))
+		}
+		if onNonMain, br := asegate.IsNonMainBranch(repoDir, gitBin); onNonMain {
+			rep.BranchClean = false
+			rep.AnyNonMainBranch = true
+			label := fmt.Sprintf("%s@%s", repoLabel, br)
+			branchNotes = append(branchNotes, label)
+			if rep.FirstNonMainBranch == "" {
+				rep.FirstNonMainBranch = label
+			}
+			rep.UnmetReasons = append(rep.UnmetReasons, fmt.Sprintf("unmerged_branch(%s:%s)", repoLabel, br))
+		} else if br != "" {
+			branchNotes = append(branchNotes, fmt.Sprintf("%s@%s", repoLabel, br))
+		}
+		unpushed, uErr := asegate.CountUnpushedCommits(repoDir, gitBin)
+		if uErr != nil {
+			rep.BranchClean = false
+			if rep.UnpushedProbeErr == nil {
+				rep.UnpushedProbeErr = fmt.Errorf("%s: %w", repoLabel, uErr)
+			}
+			rep.UnmetReasons = append(rep.UnmetReasons, fmt.Sprintf("unpushed_probe_failed(%s)", repoLabel))
+		} else if unpushed > 0 {
+			rep.BranchClean = false
+			rep.UnpushedTotal += unpushed
+			rep.UnmetReasons = append(rep.UnmetReasons, fmt.Sprintf("unpushed_commits(%s:%d)", repoLabel, unpushed))
+		}
+		if subOK, subReason := asegate.CheckSubmodulesClean(repoDir, gitBin, scopedSubmodules); !subOK {
+			rep.SubmodulesClean = false
+			if rep.SubmoduleReason == "" {
+				rep.SubmoduleReason = subReason
+			}
+			rep.UnmetReasons = append(rep.UnmetReasons, subReason)
+		}
 	}
-	if onNonMain, _ := isNonMainWorktreeBranch(workingDir, gitBin); onNonMain {
-		return false
-	}
-	unpushed, unpushedErr := countUnpushedCommits(workingDir, gitBin)
-	if unpushedErr != nil || unpushed > 0 {
-		return false
-	}
-	return true
+	rep.BranchSummary = strings.Join(branchNotes, ", ")
+	rep.Complete = !rep.StoryIncomplete && rep.HasCompletionEvidence && rep.GitClean && rep.BranchClean && rep.SubmodulesClean
+	return rep
+}
+
+func isASEFlowCompletedInWorktree(workingDir, primaryStoryID, combinedOutput, gitBin string) bool {
+	return evaluateMultiRepoASEGates(workingDir, primaryStoryID, combinedOutput, gitBin).Complete
 }
 
 var sdlcChildTokens = []string{
@@ -2515,7 +2638,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 					maxAutoResumes = defaultASEMaxAutoResumeAttempts
 				}
 			}
-			if !lastTurnStaleHook && !hasHeadlessPermissionDenial(rawStdStreams) && isASEFlowCompletedInWorktree(opts.WorkingDir, curStory, rawCombined, gitBin) {
+			loopGateRep := evaluateMultiRepoASEGates(opts.WorkingDir, curStory, rawCombined, gitBin)
+			if !lastTurnStaleHook && !hasHeadlessPermissionDenial(rawStdStreams) && loopGateRep.Complete {
 				execStatus = "completed"
 				exitCode = 0
 				waitErr = nil
@@ -2523,14 +2647,17 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 				printTimedOut = false
 				break
 			}
-			_, _, curModified := captureGitSnapshot(opts.WorkingDir, gitBin)
-			nonEphemeralModified := filterNonEphemeralModified(curModified)
+			nonEphemeralModified := loopGateRep.DirtyFiles
 			hasDirtyWorktree := len(nonEphemeralModified) > 0
-			storyIncomplete := isStoryIncompleteAnywhere(opts.WorkingDir, spRoot, curStory)
+			storyIncomplete := isStoryIncompleteAnywhere(opts.WorkingDir, spRoot, curStory) || loopGateRep.StoryIncomplete
 			isExplicitASEPrompt := isASEExecutionPrompt(opts.Prompt)
-			onNonMainBranch, nonMainBranchName := isNonMainWorktreeBranch(opts.WorkingDir, gitBin)
-			unpushedCnt, _ := countUnpushedCommits(opts.WorkingDir, gitBin)
-			aseBranchIncomplete := isASEFlow && ((storyIncomplete && (isExplicitASEPrompt || onNonMainBranch)) || (isExplicitASEPrompt && (onNonMainBranch || unpushedCnt > 0)))
+			onNonMainBranch := loopGateRep.AnyNonMainBranch
+			nonMainBranchName := loopGateRep.FirstNonMainBranch
+			if nonMainBranchName == "" {
+				nonMainBranchName = loopGateRep.BranchSummary
+			}
+			unpushedCnt := loopGateRep.UnpushedTotal
+			aseBranchIncomplete := isASEFlow && ((storyIncomplete && (isExplicitASEPrompt || onNonMainBranch)) || (isExplicitASEPrompt && (onNonMainBranch || unpushedCnt > 0 || !loopGateRep.SubmodulesClean || !loopGateRep.BranchClean || !loopGateRep.StoryDone)))
 			aseDirtyIncomplete := isASEFlow && hasDirtyWorktree
 
 			lowerCombined := strings.ToLower(rawCombined)
@@ -2764,7 +2891,13 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		_ = controlplane.PostStoryBinding(ctx, apiURL, resolveToken(), jobID, detectedStoryID, detectedStoryTitle, detectedStoryPath, fencingToken)
 	}
 
-	if !lastTurnStaleHook && !hasHeadlessPermissionDenial(combinedOutput) && isASEFlowCompletedInWorktree(opts.WorkingDir, detectedStoryID, combinedOutput, gitBin) {
+	finalExplicitASE := isASEExecutionPrompt(opts.Prompt)
+	var finalGateRep aseMultiRepoReport
+	if isASEFlow || finalExplicitASE || strings.TrimSpace(detectedStoryID) != "" {
+		finalGateRep = evaluateMultiRepoASEGates(opts.WorkingDir, detectedStoryID, combinedOutput, gitBin)
+	}
+
+	if !lastTurnStaleHook && !hasHeadlessPermissionDenial(combinedOutput) && finalGateRep.Complete {
 		execStatus = "completed"
 		exitCode = 0
 		waitErr = nil
@@ -2774,7 +2907,7 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 
 	// Enforce fail-closed BACKGROUND_DRAIN_TIMEOUT if background drain was not resolved by auto-resume or completion verification
-	if bgDrainReaped && (execStatus != "completed" || isStoryIncompleteInWorktree(opts.WorkingDir, detectedStoryID)) {
+	if bgDrainReaped && (execStatus != "completed" || isStoryIncompleteAnywhere(opts.WorkingDir, superprojectRoot, detectedStoryID)) {
 		execStatus = "timed_out"
 		if exitCode == 0 {
 			exitCode = 124
@@ -2787,13 +2920,21 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 	}
 
 	nonEphemeralFinal := filterNonEphemeralModified(modified)
-	finalStoryIncomplete := isStoryIncompleteAnywhere(opts.WorkingDir, superprojectRoot, detectedStoryID)
-	finalStoryDone := isStoryDoneAnywhere(opts.WorkingDir, superprojectRoot, detectedStoryID)
+	dirtyAll := finalGateRep.DirtyFiles
+	if len(dirtyAll) == 0 && len(nonEphemeralFinal) > 0 {
+		dirtyAll = nonEphemeralFinal
+	}
+	finalStoryIncomplete := isStoryIncompleteAnywhere(opts.WorkingDir, superprojectRoot, detectedStoryID) || finalGateRep.StoryIncomplete
+	finalStoryDone := finalGateRep.StoryDone
 	finalOnNonMainBranch, finalBranchName := isNonMainWorktreeBranch(opts.WorkingDir, gitBin)
-	finalExplicitASE := isASEExecutionPrompt(opts.Prompt)
+	if finalGateRep.AnyNonMainBranch {
+		finalOnNonMainBranch = true
+		if finalGateRep.FirstNonMainBranch != "" {
+			finalBranchName = finalGateRep.FirstNonMainBranch
+		}
+	}
 	if (isASEFlow || finalExplicitASE) && execStatus == "completed" {
-		unpushedWT, unpushedWTErr := countUnpushedCommits(opts.WorkingDir, gitBin)
-		if len(nonEphemeralFinal) > 0 {
+		markGateIncomplete := func(errMsg string) {
 			execStatus = "failed"
 			if exitCode == 0 {
 				exitCode = 1
@@ -2801,68 +2942,52 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 			failureCategory = "ASE_GATE_INCOMPLETE"
 			failureStage = "COMPLETION_GATE"
 			if waitErr == nil {
-				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: dirty_worktree_post_exit (%d uncommitted file(s) remaining: %s)", len(nonEphemeralFinal), strings.Join(nonEphemeralFinal, ", "))
+				waitErr = fmt.Errorf("%s", errMsg)
 			}
+		}
+		if len(dirtyAll) > 0 {
+			markGateIncomplete(fmt.Sprintf("ASE_GATE_INCOMPLETE: dirty_worktree_post_exit (%d uncommitted file(s) remaining across scoped repos: %s)", len(dirtyAll), strings.Join(dirtyAll, ", ")))
+		} else if !finalGateRep.SubmodulesClean {
+			markGateIncomplete(fmt.Sprintf("ASE_GATE_INCOMPLETE: %s", finalGateRep.SubmoduleReason))
 		} else if finalExplicitASE && strings.TrimSpace(detectedStoryID) == "" {
-			execStatus = "failed"
-			if exitCode == 0 {
-				exitCode = 1
-			}
-			failureCategory = "ASE_GATE_INCOMPLETE"
-			failureStage = "COMPLETION_GATE"
-			if waitErr == nil {
-				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: missing_story_binding (no canonical STORY_ID bound or created during ASE run)")
-			}
+			markGateIncomplete("ASE_GATE_INCOMPLETE: missing_story_binding (no canonical STORY_ID bound or created during ASE run)")
 		} else if finalExplicitASE && !finalStoryDone {
-			execStatus = "failed"
-			if exitCode == 0 {
-				exitCode = 1
+			reasonSuffix := strings.Join(finalGateRep.StoryReport.Reasons, ", ")
+			if reasonSuffix == "" {
+				reasonSuffix = fmt.Sprintf("story %s is not marked DONE in docs/stories/ on branch %s", detectedStoryID, finalBranchName)
 			}
-			failureCategory = "ASE_GATE_INCOMPLETE"
-			failureStage = "COMPLETION_GATE"
-			if waitErr == nil {
-				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: incomplete_ase_flow (story %s is not marked DONE in docs/stories/ on branch %s)", detectedStoryID, finalBranchName)
-			}
+			markGateIncomplete(fmt.Sprintf("ASE_GATE_INCOMPLETE: incomplete_ase_flow (%s)", reasonSuffix))
 		} else if finalStoryIncomplete && finalOnNonMainBranch {
-			execStatus = "failed"
-			if exitCode == 0 {
-				exitCode = 1
-			}
-			failureCategory = "ASE_GATE_INCOMPLETE"
-			failureStage = "COMPLETION_GATE"
-			if waitErr == nil {
-				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: incomplete_ase_flow (story %s remains IN_PROGRESS on branch %s)", detectedStoryID, finalBranchName)
-			}
+			markGateIncomplete(fmt.Sprintf("ASE_GATE_INCOMPLETE: incomplete_ase_flow (story %s remains incomplete on branch %s)", detectedStoryID, finalBranchName))
 		} else if finalExplicitASE && finalOnNonMainBranch {
-			execStatus = "failed"
-			if exitCode == 0 {
-				exitCode = 1
-			}
-			failureCategory = "ASE_GATE_INCOMPLETE"
-			failureStage = "COMPLETION_GATE"
-			if waitErr == nil {
-				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: unmerged_feature_branch (worktree remains on branch %s; git-flow land not completed)", finalBranchName)
-			}
-		} else if finalExplicitASE && unpushedWTErr != nil {
-			execStatus = "failed"
-			if exitCode == 0 {
-				exitCode = 1
-			}
-			failureCategory = "ASE_GATE_INCOMPLETE"
-			failureStage = "COMPLETION_GATE"
-			if waitErr == nil {
-				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: unpushed_probe_failed (%v)", unpushedWTErr)
-			}
-		} else if finalExplicitASE && unpushedWT > 0 {
-			execStatus = "failed"
-			if exitCode == 0 {
-				exitCode = 1
-			}
-			failureCategory = "ASE_GATE_INCOMPLETE"
-			failureStage = "COMPLETION_GATE"
-			if waitErr == nil {
-				waitErr = fmt.Errorf("ASE_GATE_INCOMPLETE: unpushed_commits (%d unpushed commit(s) on worktree; git-flow land not completed)", unpushedWT)
-			}
+			markGateIncomplete(fmt.Sprintf("ASE_GATE_INCOMPLETE: unmerged_feature_branch (repo worktree remains on branch %s; git-flow land not completed)", finalBranchName))
+		} else if finalExplicitASE && finalGateRep.UnpushedProbeErr != nil {
+			markGateIncomplete(fmt.Sprintf("ASE_GATE_INCOMPLETE: unpushed_probe_failed (%v)", finalGateRep.UnpushedProbeErr))
+		} else if finalExplicitASE && finalGateRep.UnpushedTotal > 0 {
+			markGateIncomplete(fmt.Sprintf("ASE_GATE_INCOMPLETE: unpushed_commits (%d unpushed commit(s) across scoped repos; git-flow land not completed)", finalGateRep.UnpushedTotal))
+		}
+	}
+
+	var finalASEComplete bool
+	var finalASEGateStatus map[string]bool
+	if isASEFlow || finalExplicitASE || finalGateRep.StoryReport.Found {
+		testsPassedGate := execStatus == "completed"
+		gitCleanGate := finalGateRep.GitClean && len(dirtyAll) == 0
+		branchCleanGate := finalGateRep.BranchClean && !finalOnNonMainBranch && finalGateRep.UnpushedProbeErr == nil && finalGateRep.UnpushedTotal == 0
+		submodulesCleanGate := finalGateRep.SubmodulesClean
+		storyDoneGate := finalGateRep.StoryDone
+		if !finalExplicitASE && !finalGateRep.StoryReport.Found {
+			storyDoneGate = finalGateRep.HasCompletionEvidence && !finalStoryIncomplete
+		}
+		releaseVerifiedGate := testsPassedGate && gitCleanGate && branchCleanGate && submodulesCleanGate && storyDoneGate
+		finalASEComplete = releaseVerifiedGate
+		finalASEGateStatus = map[string]bool{
+			"git_clean":        gitCleanGate,
+			"branch_clean":     branchCleanGate,
+			"submodules_clean": submodulesCleanGate,
+			"tests_passed":     testsPassedGate,
+			"release_verified": releaseVerifiedGate,
+			"story_done":       storyDoneGate,
 		}
 	}
 
@@ -2909,6 +3034,8 @@ func (r *CLIPromptRunner) RunPrompt(ctx context.Context, opts RunPromptOptions) 
 		ResumeAttempts:       resumeAttempts,
 		Status:               execStatus,
 		ExitCode:             exitCode,
+		ASEComplete:          finalASEComplete,
+		ASEGateStatus:        finalASEGateStatus,
 		PreGitHeadSHA:        preHeadSHA,
 		PreGitTreeSHA:        preTreeSHA,
 		GitHeadSHA:           headSHA,
