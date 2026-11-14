@@ -167,27 +167,17 @@ var testFailedRegexes = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)FAILED\s+\(failures=\d+\)`),
 }
 
-// isStoryDone checks whether the story markdown file exists and has status: DONE locally or on origin/main.
+// isStoryDone checks whether the story markdown file exists and has honest DONE status locally, in umbrella hubs, or on origin/main.
 func isStoryDone(worktreePath, storyID string, git func(args ...string) (string, error)) bool {
 	if storyID == "" {
 		return false
 	}
-	// Check locally in docs/stories/*.story.md
-	pattern := filepath.Join(worktreePath, "docs", "stories", "*.story.md")
-	matches, _ := filepath.Glob(pattern)
-	for _, m := range matches {
-		data, err := os.ReadFile(m)
-		if err == nil {
-			content := string(data)
-			if strings.Contains(content, storyID) {
-				if strings.Contains(content, "status: DONE") || strings.Contains(content, "status: \"DONE\"") || strings.Contains(content, "status: 'DONE'") {
-					return true
-				}
-			}
-		}
+	spRoot := gate.ResolveSuperprojectRoot(worktreePath, "")
+	if rep := gate.InspectStoryHonesty([]string{worktreePath, spRoot}, storyID); rep.Found {
+		return rep.AllHonestDone
 	}
 
-	// Check on origin/main via git log
+	// Check on origin/main via git log only when no local .story.md exists
 	if git != nil {
 		if out, err := git("log", "origin/main", "-n", "10", "--grep="+storyID, "--format=%s %b"); err == nil && strings.TrimSpace(out) != "" {
 			lower := strings.ToLower(out)

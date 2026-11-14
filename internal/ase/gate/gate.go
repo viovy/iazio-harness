@@ -128,11 +128,11 @@ func Verify(opts GateOptions) GateResult {
 		}
 	}
 
-	// 2. Branch cleanliness: detached HEAD check
+	// 2. Branch cleanliness: must be on main/master (not detached HEAD or unmerged feature branch)
 	branch, err := git("rev-parse", "--abbrev-ref", "HEAD")
 	if err == nil {
 		branch = strings.TrimSpace(branch)
-		if branch == "HEAD" {
+		if branch == "HEAD" || (branch != "" && branch != "main" && branch != "master") {
 			res.BranchClean = false
 			res.UnmetGates = append(res.UnmetGates, "branch_not_detached")
 		}
@@ -143,8 +143,7 @@ func Verify(opts GateOptions) GateResult {
 	if err == nil && subStatus != "" {
 		lines := strings.Split(subStatus, "\n")
 		for _, l := range lines {
-			l = strings.TrimSpace(l)
-			if len(l) > 0 && (l[0] == '+' || l[0] == 'U') {
+			if len(l) > 0 && (l[0] == '+' || l[0] == 'U' || l[0] == '-') {
 				res.SubmodulesClean = false
 				res.UnmetGates = append(res.UnmetGates, "submodule_gitlinks_synchronized")
 				break
@@ -158,6 +157,44 @@ func Verify(opts GateOptions) GateResult {
 		if !storyDone {
 			res.StoryDone = false
 			res.UnmetGates = append(res.UnmetGates, "story_definition_of_done")
+		}
+	}
+
+	// 4b. Multi-repo superproject & sibling story submodule checks when using real git on disk
+	if opts.GitRunner == nil {
+		spRoot := ResolveSuperprojectRoot(opts.WorktreePath, "git")
+		rep := InspectStoryHonesty([]string{opts.WorktreePath, spRoot}, opts.StoryID)
+		scopedDirs := ResolveScopedRepoDirs(opts.WorktreePath, spRoot, rep.Submodules)
+		workCleanPath := filepath.Clean(opts.WorktreePath)
+		for _, dir := range scopedDirs {
+			if dir != workCleanPath {
+				if pOut, pErr := DefaultGitRunner(dir)("status", "--porcelain"); pErr == nil {
+					for _, l := range strings.Split(pOut, "\n") {
+						trimmed := strings.TrimSpace(l)
+						if trimmed != "" && !IsIgnoredTransientArtifact(trimmed) && !strings.HasSuffix(trimmed, ".session_story_id") {
+							if res.GitClean {
+								res.GitClean = false
+								res.UnmetGates = append(res.UnmetGates, "clean_working_tree")
+							}
+							break
+						}
+					}
+				}
+				if nonMain, _ := IsNonMainBranch(dir, "git"); nonMain && res.BranchClean {
+					res.BranchClean = false
+					res.UnmetGates = append(res.UnmetGates, "branch_not_detached")
+				}
+			}
+			if unpushed, uErr := CountUnpushedCommits(dir, "git"); (uErr != nil || unpushed > 0) && res.BranchClean {
+				res.BranchClean = false
+				res.UnmetGates = append(res.UnmetGates, "branch_not_detached")
+			}
+		}
+		if spRoot != "" && res.SubmodulesClean {
+			if subOK, _ := CheckSubmodulesClean(spRoot, "git", rep.Submodules); !subOK {
+				res.SubmodulesClean = false
+				res.UnmetGates = append(res.UnmetGates, "submodule_gitlinks_synchronized")
+			}
 		}
 	}
 
@@ -188,29 +225,11 @@ func Verify(opts GateOptions) GateResult {
 }
 
 func isStoryCompleted(worktreePath, storyID string, git func(args ...string) (string, error)) bool {
-	// First inspect story files in docs/stories/ (Primary SSOT for local worktree)
-	storiesDir := filepath.Join(worktreePath, "docs", "stories")
-	entries, err := os.ReadDir(storiesDir)
-	if err == nil {
-		hasStoryFile := false
-		cleanID := strings.TrimPrefix(strings.ToLower(storyID), "story-")
-		for _, e := range entries {
-			lowerName := strings.ToLower(e.Name())
-			if !e.IsDir() && strings.HasSuffix(lowerName, ".story.md") && (strings.Contains(lowerName, strings.ToLower(storyID)) || strings.Contains(lowerName, cleanID)) {
-				hasStoryFile = true
-				content, err := os.ReadFile(filepath.Join(storiesDir, e.Name()))
-				if err == nil {
-					text := string(content)
-					if strings.Contains(text, "status: DONE") || strings.Contains(text, "status: \"DONE\"") || strings.Contains(text, "status: 'DONE'") {
-						return true
-					}
-				}
-			}
-		}
-		if hasStoryFile {
-			// Story file exists and is NOT marked DONE -> story is still incomplete
-			return false
-		}
+	// First inspect all matching .story.md copies across worktree and superproject/umbrella hubs
+	// with strict frontmatter + Tasks/DoD/Reviews honesty validation.
+	spRoot := ResolveSuperprojectRoot(worktreePath, "")
+	if rep := InspectStoryHonesty([]string{worktreePath, spRoot}, storyID); rep.Found {
+		return rep.AllHonestDone
 	}
 
 	// Fallback: check git log strictly on origin/main (already merged closeout)
@@ -223,6 +242,7 @@ func isStoryCompleted(worktreePath, storyID string, git func(args ...string) (st
 
 	// If docs/stories directory does not exist in this worktree (e.g. submodule repo or test tempdir),
 	// story files are not managed locally in this repo.
+	storiesDir := filepath.Join(worktreePath, "docs", "stories")
 	if _, err := os.Stat(storiesDir); os.IsNotExist(err) {
 		return true
 	}
